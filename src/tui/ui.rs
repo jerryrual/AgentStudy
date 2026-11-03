@@ -583,6 +583,7 @@ mod tests {
         use crate::tui::app::UiEvent;
 
         let mut app = test_app();
+        app.running = true;
         for _ in 0..2 {
             app.push_event(UiEvent::ToolStarted {
                 name: "read_file".to_string(),
@@ -640,6 +641,35 @@ mod tests {
             }
             _ => panic!("expected tool card"),
         }
+    }
+
+    #[test]
+    fn cancellation_ignores_queued_tool_events() {
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.running = true;
+        app.push_event(UiEvent::ToolStarted {
+            name: "read_file".to_string(),
+            summary: "queued.txt".to_string(),
+        });
+        app.push_event(UiEvent::ToolFinished {
+            name: "read_file".to_string(),
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+            summary: "queued.txt".to_string(),
+            output: "late result".to_string(),
+        });
+
+        app.cancel();
+        app.pump();
+
+        assert!(
+            !app.view.iter().any(
+                |item| matches!(item, ViewItem::Tool { summary, .. } if summary == "queued.txt")
+            ),
+            "cancelled turn must not recreate a tool card"
+        );
     }
 
     #[test]

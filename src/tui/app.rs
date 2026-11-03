@@ -230,6 +230,9 @@ impl App {
             UiEvent::TextDelta(delta) => self.append_assistant_text(&delta),
             UiEvent::ReasoningDelta(delta) => self.append_reasoning(&delta),
             UiEvent::ToolStarted { name, summary } => {
+                if !self.running {
+                    return;
+                }
                 self.view.push(ViewItem::Tool {
                     name,
                     summary,
@@ -246,6 +249,9 @@ impl App {
                 summary,
                 output,
             } => {
+                if !self.running {
+                    return;
+                }
                 let preview = preview_output(&output);
                 // Parallel batches emit starts and finishes in provider order.
                 // Match the oldest identical running card so duplicate calls do
