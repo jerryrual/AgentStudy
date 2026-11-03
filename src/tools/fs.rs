@@ -338,32 +338,40 @@ impl Tool for ListDir {
     }
 
     async fn run(&self, arguments: &Value, context: &ToolContext) -> Result<String> {
-        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let depth = optional_usize(arguments, "depth").unwrap_or(1).clamp(1, 3);
-        let limit = optional_usize(arguments, "limit")
-            .unwrap_or(300)
-            .clamp(1, 1000);
-        let root = context.resolve(path);
-        if !root.is_dir() {
-            bail!("{} is not a directory", display_path(&context.cwd, &root));
-        }
-        let display = display_path(&context.cwd, &root);
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        walk_dir(&root, 0, depth, limit, &mut entries, &mut truncated)?;
-        if entries.is_empty() {
-            return Ok(format!("{display} is empty"));
-        }
-        let mut output = format!("{display}:\n");
-        for entry in entries {
-            output.push_str(&entry);
-            output.push('\n');
-        }
-        if truncated {
-            output.push_str("\n[entry limit reached; use a smaller depth or a path]\n");
-        }
-        Ok(output)
+        let arguments = arguments.clone();
+        let cwd = context.cwd.clone();
+        tokio::task::spawn_blocking(move || list_dir_sync(&arguments, &cwd))
+            .await
+            .context("list_dir worker failed")?
     }
+}
+
+fn list_dir_sync(arguments: &Value, cwd: &Path) -> Result<String> {
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    let depth = optional_usize(arguments, "depth").unwrap_or(1).clamp(1, 3);
+    let limit = optional_usize(arguments, "limit")
+        .unwrap_or(300)
+        .clamp(1, 1000);
+    let root = super::resolve_path(cwd, path);
+    if !root.is_dir() {
+        bail!("{} is not a directory", display_path(cwd, &root));
+    }
+    let display = display_path(cwd, &root);
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    walk_dir(&root, 0, depth, limit, &mut entries, &mut truncated)?;
+    if entries.is_empty() {
+        return Ok(format!("{display} is empty"));
+    }
+    let mut output = format!("{display}:\n");
+    for entry in entries {
+        output.push_str(&entry);
+        output.push('\n');
+    }
+    if truncated {
+        output.push_str("\n[entry limit reached; use a smaller depth or a path]\n");
+    }
+    Ok(output)
 }
 
 fn walk_dir(
