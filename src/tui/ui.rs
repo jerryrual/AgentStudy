@@ -673,6 +673,34 @@ mod tests {
     }
 
     #[test]
+    fn stale_turn_events_cannot_mutate_a_new_turn() {
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.running = true;
+        app.push_stale_event(UiEvent::ToolFinished {
+            name: "bash".to_string(),
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+            summary: "new command".to_string(),
+            output: "old result".to_string(),
+        });
+        app.push_stale_event(UiEvent::ShellFinished {
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+        });
+        app.pump();
+
+        assert!(app.running, "stale ShellFinished must not end the new turn");
+        assert!(
+            !app.view.iter().any(
+                |item| matches!(item, ViewItem::Tool { output, .. } if output == "old result")
+            ),
+            "stale ToolFinished must not create or finish a card"
+        );
+    }
+
+    #[test]
     fn renders_approval_modal() {
         let mut app = test_app();
         let (reply, _rx) = tokio::sync::oneshot::channel();
