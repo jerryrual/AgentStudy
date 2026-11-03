@@ -343,7 +343,6 @@ impl Tool for ListDir {
         let mut entries = Vec::new();
         let mut truncated = false;
         walk_dir(&root, 0, depth, limit, &mut entries, &mut truncated)?;
-        entries.sort();
         if entries.is_empty() {
             return Ok(format!("{display} is empty"));
         }
@@ -370,8 +369,8 @@ fn walk_dir(
     let skip = [".git", "node_modules", "target", ".venv", "__pycache__"];
     let mut children: Vec<_> = std::fs::read_dir(directory)
         .with_context(|| format!("cannot list {}", directory.display()))?
-        .filter_map(|entry| entry.ok())
-        .collect();
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("cannot read an entry of {}", directory.display()))?;
     children.sort_by_key(|entry| entry.file_name());
     for child in children {
         if entries.len() >= limit {

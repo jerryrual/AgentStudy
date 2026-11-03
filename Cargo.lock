@@ -955,6 +955,7 @@ dependencies = [
  "futures-util",
  "globset",
  "ignore",
+ "libc",
  "ratatui",
  "regex",
  "reqwest",

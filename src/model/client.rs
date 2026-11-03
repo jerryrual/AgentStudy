@@ -185,13 +185,19 @@ impl ModelClient {
             let bytes = chunk.map_err(|error| {
                 ClientError::Fatal(anyhow!("streaming response failed: {error}"))
             })?;
-            for payload in parser.push(&bytes) {
+            for payload in parser
+                .push(&bytes)
+                .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+            {
                 if accumulator.apply(&payload, sink)? {
                     return Ok(accumulator.finish());
                 }
             }
         }
-        for payload in parser.finish() {
+        for payload in parser
+            .finish()
+            .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+        {
             if accumulator.apply(&payload, sink)? {
                 break;
             }
@@ -276,7 +282,10 @@ impl Accumulator {
             return Ok(false);
         }
         let chunk: Chunk = serde_json::from_str(payload).map_err(|error| {
-            ClientError::Fatal(anyhow!("invalid streaming event: {error}: {payload}"))
+            ClientError::Fatal(anyhow!(
+                "invalid streaming event: {error}: {}",
+                truncate(payload, MAX_ERROR_BODY)
+            ))
         })?;
         if let Some(usage) = chunk.usage {
             self.usage = Usage {

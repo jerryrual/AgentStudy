@@ -238,3 +238,60 @@ async fn empty_model_response_is_an_error() {
     let error = agent.run(&mut messages, &sink).await.unwrap_err();
     assert!(error.to_string().contains("empty"), "{error}");
 }
+
+#[tokio::test]
+async fn qa_agent_is_read_only() {
+    let server = MockServer::new(|_path, body| {
+        let has_tool_result = body["messages"]
+            .as_array()
+            .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+            .unwrap_or(false);
+        if has_tool_result {
+            MockResponse::sse(&[&text_chunk("understood"), &done_chunk("stop")])
+        } else {
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_w","function":{"name":"write_file","arguments":"{\"path\":\"blocked.txt\",\"content\":\"nope\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                &done_chunk("tool_calls"),
+            ])
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let client = ModelClient::from_profile(&mock_profile(server.base_url())).unwrap();
+    let agent = Agent::new(
+        Arc::new(client),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        AgentOptions {
+            kind: AgentKind::Qa,
+            cwd: directory.path().to_path_buf(),
+            max_rounds: 4,
+            tool_timeout: Duration::from_secs(5),
+        },
+    );
+    let sink = RecordingSink::default();
+    let mut messages = vec![Message::user("write a file")];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+    assert_eq!(turn.text, "understood");
+    assert!(!directory.path().join("blocked.txt").exists());
+
+    let request = &server.requests()[0];
+    let names: Vec<&str> = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(!names.contains(&"write_file"), "{names:?}");
+    assert!(!names.contains(&"bash"), "{names:?}");
+    assert!(names.contains(&"read_file"), "{names:?}");
+
+    let tool_message = messages
+        .iter()
+        .find(|message| matches!(message, Message::Tool { .. }))
+        .expect("tool result");
+    if let Message::Tool { content, .. } = tool_message {
+        assert!(content.contains("not available"), "{content}");
+    }
+}

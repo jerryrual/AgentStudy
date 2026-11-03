@@ -76,11 +76,11 @@ Operating rules:
 
 const QA_SYSTEM_PROMPT: &str = r#"You are iCode's Q&A agent, a read-only assistant running in a terminal.
 
-Answer the user's questions about the current project. You may inspect files, search the codebase and run read-only shell commands, but you must not modify files, install packages or run destructive commands.
+Answer the user's questions about the current project. You can inspect files and search the codebase, but you must not modify files, install packages or run commands: this agent is read-only and the runtime does not expose mutating tools.
 
 Operating rules:
 - Investigate before you answer: read the relevant files and search for definitions.
-- Use read_file, list_dir, grep and glob; avoid mutating tools entirely.
+- Use read_file, list_dir, grep and glob.
 - If a question needs a change, explain what you would change and why instead of changing it.
 - Reply in Markdown. Be concise and concrete, and cite files by path when useful."#;
 
@@ -153,8 +153,27 @@ impl Agent {
         )
     }
 
+    /// Tools visible to the model for this agent kind.
+    ///
+    /// The Q&A agent only sees tools that cannot change the workspace, so a
+    /// prompt-injected model cannot mutate files even in headless mode.
     pub fn tool_defs(&self) -> Vec<ToolDef> {
-        self.tools.specs()
+        self.visible_specs()
+    }
+
+    fn visible_specs(&self) -> Vec<ToolDef> {
+        let specs = self.tools.specs();
+        if self.options.kind == AgentKind::Code {
+            return specs;
+        }
+        specs
+            .into_iter()
+            .filter(|spec| {
+                self.tools
+                    .get(&spec.name)
+                    .is_some_and(|tool| !tool.mutates())
+            })
+            .collect()
     }
 
     /// Run one user turn, mutating `messages` with new assistant and tool turns.
@@ -187,7 +206,7 @@ impl Agent {
 
             let completion = self
                 .client
-                .complete(messages, &self.tools.specs(), sink)
+                .complete(messages, &self.visible_specs(), sink)
                 .await?;
             usage.add(completion.usage);
             sink.usage(&completion.usage);
@@ -275,6 +294,15 @@ impl Agent {
             sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
             return message;
         };
+
+        if self.options.kind == AgentKind::Qa && tool.mutates() {
+            let message = format!(
+                "Error: {} is not available to the read-only Q&A agent.",
+                call.name
+            );
+            sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
+            return message;
+        }
 
         if tool.mutates() {
             let request = ApprovalRequest::new(&call.name, &summary);

@@ -382,39 +382,57 @@ fn run_secret_command(command: &str) -> Result<String> {
         .spawn()
         .with_context(|| format!("failed to run API key command {command:?}"))?;
 
+    // Drain both pipes on separate threads so a chatty command cannot block on
+    // a full pipe buffer while we poll for completion.
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let stdout_reader = std::thread::spawn(move || read_all(stdout));
+    let stderr_reader = std::thread::spawn(move || read_all(stderr));
+
     let started = Instant::now();
     let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output()?;
-                if !status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    bail!(
-                        "API key command {command:?} exited with {status}: {}",
-                        stderr.trim()
-                    );
-                }
-                let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if key.is_empty() {
-                    bail!("API key command {command:?} produced no output");
-                }
-                return Ok(key);
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     bail!("API key command {command:?} timed out after {DEFAULT_TIMEOUT_SECS}s");
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(error) => {
                 let _ = child.kill();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 bail!("failed to wait for API key command {command:?}: {error}");
             }
         }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        bail!(
+            "API key command {command:?} exited with {status}: {}",
+            stderr.trim()
+        );
     }
+    let key = String::from_utf8_lossy(&stdout).trim().to_string();
+    if key.is_empty() {
+        bail!("API key command {command:?} produced no output");
+    }
+    Ok(key)
+}
+
+fn read_all(mut reader: impl std::io::Read) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = reader.read_to_end(&mut buffer);
+    buffer
 }
 
 #[cfg(test)]

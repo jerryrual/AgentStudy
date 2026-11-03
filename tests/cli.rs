@@ -187,3 +187,61 @@ fn version_flag_prints_the_version() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
 }
+
+#[test]
+fn run_continue_uses_the_latest_session() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("continued"), &done_chunk("stop")])
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let meta = json!({
+        "type": "meta",
+        "meta": {
+            "id": "1a1a0000000-00001",
+            "created_ms": 1,
+            "cwd": work.path(),
+            "model": "mock-model",
+            "agent": "code"
+        }
+    });
+    let previous = json!({"type": "user", "text": "previous context"});
+    std::fs::write(
+        sessions.join("1a1a0000000-00001.jsonl"),
+        format!("{}\n{}\n", meta, previous),
+    )
+    .unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "follow up",
+            "--continue",
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["text"], "continued");
+    let request = &server.requests()[0];
+    let contents: Vec<&str> = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(contents.contains(&"previous context"), "{contents:?}");
+    assert!(contents.contains(&"follow up"), "{contents:?}");
+}

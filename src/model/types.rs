@@ -157,8 +157,8 @@ impl Message {
             Message::Tool { content, .. } => content.clone(),
         };
         let mut line = text.lines().next().unwrap_or_default().trim().to_string();
-        if line.len() > 100 {
-            line.truncate(100);
+        if line.chars().count() > 100 {
+            line = line.chars().take(100).collect();
             line.push('…');
         }
         line
@@ -211,4 +211,34 @@ pub struct Completion {
     pub message: AssistantMessage,
     pub usage: Usage,
     pub finish_reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_truncates_multibyte_text_without_panicking() {
+        let message = Message::user("中".repeat(150));
+        let preview = message.preview();
+        assert!(preview.chars().count() <= 101, "{preview}");
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn assistant_serialisation_keeps_tool_calls_and_nulls_content() {
+        let message = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+        });
+        let value = message.to_api();
+        assert_eq!(value["role"], "assistant");
+        assert!(value["content"].is_null());
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "read_file");
+    }
 }

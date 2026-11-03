@@ -239,7 +239,9 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             current.spans.push(Span::styled(chunk, style));
         }
     }
-    result.push(current);
+    if !current.spans.is_empty() || result.is_empty() {
+        result.push(current);
+    }
     result
 }
 
@@ -381,18 +383,30 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: 
                 .fg(app.theme.warning)
                 .add_modifier(Modifier::BOLD),
         ));
-    let lines = vec![
+    // Grow the dialog so the complete command stays reviewable. The summary is
+    // wrapped here (not by Paragraph) because commands are often a single long
+    // word that Paragraph does not break.
+    let outer_width = ((area.width as u32 * 70 / 100) as u16).max(20);
+    let interior = outer_width.saturating_sub(2).max(10) as usize;
+    let mut lines = wrap_line(
         Line::from(Span::styled(
             format!("  {tool}: {summary}"),
             Style::default().fg(app.theme.text),
         )),
-        Line::default(),
+        interior,
+    );
+    lines.push(Line::default());
+    lines.extend(wrap_line(
         Line::from(Span::styled(
             "  y allow once · a always allow · n deny · esc deny",
             Style::default().fg(app.theme.dim),
         )),
-    ];
-    let popup = centered(area, 60, 7);
+        interior,
+    ));
+    let height = (lines.len() as u16 + 2)
+        .clamp(7, area.height.max(7))
+        .min(area.height.max(1));
+    let popup = centered(area, 70, height);
     frame.render_widget(Clear, popup);
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
@@ -561,6 +575,27 @@ mod tests {
         let output = render(&mut app, 100, 24);
         assert!(output.contains("Approval required"), "{output}");
         assert!(output.contains("y allow once"), "{output}");
+    }
+
+    #[test]
+    fn approval_modal_wraps_long_commands() {
+        let mut app = test_app();
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let command = format!("echo {} THE-END-MARKER", "x".repeat(240));
+        app.modal = Some(Modal::Approval {
+            request: crate::interaction::ApprovalRequest::new("bash", &command),
+            reply,
+        });
+        let output = render(&mut app, 100, 30);
+        assert!(output.contains("THE-END-MARKER"), "{output}");
+    }
+
+    #[test]
+    fn wrapping_an_exact_width_line_adds_no_blank_line() {
+        let line = Line::from(Span::raw("abcd"));
+        assert_eq!(wrap_line(line, 4).len(), 1);
+        let line = Line::from(Span::raw(""));
+        assert_eq!(wrap_line(line, 4).len(), 1);
     }
 
     #[test]

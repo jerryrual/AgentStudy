@@ -12,7 +12,7 @@ use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
-use crate::session::{Record, Session, SessionStore};
+use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::tools::ToolRegistry;
 
 pub struct RunOptions {
@@ -31,8 +31,13 @@ pub struct RunOptions {
 
 struct RunSink {
     json: bool,
-    session: Mutex<Session>,
+    recorded: Mutex<RecordedSession>,
     wrote_text: AtomicBool,
+}
+
+struct RecordedSession {
+    session: Session,
+    buffer: RecordBuffer,
 }
 
 impl RunSink {
@@ -72,8 +77,9 @@ impl EventSink for RunSink {
     }
 
     fn message_added(&self, message: &Message) {
-        if let Ok(session) = self.session.lock() {
-            if let Err(error) = session.append_message(message) {
+        if let Ok(mut recorded) = self.recorded.lock() {
+            let RecordedSession { session, buffer } = &mut *recorded;
+            if let Err(error) = buffer.record(session, message) {
                 eprintln!("warning: failed to save session: {error:#}");
             }
         }
@@ -95,7 +101,14 @@ impl EventSink for RunSink {
 /// Like iCode's `icode run`, no approval prompt is shown: mutating tools are
 /// allowed unless `--approval deny` was requested.
 pub async fn execute(options: RunOptions) -> Result<()> {
-    let client = std::sync::Arc::new(ModelClient::from_profile(&options.profile)?);
+    let profile = options.profile.clone();
+    let client = std::sync::Arc::new(
+        tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to resolve the model configuration: {error}")
+            })??,
+    );
     let store = options.store;
     let (session, mut messages): (Session, Vec<Message>) = match &options.session {
         Some(id) => {
@@ -138,7 +151,10 @@ pub async fn execute(options: RunOptions) -> Result<()> {
 
     let sink = RunSink {
         json: options.json,
-        session: Mutex::new(session.clone()),
+        recorded: Mutex::new(RecordedSession {
+            session: session.clone(),
+            buffer: RecordBuffer::default(),
+        }),
         wrote_text: AtomicBool::new(false),
     };
 

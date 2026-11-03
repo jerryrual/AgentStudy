@@ -114,6 +114,13 @@ pub fn execute(cli: Cli) -> Result<()> {
             json,
             session,
         }) => {
+            let session = match session {
+                Some(id) => Some(id),
+                None if cli.continue_session => store
+                    .latest()
+                    .context("failed to find the latest session")?,
+                None => None,
+            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -131,6 +138,8 @@ pub fn execute(cli: Cli) -> Result<()> {
             }))
         }
         None => {
+            // The CLI override must win over the settings file for the TUI too.
+            settings.approval_mode = approval;
             let resume = if cli.continue_session {
                 store
                     .latest()

@@ -13,7 +13,7 @@ use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
-use crate::session::{Session, SessionStore};
+use crate::session::{RecordBuffer, Session, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
 use crate::APP_NAME;
@@ -108,6 +108,7 @@ pub struct App {
     pub theme: Theme,
     pub store: SessionStore,
     pub session: Session,
+    recorder: RecordBuffer,
     pub messages: Vec<Message>,
     pub view: Vec<ViewItem>,
     pub input: String,
@@ -169,6 +170,7 @@ impl App {
             theme: options.theme,
             store: options.store,
             session,
+            recorder: RecordBuffer::default(),
             messages,
             view,
             input: String::new(),
@@ -272,7 +274,7 @@ impl App {
             }
             UiEvent::Usage(usage) => self.tokens.add(usage),
             UiEvent::MessageAdded(message) => {
-                if let Err(error) = self.session.append_message(&message) {
+                if let Err(error) = self.recorder.record(&self.session, &message) {
                     self.view.push(ViewItem::Error(format!(
                         "failed to save session: {error:#}"
                     )));
@@ -639,7 +641,13 @@ impl App {
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
             let result = async {
-                let client = Arc::new(ModelClient::from_profile(&profile)?);
+                let client = Arc::new(
+                    tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to resolve the model configuration: {error}")
+                        })??,
+                );
                 let options = AgentOptions {
                     kind,
                     cwd,
@@ -778,6 +786,12 @@ impl App {
         let mut parts = raw.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
         let argument = parts.next().unwrap_or_default().trim();
+        if self.running && matches!(command, "/new" | "/clear" | "/resume") {
+            self.view.push(ViewItem::Info(
+                "Cancel the running turn (Esc) before changing the session.".to_string(),
+            ));
+            return;
+        }
         match command {
             "/help" => self.modal = Some(Modal::Help),
             "/quit" | "/exit" => self.quit = true,
@@ -874,6 +888,7 @@ impl App {
                                     return;
                                 }
                             };
+                            self.recorder.reset();
                             self.view.push(ViewItem::Info(format!(
                                 "Resumed session {} ({}).",
                                 loaded.meta.id, loaded.meta.cwd
@@ -926,7 +941,10 @@ impl App {
             &self.profile.model,
             self.agent_kind.as_str(),
         ) {
-            Ok(session) => self.session = session,
+            Ok(session) => {
+                self.session = session;
+                self.recorder.reset();
+            }
             Err(error) => self.view.push(ViewItem::Error(format!(
                 "failed to create session: {error:#}"
             ))),

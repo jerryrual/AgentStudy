@@ -69,11 +69,7 @@ impl MockServer {
                     continue;
                 };
                 hits_for_thread.fetch_add(1, Ordering::SeqCst);
-                if let Some(body) = serve_connection(stream, handler.as_ref()) {
-                    if let Ok(mut recorded) = requests_for_thread.lock() {
-                        recorded.push(body);
-                    }
-                }
+                serve_connection(stream, handler.as_ref(), &requests_for_thread);
             }
         });
         Self {
@@ -114,7 +110,11 @@ impl Drop for MockServer {
     }
 }
 
-fn serve_connection(mut stream: std::net::TcpStream, handler: &Handler) -> Option<Value> {
+fn serve_connection(
+    mut stream: std::net::TcpStream,
+    handler: &Handler,
+    requests: &Arc<Mutex<Vec<Value>>>,
+) -> Option<()> {
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).ok()?;
@@ -141,6 +141,11 @@ fn serve_connection(mut stream: std::net::TcpStream, handler: &Handler) -> Optio
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).ok()?;
     let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    // Record before writing the response so a test that waits for the reply
+    // can always inspect the request.
+    if let Ok(mut recorded) = requests.lock() {
+        recorded.push(value.clone());
+    }
     let response = handler(&path, &value);
 
     let head = format!(
@@ -153,7 +158,7 @@ fn serve_connection(mut stream: std::net::TcpStream, handler: &Handler) -> Optio
     stream.write_all(head.as_bytes()).ok()?;
     stream.write_all(response.body.as_bytes()).ok()?;
     stream.flush().ok()?;
-    Some(value)
+    Some(())
 }
 
 fn status_text(status: u16) -> &'static str {

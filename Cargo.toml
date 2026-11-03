@@ -2,7 +2,7 @@
 name = "icode"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 description = "A Rust implementation of the iCode terminal coding agent"
 license = "Apache-2.0"
 repository = "https://github.com/jerryrual/AgentStudy"
@@ -35,3 +35,6 @@ unicode-width = "0.2.3"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"

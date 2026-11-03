@@ -145,6 +145,14 @@ async fn list_dir_walks_the_tree() {
     assert!(output.contains("main.rs"), "{output}");
     assert!(output.contains("bin/"), "{output}");
     assert!(!output.contains(".git"), "{output}");
+    // The tree must keep parents before their indented children.
+    let parent = output.find("src/").expect("src/ in listing");
+    let child = output.find("  bin/").expect("indented bin/ in listing");
+    let file = output
+        .find("  main.rs")
+        .expect("indented main.rs in listing");
+    assert!(parent < child, "parent before children: {output}");
+    assert!(parent < file, "parent before files: {output}");
 }
 
 #[tokio::test]
@@ -229,12 +237,33 @@ async fn bash_honours_its_timeout() {
     let error = run(
         &registry(),
         "bash",
-        json!({"command": "sleep 5", "timeout_secs": 1}),
+        json!({"command": "echo before-timeout; sleep 5", "timeout_secs": 1}),
         &context,
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("timed out"), "{error}");
+    let message = error.to_string();
+    assert!(message.contains("timed out"), "{message}");
+    assert!(
+        message.contains("before-timeout"),
+        "partial output should be kept: {message}"
+    );
+}
+
+#[tokio::test]
+async fn bash_caps_captured_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = tool_context(directory.path());
+    let output = run(
+        &registry(),
+        "bash",
+        json!({"command": "yes a | head -c 100000"}),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(output.contains("truncated at"), "{output}");
+    assert!(output.len() < 70_000, "output should be capped");
 }
 
 #[tokio::test]

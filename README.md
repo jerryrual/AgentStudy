@@ -33,7 +33,7 @@
 
 ## 构建
 
-需要 Rust 1.82 或更新版本。
+需要 Rust 1.88 或更新版本。
 
 ```bash
 cargo build --release

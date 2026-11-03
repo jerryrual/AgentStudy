@@ -13,28 +13,41 @@ use crate::theme::Theme;
 /// Render Markdown text into styled lines.
 pub fn render(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut in_code = false;
+    // Length of the opening backtick fence, if a code block is open.
+    let mut fence: Option<usize> = None;
     for raw in text.split('\n') {
         let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            if in_code {
-                in_code = false;
-            } else {
-                in_code = true;
-                let language = trimmed.trim_start_matches('`').trim();
-                let label = if language.is_empty() {
-                    "code".to_string()
-                } else {
-                    language.to_string()
-                };
+        let ticks = trimmed
+            .chars()
+            .take_while(|character| *character == '`')
+            .count();
+        if ticks >= 3 {
+            if let Some(open) = fence {
+                if ticks >= open && trimmed[ticks..].trim().is_empty() {
+                    fence = None;
+                    continue;
+                }
+                // A shorter or annotated fence inside a block is content.
                 lines.push(Line::from(Span::styled(
-                    format!("  ┌─ {label}"),
-                    Style::default().fg(theme.dim),
+                    format!("  │ {raw}"),
+                    Style::default().fg(theme.code),
                 )));
+                continue;
             }
+            fence = Some(ticks);
+            let language = trimmed.trim_start_matches('`').trim();
+            let label = if language.is_empty() {
+                "code".to_string()
+            } else {
+                language.to_string()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  ┌─ {label}"),
+                Style::default().fg(theme.dim),
+            )));
             continue;
         }
-        if in_code {
+        if fence.is_some() {
             lines.push(Line::from(Span::styled(
                 format!("  │ {raw}"),
                 Style::default().fg(theme.code),
@@ -255,5 +268,21 @@ mod tests {
         let lines = render("```\nnot closed", &theme);
         assert!(line_text(&lines[0]).contains("code"));
         assert!(line_text(&lines[1]).contains("not closed"));
+    }
+
+    #[test]
+    fn closes_a_block_only_on_a_matching_fence() {
+        let theme = Theme::default();
+        let lines = render(
+            "````markdown\n```rust\nlet x = 1;\n```\n````\n\ntext after",
+            &theme,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|line| line.contains("```rust")), "{text:?}");
+        assert!(
+            text.iter().any(|line| line.contains("let x = 1;")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|line| line == "text after"), "{text:?}");
     }
 }
