@@ -1,0 +1,1199 @@
+//! TUI state and event handling.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
+use crate::config::{ApprovalMode, ModelProfile, Settings};
+use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
+use crate::model::{Message, ModelClient, Usage};
+use crate::session::{Session, SessionStore};
+use crate::theme::Theme;
+use crate::tools::{truncate_output, ToolRegistry};
+use crate::APP_NAME;
+
+/// One rendered entry in the transcript.
+#[derive(Debug, Clone)]
+pub enum ViewItem {
+    User(String),
+    Assistant {
+        text: String,
+        reasoning: String,
+        streaming: bool,
+    },
+    Tool {
+        name: String,
+        summary: String,
+        status: ToolStatus,
+        ok: Option<bool>,
+        duration: Option<Duration>,
+        output: String,
+    },
+    Info(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Done,
+}
+
+#[derive(Debug)]
+pub enum Modal {
+    Approval {
+        request: ApprovalRequest,
+        reply: oneshot::Sender<ApprovalDecision>,
+    },
+    Help,
+}
+
+/// Events sent from the agent task and the interaction handlers.
+pub enum UiEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolStarted {
+        name: String,
+        summary: String,
+    },
+    ToolFinished {
+        name: String,
+        ok: bool,
+        duration: Duration,
+        summary: String,
+        output: String,
+    },
+    Usage(Usage),
+    MessageAdded(Message),
+    Info(String),
+    Error(String),
+    Approval {
+        request: ApprovalRequest,
+        reply: oneshot::Sender<ApprovalDecision>,
+    },
+    Ask {
+        question: String,
+        reply: oneshot::Sender<String>,
+    },
+    TurnFinished(std::result::Result<TurnResult, String>, Vec<Message>),
+    ShellFinished {
+        ok: bool,
+        duration: Duration,
+    },
+}
+
+/// Construction options, separated so tests can build an app without a
+/// terminal or network access.
+pub struct AppOptions {
+    pub settings: Settings,
+    pub profile: ModelProfile,
+    pub agent: AgentKind,
+    pub cwd: PathBuf,
+    pub store: SessionStore,
+    pub resume: Option<String>,
+    pub theme: Theme,
+}
+
+pub struct App {
+    pub settings: Settings,
+    pub profile: ModelProfile,
+    pub agent_kind: AgentKind,
+    pub cwd: PathBuf,
+    pub theme: Theme,
+    pub store: SessionStore,
+    pub session: Session,
+    pub messages: Vec<Message>,
+    pub view: Vec<ViewItem>,
+    pub input: String,
+    pub cursor: usize,
+    pub follow: bool,
+    pub scroll_back: u16,
+    pub running: bool,
+    pub turn_started: Option<Instant>,
+    pub elapsed: Duration,
+    pub tokens: Usage,
+    pub spinner: usize,
+    pub modal: Option<Modal>,
+    pub pending_ask: Option<oneshot::Sender<String>>,
+    pub history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub quit: bool,
+    events: mpsc::UnboundedReceiver<UiEvent>,
+    events_tx: mpsc::UnboundedSender<UiEvent>,
+    cancel_handle: Option<tokio::task::JoinHandle<()>>,
+    pub approver: Arc<dyn Approver>,
+    pub asker: Arc<dyn Asker>,
+    pub tools: Arc<ToolRegistry>,
+    pub runtime: Handle,
+}
+
+impl App {
+    pub fn new(runtime: Handle, options: AppOptions) -> Result<Self> {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let approver: Arc<dyn Approver> = match options.settings.approval_mode {
+            ApprovalMode::Auto => Arc::new(AllowAll),
+            ApprovalMode::Deny => Arc::new(DenyAll),
+            ApprovalMode::Ask => Arc::new(TuiApprover::new(events_tx.clone())),
+        };
+        let asker: Arc<dyn Asker> = Arc::new(TuiAsker {
+            tx: events_tx.clone(),
+        });
+        let (session, messages, view) = match options.resume.as_deref() {
+            Some(id) => {
+                let loaded = options.store.load(id)?;
+                let messages = loaded.messages();
+                let view = view_from_records(&loaded.records);
+                let session = options.store.reopen(id)?;
+                (session, messages, view)
+            }
+            None => {
+                let session = options.store.create(
+                    &options.cwd.display().to_string(),
+                    &options.profile.model,
+                    options.agent.as_str(),
+                )?;
+                (session, Vec::new(), welcome())
+            }
+        };
+        Ok(Self {
+            settings: options.settings,
+            profile: options.profile,
+            agent_kind: options.agent,
+            cwd: options.cwd,
+            theme: options.theme,
+            store: options.store,
+            session,
+            messages,
+            view,
+            input: String::new(),
+            cursor: 0,
+            follow: true,
+            scroll_back: 0,
+            running: false,
+            turn_started: None,
+            elapsed: Duration::default(),
+            tokens: Usage::default(),
+            spinner: 0,
+            modal: None,
+            pending_ask: None,
+            history: Vec::new(),
+            history_index: None,
+            quit: false,
+            events,
+            events_tx,
+            cancel_handle: None,
+            approver,
+            asker,
+            tools: Arc::new(ToolRegistry::builtin()),
+            runtime,
+        })
+    }
+
+    /// Send an event into the app (used by tests).
+    pub fn push_event(&self, event: UiEvent) {
+        let _ = self.events_tx.send(event);
+    }
+
+    /// Drain pending events; returns true when the UI should redraw.
+    pub fn pump(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(event) = self.events.try_recv() {
+            self.apply(event);
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn tick(&mut self) {
+        self.spinner = self.spinner.wrapping_add(1);
+        if let Some(started) = self.turn_started {
+            self.elapsed = started.elapsed();
+        }
+    }
+
+    fn apply(&mut self, event: UiEvent) {
+        match event {
+            UiEvent::TextDelta(delta) => self.append_assistant_text(&delta),
+            UiEvent::ReasoningDelta(delta) => self.append_reasoning(&delta),
+            UiEvent::ToolStarted { name, summary } => {
+                self.view.push(ViewItem::Tool {
+                    name,
+                    summary,
+                    status: ToolStatus::Running,
+                    ok: None,
+                    duration: None,
+                    output: String::new(),
+                });
+            }
+            UiEvent::ToolFinished {
+                name,
+                ok,
+                duration,
+                summary,
+                output,
+            } => {
+                let preview = preview_output(&output);
+                let found = self.view.iter_mut().rev().find_map(|item| match item {
+                    ViewItem::Tool {
+                        name: tool_name,
+                        summary: tool_summary,
+                        status,
+                        ok: tool_ok,
+                        duration: tool_duration,
+                        output: tool_output,
+                    } if *status == ToolStatus::Running
+                        && *tool_name == name
+                        && *tool_summary == summary =>
+                    {
+                        *status = ToolStatus::Done;
+                        *tool_ok = Some(ok);
+                        *tool_duration = Some(duration);
+                        *tool_output = preview.clone();
+                        Some(())
+                    }
+                    _ => None,
+                });
+                if found.is_none() {
+                    self.view.push(ViewItem::Tool {
+                        name,
+                        summary,
+                        status: ToolStatus::Done,
+                        ok: Some(ok),
+                        duration: Some(duration),
+                        output: preview,
+                    });
+                }
+            }
+            UiEvent::Usage(usage) => self.tokens.add(usage),
+            UiEvent::MessageAdded(message) => {
+                if let Err(error) = self.session.append_message(&message) {
+                    self.view.push(ViewItem::Error(format!(
+                        "failed to save session: {error:#}"
+                    )));
+                }
+                if let Message::Assistant { message } = &message {
+                    if let Some(ViewItem::Assistant {
+                        text, streaming, ..
+                    }) = self.view.iter_mut().rev().find(
+                        |item| matches!(item, ViewItem::Assistant { streaming, .. } if *streaming),
+                    ) {
+                        *streaming = false;
+                        if let Some(content) = &message.content {
+                            if text.is_empty() {
+                                text.push_str(content);
+                            }
+                        }
+                    }
+                }
+            }
+            UiEvent::Info(message) => self.view.push(ViewItem::Info(message)),
+            UiEvent::Error(message) => self.view.push(ViewItem::Error(message)),
+            UiEvent::Approval { request, reply } => {
+                self.modal = Some(Modal::Approval { request, reply });
+            }
+            UiEvent::Ask { question, reply } => {
+                self.pending_ask = Some(reply);
+                self.view
+                    .push(ViewItem::Info(format!("The assistant asks: {question}")));
+                self.view.push(ViewItem::Info(
+                    "Type your answer and press Enter.".to_string(),
+                ));
+            }
+            UiEvent::TurnFinished(result, messages) => {
+                self.messages = messages;
+                self.running = false;
+                self.turn_started = None;
+                for item in self.view.iter_mut().rev() {
+                    if let ViewItem::Assistant { streaming, .. } = item {
+                        *streaming = false;
+                    }
+                }
+                match result {
+                    Ok(turn) => {
+                        self.elapsed = turn.duration;
+                        if turn.tool_calls > 0 {
+                            self.view.push(ViewItem::Info(format!(
+                                "Done in {:.1}s · {} tool call(s) · {} model calls",
+                                turn.duration.as_secs_f64(),
+                                turn.tool_calls,
+                                turn.rounds
+                            )));
+                        }
+                    }
+                    Err(error) => self.view.push(ViewItem::Error(error)),
+                }
+            }
+            UiEvent::ShellFinished { ok, duration } => {
+                self.running = false;
+                self.turn_started = None;
+                self.elapsed = duration;
+                if !ok {
+                    self.view.push(ViewItem::Info(
+                        "Shell command failed; its output is not part of the conversation."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn append_assistant_text(&mut self, delta: &str) {
+        if let Some(ViewItem::Assistant {
+            text, streaming, ..
+        }) = self.view.last_mut()
+        {
+            if *streaming {
+                text.push_str(delta);
+                return;
+            }
+        }
+        self.view.push(ViewItem::Assistant {
+            text: delta.to_string(),
+            reasoning: String::new(),
+            streaming: true,
+        });
+    }
+
+    fn append_reasoning(&mut self, delta: &str) {
+        if let Some(ViewItem::Assistant {
+            reasoning,
+            streaming,
+            ..
+        }) = self.view.last_mut()
+        {
+            if *streaming {
+                reasoning.push_str(delta);
+                return;
+            }
+        }
+        self.view.push(ViewItem::Assistant {
+            text: String::new(),
+            reasoning: delta.to_string(),
+            streaming: true,
+        });
+    }
+
+    // ----- input handling -------------------------------------------------
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if ctrl => {
+                if self.running {
+                    self.cancel();
+                } else {
+                    self.quit = true;
+                }
+                return;
+            }
+            KeyCode::Char('d') if ctrl => {
+                if self.input.is_empty() && !self.running {
+                    self.quit = true;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(modal) = self.modal.take() {
+            self.handle_modal_key(modal, key);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                if self.pending_ask.is_some() {
+                    self.answer_question(String::new());
+                } else if self.running {
+                    self.cancel();
+                } else {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+            }
+            KeyCode::Enter => {
+                if self.pending_ask.is_some() {
+                    let answer = std::mem::take(&mut self.input);
+                    self.cursor = 0;
+                    self.answer_question(answer);
+                } else if !self.running {
+                    self.submit();
+                }
+            }
+            KeyCode::Char(character) => {
+                self.insert_char(character);
+            }
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => {
+                self.cursor = (self.cursor + 1).min(self.char_len());
+            }
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.char_len(),
+            KeyCode::Up => self.history_previous(),
+            KeyCode::Down => self.history_next(),
+            KeyCode::PageUp => {
+                self.scroll_back = self.scroll_back.saturating_add(10);
+                self.follow = false;
+            }
+            KeyCode::PageDown => {
+                self.scroll_back = self.scroll_back.saturating_sub(10);
+                if self.scroll_back == 0 {
+                    self.follow = true;
+                }
+            }
+            KeyCode::Tab => self.complete_command(),
+            _ => {}
+        }
+    }
+
+    fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent) {
+        self.modal = Some(modal);
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+                    let _ = reply.send(ApprovalDecision::Deny);
+                } else {
+                    self.modal = None;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+                    let _ = reply.send(ApprovalDecision::AllowOnce);
+                } else {
+                    self.modal = None;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+                    let _ = reply.send(ApprovalDecision::Deny);
+                } else {
+                    self.modal = None;
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+                    let _ = reply.send(ApprovalDecision::AllowAlways);
+                } else {
+                    self.modal = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_char(&mut self, character: char) {
+        let index = self.byte_index(self.cursor);
+        self.input.insert(index, character);
+        self.cursor += 1;
+        self.history_index = None;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.byte_index(self.cursor);
+        let start = self.byte_index(self.cursor - 1);
+        self.input.replace_range(start..end, "");
+        self.cursor -= 1;
+        self.history_index = None;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let start = self.byte_index(self.cursor);
+        let end = self.byte_index(self.cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn char_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn byte_index(&self, character_index: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(character_index)
+            .map(|(byte, _)| byte)
+            .unwrap_or(self.input.len())
+    }
+
+    fn history_previous(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => self.history.len() - 1,
+        };
+        self.history_index = Some(index);
+        self.input = self.history[index].clone();
+        self.cursor = self.char_len();
+    }
+
+    fn history_next(&mut self) {
+        if let Some(index) = self.history_index {
+            if index + 1 < self.history.len() {
+                self.history_index = Some(index + 1);
+                self.input = self.history[index + 1].clone();
+            } else {
+                self.history_index = None;
+                self.input.clear();
+            }
+            self.cursor = self.char_len();
+        }
+    }
+
+    fn complete_command(&mut self) {
+        if !self.input.starts_with('/') || self.input.contains(' ') {
+            return;
+        }
+        let commands = [
+            "/help",
+            "/new",
+            "/clear",
+            "/quit",
+            "/models",
+            "/model",
+            "/approval",
+            "/sessions",
+            "/resume",
+            "/cwd",
+            "/compact",
+        ];
+        if let Some(command) = commands
+            .iter()
+            .find(|command| command.starts_with(&self.input))
+        {
+            self.input = command.to_string();
+            self.cursor = self.char_len();
+        }
+    }
+
+    // ----- turn lifecycle -------------------------------------------------
+
+    pub fn submit(&mut self) {
+        let raw = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.history_index = None;
+        let raw = raw.trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        self.history.push(raw.clone());
+        if raw.starts_with('/') {
+            self.run_command(&raw);
+            return;
+        }
+        if let Some(command) = raw.strip_prefix('!') {
+            self.run_shell(command.trim().to_string());
+            return;
+        }
+        if self.running {
+            self.view.push(ViewItem::Info(
+                "A turn is already running; wait for it or press Esc to cancel.".to_string(),
+            ));
+            return;
+        }
+        let message_text = self.expand_mentions(&raw);
+        let user = Message::user(message_text);
+        self.messages.push(user.clone());
+        if let Err(error) = self.session.append_message(&user) {
+            self.view.push(ViewItem::Error(format!(
+                "failed to save session: {error:#}"
+            )));
+        }
+        self.view.push(ViewItem::User(raw));
+        self.view.push(ViewItem::Assistant {
+            text: String::new(),
+            reasoning: String::new(),
+            streaming: true,
+        });
+        self.start_agent();
+    }
+
+    fn start_agent(&mut self) {
+        self.running = true;
+        self.turn_started = Some(Instant::now());
+        self.tokens = Usage::default();
+        let tx = self.events_tx.clone();
+        let profile = self.profile.clone();
+        let kind = self.agent_kind;
+        let cwd = self.cwd.clone();
+        let max_rounds = self.settings.max_tool_rounds;
+        let approver = self.approver.clone();
+        let asker = self.asker.clone();
+        let tools = self.tools.clone();
+        let mut messages = self.messages.clone();
+        let sink: Arc<dyn EventSink> = Arc::new(TuiSink { tx: tx.clone() });
+        let handle = self.runtime.clone();
+        let task = handle.spawn(async move {
+            let result = async {
+                let client = Arc::new(ModelClient::from_profile(&profile)?);
+                let options = AgentOptions {
+                    kind,
+                    cwd,
+                    max_rounds,
+                    tool_timeout: Duration::from_secs(120),
+                };
+                let agent = Agent::new(client, tools, approver, asker, options);
+                agent.run(&mut messages, sink.as_ref()).await
+            }
+            .await;
+            let _ = tx.send(UiEvent::TurnFinished(
+                result.map_err(|error| format!("{error:#}")),
+                messages,
+            ));
+        });
+        self.cancel_handle = Some(task);
+    }
+
+    pub fn cancel(&mut self) {
+        if !self.running {
+            return;
+        }
+        if let Some(handle) = self.cancel_handle.take() {
+            handle.abort();
+        }
+        if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+            let _ = reply.send(ApprovalDecision::Deny);
+        }
+        if let Some(reply) = self.pending_ask.take() {
+            let _ = reply.send(String::new());
+        }
+        self.running = false;
+        self.turn_started = None;
+        for item in self.view.iter_mut().rev() {
+            if let ViewItem::Assistant { streaming, .. } = item {
+                *streaming = false;
+            }
+        }
+        self.view.push(ViewItem::Info("Cancelled.".to_string()));
+    }
+
+    fn answer_question(&mut self, answer: String) {
+        if let Some(reply) = self.pending_ask.take() {
+            let _ = reply.send(answer);
+        }
+    }
+
+    fn run_shell(&mut self, command: String) {
+        if self.running {
+            self.view.push(ViewItem::Info(
+                "A turn is already running; press Esc to cancel.".to_string(),
+            ));
+            return;
+        }
+        if command.is_empty() {
+            return;
+        }
+        self.running = true;
+        self.turn_started = Some(Instant::now());
+        self.view.push(ViewItem::Tool {
+            name: "bash".to_string(),
+            summary: command.clone(),
+            status: ToolStatus::Running,
+            ok: None,
+            duration: None,
+            output: String::new(),
+        });
+        let tx = self.events_tx.clone();
+        let cwd = self.cwd.clone();
+        let handle = self.runtime.clone();
+        let task = handle.spawn(async move {
+            let started = Instant::now();
+            let result =
+                crate::tools::shell::run_command(&command, &cwd, Duration::from_secs(120)).await;
+            let ok = result.is_ok();
+            match result {
+                Ok(output) => {
+                    let _ = tx.send(UiEvent::ToolFinished {
+                        name: "bash".to_string(),
+                        ok: true,
+                        duration: started.elapsed(),
+                        summary: command.clone(),
+                        output,
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(UiEvent::ToolFinished {
+                        name: "bash".to_string(),
+                        ok: false,
+                        duration: started.elapsed(),
+                        summary: command.clone(),
+                        output: format!("{error:#}"),
+                    });
+                }
+            }
+            let _ = tx.send(UiEvent::ShellFinished {
+                ok,
+                duration: started.elapsed(),
+            });
+        });
+        self.cancel_handle = Some(task);
+    }
+
+    fn expand_mentions(&self, input: &str) -> String {
+        let mut attachments = String::new();
+        let mut seen = std::collections::HashSet::new();
+        for token in input.split_whitespace() {
+            let Some(path) = token.strip_prefix('@') else {
+                continue;
+            };
+            if path.is_empty() || !seen.insert(path.to_string()) {
+                continue;
+            }
+            let full = self.cwd.join(path);
+            let Ok(content) = std::fs::read_to_string(&full) else {
+                continue;
+            };
+            let content = if content.chars().count() > 20_000 {
+                let head: String = content.chars().take(20_000).collect();
+                format!("{head}\n[... file truncated at 20000 characters ...]")
+            } else {
+                content
+            };
+            attachments.push_str(&format!("\n\nAttached file `{path}`:\n```\n{content}\n```"));
+        }
+        if attachments.is_empty() {
+            input.to_string()
+        } else {
+            format!("{input}{attachments}")
+        }
+    }
+
+    // ----- slash commands -------------------------------------------------
+
+    fn run_command(&mut self, raw: &str) {
+        let mut parts = raw.splitn(2, char::is_whitespace);
+        let command = parts.next().unwrap_or_default();
+        let argument = parts.next().unwrap_or_default().trim();
+        match command {
+            "/help" => self.modal = Some(Modal::Help),
+            "/quit" | "/exit" => self.quit = true,
+            "/new" | "/clear" => self.new_session(),
+            "/models" => self.list_models(),
+            "/model" => {
+                if argument.is_empty() {
+                    self.view.push(ViewItem::Info(format!(
+                        "Current model: {} ({}). Use /model <name> to switch.",
+                        self.profile.name, self.profile.model
+                    )));
+                } else if let Some(profile) = self
+                    .settings
+                    .models
+                    .iter()
+                    .find(|profile| profile.name == argument)
+                    .cloned()
+                {
+                    self.profile = profile;
+                    self.settings.current_model = Some(argument.to_string());
+                    if let Err(error) = self.settings.save() {
+                        self.view.push(ViewItem::Error(format!(
+                            "failed to save settings: {error:#}"
+                        )));
+                    }
+                    self.view.push(ViewItem::Info(format!(
+                        "Switched to model profile {argument} ({}).",
+                        self.profile.model
+                    )));
+                } else {
+                    self.view.push(ViewItem::Error(format!(
+                        "Unknown model profile {argument:?}; use /models to list them."
+                    )));
+                }
+            }
+            "/approval" => {
+                if argument.is_empty() {
+                    self.view.push(ViewItem::Info(format!(
+                        "Approval mode: {} (ask, auto or deny).",
+                        self.settings.approval_mode
+                    )));
+                } else if let Some(mode) = ApprovalMode::parse(argument) {
+                    self.settings.approval_mode = mode;
+                    self.approver = match mode {
+                        ApprovalMode::Auto => Arc::new(AllowAll),
+                        ApprovalMode::Deny => Arc::new(DenyAll),
+                        ApprovalMode::Ask => Arc::new(TuiApprover::new(self.events_tx.clone())),
+                    };
+                    self.view
+                        .push(ViewItem::Info(format!("Approval mode set to {mode}.")));
+                } else {
+                    self.view.push(ViewItem::Error(
+                        "Usage: /approval ask|auto|deny".to_string(),
+                    ));
+                }
+            }
+            "/sessions" => match self.store.list() {
+                Ok(sessions) if !sessions.is_empty() => {
+                    self.view
+                        .push(ViewItem::Info("Recent sessions:".to_string()));
+                    for session in sessions.iter().take(10) {
+                        self.view.push(ViewItem::Info(format!(
+                            "{} · {} · {}",
+                            session.id, session.model, session.preview
+                        )));
+                    }
+                    self.view.push(ViewItem::Info(
+                        "Use /resume <id> to continue a session.".to_string(),
+                    ));
+                }
+                Ok(_) => self
+                    .view
+                    .push(ViewItem::Info("No sessions yet.".to_string())),
+                Err(error) => self
+                    .view
+                    .push(ViewItem::Error(format!("cannot list sessions: {error:#}"))),
+            },
+            "/resume" => {
+                if argument.is_empty() {
+                    self.view
+                        .push(ViewItem::Error("Usage: /resume <session-id>".to_string()));
+                } else {
+                    match self.store.load(argument) {
+                        Ok(loaded) => {
+                            self.messages = loaded.messages();
+                            self.view = view_from_records(&loaded.records);
+                            self.cwd = PathBuf::from(&loaded.meta.cwd);
+                            self.session = match self.store.reopen(argument) {
+                                Ok(session) => session,
+                                Err(error) => {
+                                    self.view.push(ViewItem::Error(format!(
+                                        "cannot resume session: {error:#}"
+                                    )));
+                                    return;
+                                }
+                            };
+                            self.view.push(ViewItem::Info(format!(
+                                "Resumed session {} ({}).",
+                                loaded.meta.id, loaded.meta.cwd
+                            )));
+                        }
+                        Err(error) => self
+                            .view
+                            .push(ViewItem::Error(format!("cannot resume: {error:#}"))),
+                    }
+                }
+            }
+            "/cwd" => {
+                if argument.is_empty() {
+                    self.view.push(ViewItem::Info(format!(
+                        "Working directory: {}",
+                        self.cwd.display()
+                    )));
+                } else {
+                    let candidate = self.cwd.join(argument);
+                    match candidate.canonicalize() {
+                        Ok(path) if path.is_dir() => {
+                            self.cwd = path.clone();
+                            self.view.push(ViewItem::Info(format!(
+                                "Working directory is now {}.",
+                                path.display()
+                            )));
+                        }
+                        _ => self
+                            .view
+                            .push(ViewItem::Error(format!("{argument:?} is not a directory"))),
+                    }
+                }
+            }
+            "/compact" => self.view.push(ViewItem::Info(
+                "Context compaction is not implemented in the Rust port yet; use /new to start \
+                 a fresh session."
+                    .to_string(),
+            )),
+            _ => self.view.push(ViewItem::Error(format!(
+                "Unknown command {command:?}; use /help for the command list."
+            ))),
+        }
+    }
+
+    fn new_session(&mut self) {
+        self.messages.clear();
+        self.view = welcome();
+        match self.store.create(
+            &self.cwd.display().to_string(),
+            &self.profile.model,
+            self.agent_kind.as_str(),
+        ) {
+            Ok(session) => self.session = session,
+            Err(error) => self.view.push(ViewItem::Error(format!(
+                "failed to create session: {error:#}"
+            ))),
+        }
+        self.view
+            .push(ViewItem::Info("Started a new session.".to_string()));
+    }
+
+    fn list_models(&mut self) {
+        self.view
+            .push(ViewItem::Info("Model profiles:".to_string()));
+        for profile in &self.settings.models {
+            let marker = if profile.name == self.profile.name {
+                "* "
+            } else {
+                "  "
+            };
+            self.view.push(ViewItem::Info(format!(
+                "{marker}{} · {} · {}",
+                profile.name,
+                profile.model,
+                profile.resolved_base_url()
+            )));
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        let mut status = format!(
+            " {} · {} · {} · {} ",
+            self.agent_kind.display_name(),
+            self.profile.name,
+            self.settings.approval_mode,
+            self.cwd.display()
+        );
+        if self.tokens.total_tokens > 0 {
+            status.push_str(&format!("· {} tok ", self.tokens.total_tokens));
+        }
+        if self.running {
+            status.push_str("· working ");
+        } else if self.elapsed > Duration::ZERO {
+            status.push_str(&format!("· {:.1}s ", self.elapsed.as_secs_f64()));
+        }
+        status.push_str(&format!("· {} ", self.session.id()));
+        status
+    }
+}
+
+fn welcome() -> Vec<ViewItem> {
+    let mut items = vec![ViewItem::Info(format!(
+        "Welcome to {APP_NAME} {}. A Rust port of iCode.",
+        crate::APP_VERSION
+    ))];
+    items.push(ViewItem::Info(
+        "Ask a coding question, or try: explain this project; add tests for src/main.rs"
+            .to_string(),
+    ));
+    items.push(ViewItem::Info(
+        "Commands: /help · !<shell> · @<file> to attach a file".to_string(),
+    ));
+    items.push(ViewItem::Info(String::new()));
+    items
+}
+
+fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
+    let mut view = Vec::new();
+    for record in records {
+        match record {
+            crate::session::Record::User { text } => view.push(ViewItem::User(text.clone())),
+            crate::session::Record::Assistant { content, .. } => {
+                if let Some(content) = content {
+                    view.push(ViewItem::Assistant {
+                        text: content.clone(),
+                        reasoning: String::new(),
+                        streaming: false,
+                    });
+                }
+            }
+            crate::session::Record::Tool { name, content, .. } => view.push(ViewItem::Tool {
+                name: name.clone(),
+                summary: String::new(),
+                status: ToolStatus::Done,
+                ok: Some(!content.starts_with("Error:")),
+                duration: None,
+                output: preview_output(content),
+            }),
+            crate::session::Record::Meta { .. } | crate::session::Record::Usage { .. } => {}
+        }
+    }
+    view
+}
+
+fn preview_output(output: &str) -> String {
+    let truncated = truncate_output(output);
+    let mut lines: Vec<&str> = truncated.lines().collect();
+    if lines.len() > 8 {
+        lines.truncate(6);
+        let mut preview = lines.join("\n");
+        preview.push_str("\n… (output truncated)");
+        preview
+    } else {
+        lines.join("\n")
+    }
+}
+
+struct TuiSink {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+impl EventSink for TuiSink {
+    fn text_delta(&self, delta: &str) {
+        let _ = self.tx.send(UiEvent::TextDelta(delta.to_string()));
+    }
+
+    fn reasoning_delta(&self, delta: &str) {
+        let _ = self.tx.send(UiEvent::ReasoningDelta(delta.to_string()));
+    }
+
+    fn tool_started(&self, name: &str, summary: &str) {
+        let _ = self.tx.send(UiEvent::ToolStarted {
+            name: name.to_string(),
+            summary: summary.to_string(),
+        });
+    }
+
+    fn tool_finished(&self, name: &str, ok: bool, duration: Duration, summary: &str, output: &str) {
+        let _ = self.tx.send(UiEvent::ToolFinished {
+            name: name.to_string(),
+            ok,
+            duration,
+            summary: summary.to_string(),
+            output: output.to_string(),
+        });
+    }
+
+    fn message_added(&self, message: &Message) {
+        let _ = self.tx.send(UiEvent::MessageAdded(message.clone()));
+    }
+
+    fn usage(&self, usage: &Usage) {
+        let _ = self.tx.send(UiEvent::Usage(*usage));
+    }
+
+    fn info(&self, message: &str) {
+        let _ = self.tx.send(UiEvent::Info(message.to_string()));
+    }
+
+    fn error(&self, message: &str) {
+        let _ = self.tx.send(UiEvent::Error(message.to_string()));
+    }
+}
+
+struct TuiApprover {
+    tx: mpsc::UnboundedSender<UiEvent>,
+    always: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+impl TuiApprover {
+    fn new(tx: mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            tx,
+            always: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn always_allowed(&self, tool: &str) -> bool {
+        self.always
+            .lock()
+            .map(|always| always.contains(tool))
+            .unwrap_or(false)
+    }
+
+    fn remember(&self, tool: &str) {
+        if let Ok(mut always) = self.always.lock() {
+            always.insert(tool.to_string());
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Approver for TuiApprover {
+    async fn approve(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        if self.always_allowed(&request.tool) {
+            return ApprovalDecision::AllowOnce;
+        }
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(UiEvent::Approval {
+                request: request.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return ApprovalDecision::Deny;
+        }
+        let decision = response.await.unwrap_or(ApprovalDecision::Deny);
+        if decision == ApprovalDecision::AllowAlways {
+            self.remember(&request.tool);
+        }
+        decision
+    }
+}
+
+struct TuiAsker {
+    tx: mpsc::UnboundedSender<UiEvent>,
+}
+
+#[async_trait::async_trait]
+impl Asker for TuiAsker {
+    async fn ask(&self, question: &str) -> String {
+        let (reply, response) = oneshot::channel();
+        if self
+            .tx
+            .send(UiEvent::Ask {
+                question: question.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return String::new();
+        }
+        response.await.unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn always_allow_is_remembered_per_tool() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = Arc::new(TuiApprover::new(tx));
+        let request = ApprovalRequest::new("bash", "cargo test");
+        let first = {
+            let approver = approver.clone();
+            let request = request.clone();
+            tokio::spawn(async move { approver.approve(&request).await })
+        };
+        let event = rx.recv().await.expect("approval prompt");
+        match event {
+            UiEvent::Approval { reply, .. } => {
+                let _ = reply.send(ApprovalDecision::AllowAlways);
+            }
+            _ => panic!("expected an approval event"),
+        }
+        assert_eq!(first.await.unwrap(), ApprovalDecision::AllowAlways);
+
+        // The same tool is approved without asking again.
+        assert_eq!(
+            approver.approve(&request).await,
+            ApprovalDecision::AllowOnce
+        );
+        assert!(rx.try_recv().is_err(), "no second prompt for the same tool");
+
+        // A different tool still prompts.
+        let other = ApprovalRequest::new("write_file", "notes.txt");
+        let pending = {
+            let approver = approver.clone();
+            tokio::spawn(async move { approver.approve(&other).await })
+        };
+        match rx.recv().await.expect("second prompt") {
+            UiEvent::Approval { reply, .. } => {
+                let _ = reply.send(ApprovalDecision::Deny);
+            }
+            _ => panic!("expected an approval event"),
+        }
+        assert_eq!(pending.await.unwrap(), ApprovalDecision::Deny);
+    }
+}
