@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "zh-CN"
+reviews:
+  auto_review:
+    enabled: true
+    drafts: false
+  profile: "chill"
+  high_level_summary: true
+  review_status: true
+  poem: false
+  path_filters:
+    - "!LICENSE"
+  path_instructions:
+    - path: "**/*.rs"
+      instructions: |
+        - 关注 Rust 惯用法、错误处理（Result/Option）、所有权与借用
+        - 指出不必要的 clone / unwrap / panic
+        - 提示 clippy 常见问题与性能隐患
+chat:
+  auto_reply: true
