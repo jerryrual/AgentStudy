@@ -42,6 +42,10 @@ impl Tool for ReadFile {
         })
     }
 
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     fn summarize(&self, raw: &str) -> String {
         match serde_json::from_str::<Value>(raw) {
             Ok(arguments) => {
@@ -316,6 +320,10 @@ impl Tool for ListDir {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum entries to return (default 300)."}
             }
         })
+    }
+
+    fn parallel_safe(&self) -> bool {
+        true
     }
 
     fn summarize(&self, raw: &str) -> String {

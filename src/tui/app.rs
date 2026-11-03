@@ -247,7 +247,10 @@ impl App {
                 output,
             } => {
                 let preview = preview_output(&output);
-                let found = self.view.iter_mut().rev().find_map(|item| match item {
+                // Parallel batches emit starts and finishes in provider order.
+                // Match the oldest identical running card so duplicate calls do
+                // not swap their outputs.
+                let found = self.view.iter_mut().find_map(|item| match item {
                     ViewItem::Tool {
                         name: tool_name,
                         summary: tool_summary,
@@ -691,9 +694,17 @@ impl App {
         }
         self.running = false;
         self.turn_started = None;
-        for item in self.view.iter_mut().rev() {
-            if let ViewItem::Assistant { streaming, .. } = item {
-                *streaming = false;
+        for item in &mut self.view {
+            match item {
+                ViewItem::Assistant { streaming, .. } => *streaming = false,
+                ViewItem::Tool {
+                    status, ok, output, ..
+                } if *status == ToolStatus::Running => {
+                    *status = ToolStatus::Done;
+                    *ok = Some(false);
+                    *output = "Cancelled.".to_string();
+                }
+                _ => {}
             }
         }
         self.view.push(ViewItem::Info("Cancelled.".to_string()));

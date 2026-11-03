@@ -44,6 +44,10 @@ impl Tool for Grep {
         })
     }
 
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     fn summarize(&self, raw: &str) -> String {
         match serde_json::from_str::<Value>(raw) {
             Ok(arguments) => {
@@ -180,6 +184,10 @@ impl Tool for Glob {
             },
             "required": ["pattern"]
         })
+    }
+
+    fn parallel_safe(&self) -> bool {
+        true
     }
 
     fn summarize(&self, raw: &str) -> String {

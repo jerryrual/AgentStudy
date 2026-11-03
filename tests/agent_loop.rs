@@ -112,6 +112,49 @@ async fn executes_tool_calls_and_feeds_results_back() {
 }
 
 #[tokio::test]
+async fn parallel_read_results_are_sent_back_in_provider_order() {
+    let server = MockServer::new(|_path, body| {
+        let tool_results = body["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "tool")
+                    .count()
+            })
+            .unwrap_or_default();
+        if tool_results == 2 {
+            MockResponse::sse(&[&text_chunk("both read"), &done_chunk("stop")])
+        } else {
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}},{"index":1,"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"b.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                &done_chunk("tool_calls"),
+            ])
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(directory.path().join("b.txt"), "beta\n").unwrap();
+    let agent = build_agent(&server, directory.path(), Arc::new(AllowAll));
+    let sink = RecordingSink::default();
+    let mut messages = vec![Message::user("read both")];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+    assert_eq!(turn.text, "both read");
+    assert_eq!(turn.tool_calls, 2);
+
+    let requests = server.requests();
+    let tool_ids: Vec<_> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["tool_call_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(tool_ids, ["call_a", "call_b"]);
+}
+
+#[tokio::test]
 async fn mutating_tools_require_approval() {
     let server = MockServer::new(|_path, body| {
         let has_tool_result = body["messages"]
