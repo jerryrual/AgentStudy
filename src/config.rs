@@ -369,6 +369,7 @@ fn placeholder_inner(raw: &str) -> Option<&str> {
 
 fn run_secret_command(command: &str) -> Result<String> {
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
 
     if command.is_empty() {
         bail!("API key command is empty");
@@ -386,8 +387,15 @@ fn run_secret_command(command: &str) -> Result<String> {
     // a full pipe buffer while we poll for completion.
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_reader = std::thread::spawn(move || read_all(stdout));
-    let stderr_reader = std::thread::spawn(move || read_all(stderr));
+    let (sender, receiver) = mpsc::channel();
+    let stdout_sender = sender.clone();
+    std::thread::spawn(move || {
+        let _ = stdout_sender.send((Stream::Stdout, read_capped(stdout)));
+    });
+    let stderr_sender = sender;
+    std::thread::spawn(move || {
+        let _ = stderr_sender.send((Stream::Stderr, read_capped(stderr)));
+    });
 
     let started = Instant::now();
     let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
@@ -398,41 +406,99 @@ fn run_secret_command(command: &str) -> Result<String> {
                 if started.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    let _ = collect_output(&receiver);
                     bail!("API key command {command:?} timed out after {DEFAULT_TIMEOUT_SECS}s");
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(error) => {
                 let _ = child.kill();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                let _ = collect_output(&receiver);
                 bail!("failed to wait for API key command {command:?}: {error}");
             }
         }
     };
 
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
+    let output = collect_output(&receiver);
+    if output.truncated {
+        bail!(
+            "API key command {command:?} produced more than {} KiB of output",
+            SECRET_OUTPUT_CAP / 1024
+        );
+    }
     if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "API key command {command:?} exited with {status}: {}",
             stderr.trim()
         );
     }
-    let key = String::from_utf8_lossy(&stdout).trim().to_string();
+    let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if key.is_empty() {
         bail!("API key command {command:?} produced no output");
     }
     Ok(key)
 }
 
-fn read_all(mut reader: impl std::io::Read) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let _ = reader.read_to_end(&mut buffer);
-    buffer
+/// Bytes captured per stream from an API-key command.
+const SECRET_OUTPUT_CAP: usize = 64 * 1024;
+/// Upper bound for waiting for inherited pipe handles to close.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
+
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+/// Collect both reader results, but never wait past [`READER_JOIN_TIMEOUT`]:
+/// a background process can keep an inherited pipe open after the shell exits.
+fn collect_output(
+    receiver: &std::sync::mpsc::Receiver<(Stream, (Vec<u8>, bool))>,
+) -> CapturedOutput {
+    let mut output = CapturedOutput::default();
+    let deadline = Instant::now() + READER_JOIN_TIMEOUT;
+    for _ in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok((stream, (bytes, truncated))) = receiver.recv_timeout(remaining) else {
+            break;
+        };
+        match stream {
+            Stream::Stdout => output.stdout = bytes,
+            Stream::Stderr => output.stderr = bytes,
+        }
+        output.truncated |= truncated;
+    }
+    output
+}
+
+fn read_capped(mut reader: impl std::io::Read) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if kept.len() < SECRET_OUTPUT_CAP {
+                    let take = (SECRET_OUTPUT_CAP - kept.len()).min(read);
+                    kept.extend_from_slice(&buffer[..take]);
+                    if take < read {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+    }
+    (kept, truncated)
 }
 
 #[cfg(test)]

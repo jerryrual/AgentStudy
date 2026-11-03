@@ -138,8 +138,6 @@ pub fn execute(cli: Cli) -> Result<()> {
             }))
         }
         None => {
-            // The CLI override must win over the settings file for the TUI too.
-            settings.approval_mode = approval;
             let resume = if cli.continue_session {
                 store
                     .latest()
@@ -155,6 +153,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                 resume,
                 store,
                 theme: Theme::default(),
+                approval,
             })
         }
     }

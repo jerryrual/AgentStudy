@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use crate::agent::AgentKind;
-use crate::config::{ModelProfile, Settings};
+use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::session::SessionStore;
 use crate::theme::Theme;
 
@@ -25,6 +25,8 @@ pub struct TuiOptions {
     pub resume: Option<String>,
     pub store: SessionStore,
     pub theme: Theme,
+    /// Effective approval mode (may come from `--approval`).
+    pub approval: ApprovalMode,
 }
 
 /// Run the TUI until the user quits.
@@ -43,6 +45,7 @@ pub fn run(options: TuiOptions) -> Result<()> {
             store: options.store,
             resume: options.resume,
             theme: options.theme,
+            approval: options.approval,
         },
     )?;
     let mut terminal = ratatui::try_init().context("failed to initialize the terminal")?;
@@ -61,7 +64,13 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         if event::poll(Duration::from_millis(40)).context("failed to poll for terminal input")? {
             if let Event::Key(key) = event::read().context("failed to read terminal input")? {
                 if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
+                    let size = terminal
+                        .size()
+                        .context("failed to read the terminal size")?;
+                    app.handle_key(
+                        key,
+                        ratatui::layout::Rect::new(0, 0, size.width, size.height),
+                    );
                 }
             }
         }

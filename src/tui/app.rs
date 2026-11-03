@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
@@ -98,12 +99,16 @@ pub struct AppOptions {
     pub store: SessionStore,
     pub resume: Option<String>,
     pub theme: Theme,
+    /// Effective approval mode for this run; a `--approval` override stays out
+    /// of the persisted settings unless the user changes it with `/approval`.
+    pub approval: ApprovalMode,
 }
 
 pub struct App {
     pub settings: Settings,
     pub profile: ModelProfile,
     pub agent_kind: AgentKind,
+    pub approval_mode: ApprovalMode,
     pub cwd: PathBuf,
     pub theme: Theme,
     pub store: SessionStore,
@@ -137,7 +142,7 @@ pub struct App {
 impl App {
     pub fn new(runtime: Handle, options: AppOptions) -> Result<Self> {
         let (events_tx, events) = mpsc::unbounded_channel();
-        let approver: Arc<dyn Approver> = match options.settings.approval_mode {
+        let approver: Arc<dyn Approver> = match options.approval {
             ApprovalMode::Auto => Arc::new(AllowAll),
             ApprovalMode::Deny => Arc::new(DenyAll),
             ApprovalMode::Ask => Arc::new(TuiApprover::new(events_tx.clone())),
@@ -166,6 +171,7 @@ impl App {
             settings: options.settings,
             profile: options.profile,
             agent_kind: options.agent,
+            approval_mode: options.approval,
             cwd: options.cwd,
             theme: options.theme,
             store: options.store,
@@ -383,7 +389,7 @@ impl App {
 
     // ----- input handling -------------------------------------------------
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent, screen: Rect) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => {
@@ -404,7 +410,7 @@ impl App {
         }
 
         if let Some(modal) = self.modal.take() {
-            self.handle_modal_key(modal, key);
+            self.handle_modal_key(modal, key, screen);
             return;
         }
 
@@ -456,38 +462,42 @@ impl App {
         }
     }
 
-    fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent) {
+    fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent, screen: Rect) {
         self.modal = Some(modal);
         match key.code {
-            KeyCode::Esc => {
-                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
-                    let _ = reply.send(ApprovalDecision::Deny);
-                } else {
-                    self.modal = None;
-                }
-            }
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
-                    let _ = reply.send(ApprovalDecision::AllowOnce);
-                } else {
-                    self.modal = None;
-                }
+            KeyCode::Esc => self.decide_approval(ApprovalDecision::Deny, screen),
+            // Enter is deliberately not bound: an accidental Enter must not
+            // approve a tool call the user has not read.
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.decide_approval(ApprovalDecision::AllowOnce, screen)
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
-                    let _ = reply.send(ApprovalDecision::Deny);
-                } else {
-                    self.modal = None;
-                }
+                self.decide_approval(ApprovalDecision::Deny, screen)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
-                    let _ = reply.send(ApprovalDecision::AllowAlways);
-                } else {
-                    self.modal = None;
-                }
+                self.decide_approval(ApprovalDecision::AllowAlways, screen)
             }
             _ => {}
+        }
+    }
+
+    /// Approve or deny the pending request. Allow decisions are refused while
+    /// the dialog has to clip the command, so the user cannot approve text they
+    /// cannot read.
+    fn decide_approval(&mut self, decision: ApprovalDecision, screen: Rect) {
+        let Some(Modal::Approval { request, .. }) = &self.modal else {
+            self.modal = None;
+            return;
+        };
+        if matches!(
+            decision,
+            ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
+        ) && approval_is_clipped(screen, &request.tool, &request.summary)
+        {
+            return;
+        }
+        if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
+            let _ = reply.send(decision);
         }
     }
 
@@ -831,9 +841,12 @@ impl App {
                 if argument.is_empty() {
                     self.view.push(ViewItem::Info(format!(
                         "Approval mode: {} (ask, auto or deny).",
-                        self.settings.approval_mode
+                        self.approval_mode
                     )));
                 } else if let Some(mode) = ApprovalMode::parse(argument) {
+                    self.approval_mode = mode;
+                    // An explicit /approval change is persisted; a CLI override
+                    // alone is not.
                     self.settings.approval_mode = mode;
                     self.approver = match mode {
                         ApprovalMode::Auto => Arc::new(AllowAll),
@@ -976,7 +989,7 @@ impl App {
             " {} · {} · {} · {} ",
             self.agent_kind.display_name(),
             self.profile.name,
-            self.settings.approval_mode,
+            self.approval_mode,
             self.cwd.display()
         );
         if self.tokens.total_tokens > 0 {
@@ -990,6 +1003,26 @@ impl App {
         status.push_str(&format!("· {} ", self.session.id()));
         status
     }
+}
+
+/// Whether the approval dialog cannot show the whole command at this size.
+///
+/// Must stay in sync with `ui::draw_approval`; allows are refused when true.
+pub(crate) fn approval_is_clipped(screen: Rect, tool: &str, summary: &str) -> bool {
+    let outer = ((screen.width as u32 * 70 / 100) as u16).max(20);
+    let interior = outer.saturating_sub(2).max(10) as usize;
+    let summary_lines = wrapped_line_count(&format!("  {tool}: {summary}"), interior);
+    let hint_lines = wrapped_line_count(
+        "  y allow once · a always allow · n deny · esc deny",
+        interior,
+    );
+    summary_lines + 1 + hint_lines + 2 > screen.height as usize
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    text.split('\n')
+        .map(|line| line.chars().count().div_ceil(width.max(1)).max(1))
+        .sum()
 }
 
 fn welcome() -> Vec<ViewItem> {

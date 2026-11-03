@@ -45,9 +45,9 @@ impl SseParser {
                 line.pop();
             }
             let line = String::from_utf8_lossy(&line).to_string();
-            self.consume_line(&line, &mut events);
+            self.consume_line(&line, &mut events)?;
         }
-        if self.buffer.len() > MAX_EVENT_BYTES || self.data.len() > MAX_EVENT_BYTES {
+        if self.buffer.len() > MAX_EVENT_BYTES {
             return Err(SseTooLarge);
         }
         Ok(events)
@@ -63,7 +63,7 @@ impl SseParser {
             }
             let line = String::from_utf8_lossy(&self.buffer).to_string();
             self.buffer.clear();
-            self.consume_line(&line, &mut events);
+            self.consume_line(&line, &mut events)?;
         }
         if self.has_data {
             events.push(std::mem::take(&mut self.data));
@@ -72,28 +72,33 @@ impl SseParser {
         Ok(events)
     }
 
-    fn consume_line(&mut self, line: &str, events: &mut Vec<String>) {
+    fn consume_line(&mut self, line: &str, events: &mut Vec<String>) -> Result<(), SseTooLarge> {
         if line.is_empty() {
             if self.has_data {
                 events.push(std::mem::take(&mut self.data));
                 self.has_data = false;
             }
-            return;
+            return Ok(());
         }
         if line.starts_with(':') {
             // Comment / keep-alive.
-            return;
+            return Ok(());
         }
         let Some(rest) = line.strip_prefix("data:") else {
             // `event:`, `id:`, `retry:` fields are not used by the chat API.
-            return;
+            return Ok(());
         };
         let payload = rest.strip_prefix(' ').unwrap_or(rest);
+        let separator = usize::from(self.has_data);
+        if self.data.len() + separator + payload.len() > MAX_EVENT_BYTES {
+            return Err(SseTooLarge);
+        }
         if self.has_data {
             self.data.push('\n');
         }
         self.data.push_str(payload);
         self.has_data = true;
+        Ok(())
     }
 }
 
@@ -149,5 +154,15 @@ mod tests {
         let mut parser = SseParser::new();
         let line = format!("data: {}\n", "a".repeat(MAX_EVENT_BYTES + 1));
         assert_eq!(parser.push(line.as_bytes()), Err(SseTooLarge));
+    }
+
+    #[test]
+    fn rejects_oversized_event_before_dispatch() {
+        let mut parser = SseParser::new();
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(b"data: ");
+        chunk.extend(std::iter::repeat_n(b'a', MAX_EVENT_BYTES + 1));
+        chunk.extend_from_slice(b"\n\n");
+        assert_eq!(parser.push(&chunk), Err(SseTooLarge));
     }
 }

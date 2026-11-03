@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{App, Modal, ToolStatus, ViewItem};
+use super::app::{approval_is_clipped, App, Modal, ToolStatus, ViewItem};
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -388,21 +388,34 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: 
     // word that Paragraph does not break.
     let outer_width = ((area.width as u32 * 70 / 100) as u16).max(20);
     let interior = outer_width.saturating_sub(2).max(10) as usize;
-    let mut lines = wrap_line(
+    let clipped = approval_is_clipped(area, tool, summary);
+    let mut lines = Vec::new();
+    if clipped {
+        lines.extend(wrap_line(
+            Line::from(Span::styled(
+                "  ⚠ command clipped — approval disabled; resize, or press n/esc",
+                Style::default().fg(app.theme.warning),
+            )),
+            interior,
+        ));
+    }
+    lines.extend(wrap_line(
         Line::from(Span::styled(
             format!("  {tool}: {summary}"),
             Style::default().fg(app.theme.text),
         )),
         interior,
-    );
-    lines.push(Line::default());
-    lines.extend(wrap_line(
-        Line::from(Span::styled(
-            "  y allow once · a always allow · n deny · esc deny",
-            Style::default().fg(app.theme.dim),
-        )),
-        interior,
     ));
+    if !clipped {
+        lines.push(Line::default());
+        lines.extend(wrap_line(
+            Line::from(Span::styled(
+                "  y allow once · a always allow · n deny · esc deny",
+                Style::default().fg(app.theme.dim),
+            )),
+            interior,
+        ));
+    }
     let height = (lines.len() as u16 + 2)
         .clamp(7, area.height.max(7))
         .min(area.height.max(1));
@@ -469,7 +482,7 @@ fn centered(area: Rect, percent_x: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
-    use crate::config::{ModelProfile, Settings};
+    use crate::config::{ApprovalMode, ModelProfile, Settings};
     use crate::session::SessionStore;
     use crate::tui::app::{App, AppOptions};
     use ratatui::backend::TestBackend;
@@ -500,6 +513,7 @@ mod tests {
                 store: SessionStore::with_root(path.join("sessions")),
                 resume: None,
                 theme: Theme::default(),
+                approval: ApprovalMode::Ask,
             },
         )
         .unwrap()
@@ -588,6 +602,53 @@ mod tests {
         });
         let output = render(&mut app, 100, 30);
         assert!(output.contains("THE-END-MARKER"), "{output}");
+    }
+
+    #[test]
+    fn clipped_command_disables_approval() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        let command = format!("echo {}", "x".repeat(400));
+        app.modal = Some(Modal::Approval {
+            request: crate::interaction::ApprovalRequest::new("bash", &command),
+            reply,
+        });
+        let screen = ratatui::layout::Rect::new(0, 0, 60, 9);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            screen,
+        );
+        assert!(app.modal.is_some(), "clipped approval stays open");
+        assert!(rx.try_recv().is_err(), "no decision is sent");
+
+        let output = render(&mut app, 60, 9);
+        assert!(output.contains("approval disabled"), "{output}");
+    }
+
+    #[test]
+    fn enter_does_not_approve_a_tool_call() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        app.modal = Some(Modal::Approval {
+            request: crate::interaction::ApprovalRequest::new("bash", "cargo test"),
+            reply,
+        });
+        let screen = ratatui::layout::Rect::new(0, 0, 100, 30);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        assert!(app.modal.is_some());
+        assert!(rx.try_recv().is_err());
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            screen,
+        );
+        assert!(app.modal.is_none());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::interaction::ApprovalDecision::AllowOnce
+        );
     }
 
     #[test]
