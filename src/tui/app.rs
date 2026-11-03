@@ -492,7 +492,7 @@ impl App {
         if matches!(
             decision,
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
-        ) && approval_is_clipped(screen, &request.tool, &request.summary)
+        ) && approval_layout(screen, &request.tool, &request.summary).clipped
         {
             return;
         }
@@ -1005,24 +1005,72 @@ impl App {
     }
 }
 
-/// Whether the approval dialog cannot show the whole command at this size.
+/// Geometry shared by the approval dialog renderer and the allow guard.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ApprovalLayout {
+    /// Text width inside the popup borders.
+    pub interior: usize,
+    /// True when the command and hints cannot fit in the popup.
+    pub clipped: bool,
+}
+
+/// Compute the approval popup geometry for the current terminal size.
 ///
-/// Must stay in sync with `ui::draw_approval`; allows are refused when true.
-pub(crate) fn approval_is_clipped(screen: Rect, tool: &str, summary: &str) -> bool {
-    let outer = ((screen.width as u32 * 70 / 100) as u16).max(20);
-    let interior = outer.saturating_sub(2).max(10) as usize;
-    let summary_lines = wrapped_line_count(&format!("  {tool}: {summary}"), interior);
-    let hint_lines = wrapped_line_count(
+/// `ui::draw_approval` renders with this layout, and `decide_approval` refuses
+/// allow decisions when `clipped` is set, so approval can never be granted for
+/// text the user cannot see.
+pub(crate) fn approval_layout(screen: Rect, tool: &str, summary: &str) -> ApprovalLayout {
+    // Keep in sync with `centered(area, 70, height)` in the renderer.
+    let popup_width = (screen.width as u32 * 70 / 100) as u16;
+    let interior = popup_width.saturating_sub(2) as usize;
+    if interior < 10 {
+        return ApprovalLayout {
+            interior: interior.max(1),
+            clipped: true,
+        };
+    }
+    let summary_lines = wrapped_cell_lines(&format!("  {tool}: {summary}"), interior);
+    let hint_lines = wrapped_cell_lines(
         "  y allow once · a always allow · n deny · esc deny",
         interior,
     );
-    summary_lines + 1 + hint_lines + 2 > screen.height as usize
+    let needed = summary_lines + 1 + hint_lines + 2;
+    ApprovalLayout {
+        interior,
+        clipped: needed > screen.height as usize,
+    }
 }
 
-fn wrapped_line_count(text: &str, width: usize) -> usize {
-    text.split('\n')
-        .map(|line| line.chars().count().div_ceil(width.max(1)).max(1))
-        .sum()
+/// Count the display rows `wrap_line` would produce, counting wide characters
+/// as two cells.
+fn wrapped_cell_lines(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut total = 0;
+    for line in text.split('\n') {
+        let mut rows = 0usize;
+        let mut current = 0usize;
+        for character in line.chars() {
+            let character_width = unicode_width::UnicodeWidthChar::width(character)
+                .unwrap_or(0)
+                .max(1);
+            if current + character_width > width && current > 0 {
+                rows += 1;
+                current = 0;
+            }
+            current += character_width;
+            if current >= width {
+                rows += 1;
+                current = 0;
+            }
+        }
+        if current > 0 || rows == 0 {
+            rows += 1;
+        }
+        total += rows;
+    }
+    total.max(1)
 }
 
 fn welcome() -> Vec<ViewItem> {
@@ -1206,6 +1254,20 @@ impl Asker for TuiAsker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipping_uses_display_width_and_popup_width() {
+        let wide = "写".repeat(30);
+        // At 40x7 a character-count heuristic would claim the command fits,
+        // but the wide characters need one more rendered row.
+        assert!(
+            approval_layout(Rect::new(0, 0, 40, 7), "bash", &wide).clipped,
+            "{wide}"
+        );
+        assert!(!approval_layout(Rect::new(0, 0, 120, 40), "bash", "cargo test").clipped);
+        // A very narrow popup has too little room for the text: refuse.
+        assert!(approval_layout(Rect::new(0, 0, 12, 20), "bash", "cargo test").clipped);
+    }
 
     #[tokio::test]
     async fn always_allow_is_remembered_per_tool() {

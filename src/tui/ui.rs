@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{approval_is_clipped, App, Modal, ToolStatus, ViewItem};
+use super::app::{approval_layout, App, Modal, ToolStatus, ViewItem};
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -386,9 +386,9 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: 
     // Grow the dialog so the complete command stays reviewable. The summary is
     // wrapped here (not by Paragraph) because commands are often a single long
     // word that Paragraph does not break.
-    let outer_width = ((area.width as u32 * 70 / 100) as u16).max(20);
-    let interior = outer_width.saturating_sub(2).max(10) as usize;
-    let clipped = approval_is_clipped(area, tool, summary);
+    let layout = approval_layout(area, tool, summary);
+    let interior = layout.interior;
+    let clipped = layout.clipped;
     let mut lines = Vec::new();
     if clipped {
         lines.extend(wrap_line(
