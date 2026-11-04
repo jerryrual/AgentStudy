@@ -1,5 +1,6 @@
 //! Loads project-local reference context from `AGENTS.md`.
 
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -19,9 +20,10 @@ pub struct ProjectMemory {
 
 /// Load the default `AGENTS.md` memory source for a workspace.
 ///
-/// Missing, unreadable and non-regular files are a silent no-op. A symlink is
-/// accepted only when its physical target remains inside the workspace. Text
-/// decoding is lossy, matching upstream's nonfatal decoding behavior.
+/// Missing, unreadable and non-regular files are a silent no-op. Symlinked
+/// `AGENTS.md` entries are ignored so implicit memory cannot disclose another
+/// workspace file. Text decoding is lossy, matching upstream's nonfatal
+/// decoding behavior.
 pub fn load_project_memory(cwd: &Path) -> ProjectMemory {
     load_project_memory_with_limit(cwd, DEFAULT_MAX_MEMORY_TOKENS)
 }
@@ -35,11 +37,11 @@ fn load_project_memory_with_limit(cwd: &Path, max_tokens: usize) -> ProjectMemor
         return ProjectMemory::default();
     }
 
-    let candidate = cwd.join(DEFAULT_MEMORY_FILE);
-    let Ok(path) = candidate.canonicalize() else {
+    let path = cwd.join(DEFAULT_MEMORY_FILE);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
         return ProjectMemory::default();
     };
-    if !path.starts_with(&cwd) || !path.is_file() {
+    if !metadata.file_type().is_file() {
         return ProjectMemory::default();
     }
 
@@ -90,10 +92,36 @@ enum BoundedRead {
 
 /// Read a memory file without allowing an unexpectedly large allocation.
 fn read_lossy_bounded(path: &Path, max_bytes: usize) -> BoundedRead {
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(mut file) = open_without_following_symlinks(path) else {
         return BoundedRead::Unavailable;
     };
     read_lossy_bounded_from(&mut file, max_bytes)
+}
+
+#[cfg(unix)]
+fn open_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).open(path)
 }
 
 fn read_lossy_bounded_from(reader: &mut impl Read, max_bytes: usize) -> BoundedRead {
@@ -183,7 +211,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn accepts_contained_symlinks_but_rejects_workspace_escape() {
+    fn rejects_symlinked_memory_files() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -191,7 +219,7 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("instructions.md"), "inside").unwrap();
         symlink("instructions.md", workspace.join("AGENTS.md")).unwrap();
-        assert!(load_project_memory(&workspace).prompt.ends_with("inside"));
+        assert_eq!(load_project_memory(&workspace), ProjectMemory::default());
 
         std::fs::remove_file(workspace.join("AGENTS.md")).unwrap();
         std::fs::write(temp.path().join("outside.md"), "outside").unwrap();
