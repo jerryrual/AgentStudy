@@ -724,6 +724,25 @@ mod tests {
     }
 
     #[test]
+    fn compaction_refuses_unsaved_messages() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = test_app();
+        app.unsaved_messages = true;
+        app.input = "/compact".to_string();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+
+        assert!(!app.running);
+        assert!(app.view.iter().any(
+            |item| matches!(item, ViewItem::Error(message) if message.contains("were not saved"))
+        ));
+    }
+
+    #[test]
     fn completed_compaction_replaces_and_persists_model_context() {
         use crate::compaction::Compaction;
         use crate::model::{Message, Usage};

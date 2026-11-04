@@ -123,6 +123,7 @@ pub struct App {
     pub store: SessionStore,
     pub session: Session,
     recorder: RecordBuffer,
+    pub(crate) unsaved_messages: bool,
     pub messages: Vec<Message>,
     pub view: Vec<ViewItem>,
     pub input: String,
@@ -187,6 +188,7 @@ impl App {
             store: options.store,
             session,
             recorder: RecordBuffer::default(),
+            unsaved_messages: false,
             messages,
             view,
             input: String::new(),
@@ -314,6 +316,7 @@ impl App {
             UiEvent::Usage(usage) => self.tokens.add(usage),
             UiEvent::MessageAdded(message) => {
                 if let Err(error) = self.recorder.record(&self.session, &message) {
+                    self.unsaved_messages = true;
                     self.view.push(ViewItem::Error(format!(
                         "failed to save session: {error:#}"
                     )));
@@ -388,6 +391,7 @@ impl App {
                         self.messages =
                             vec![crate::compaction::summary_message(&compaction.summary)];
                         self.recorder.reset();
+                        self.unsaved_messages = false;
                         self.tokens.add(compaction.usage);
                         let usage_error = self
                             .session
@@ -702,6 +706,7 @@ impl App {
         let user = Message::user(message_text);
         self.messages.push(user.clone());
         if let Err(error) = self.session.append_message(&user) {
+            self.unsaved_messages = true;
             self.view.push(ViewItem::Error(format!(
                 "failed to save session: {error:#}"
             )));
@@ -808,6 +813,12 @@ impl App {
     }
 
     fn start_compaction(&mut self) {
+        if self.unsaved_messages {
+            self.view.push(ViewItem::Error(
+                "Cannot compact: some conversation messages were not saved.".to_string(),
+            ));
+            return;
+        }
         let messages = match self.compaction_messages() {
             Ok(messages) => messages,
             Err(error) => {
@@ -1068,6 +1079,7 @@ impl App {
                                 }
                             };
                             self.recorder.reset();
+                            self.unsaved_messages = false;
                             self.view.push(ViewItem::Info(format!(
                                 "Resumed session {} ({}).",
                                 loaded.meta.id, loaded.meta.cwd
@@ -1119,6 +1131,7 @@ impl App {
             Ok(session) => {
                 self.session = session;
                 self.recorder.reset();
+                self.unsaved_messages = false;
             }
             Err(error) => self.view.push(ViewItem::Error(format!(
                 "failed to create session: {error:#}"

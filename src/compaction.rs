@@ -38,10 +38,10 @@ pub async fn compact(client: &ModelClient, messages: &[Message]) -> Result<Compa
         )),
     ];
     let completion = client.complete(&request, &[], &QuietSink).await?;
-    if completion.finish_reason != "stop" {
+    if completion.finish_reason.as_deref() != Some("stop") {
         bail!(
             "the model did not finish the compaction summary (finish reason: {})",
-            completion.finish_reason
+            completion.finish_reason.as_deref().unwrap_or("missing")
         );
     }
     let summary = completion

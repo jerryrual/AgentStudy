@@ -43,6 +43,25 @@ async fn model_compaction_sends_transcript_as_data_and_returns_summary() {
 }
 
 #[tokio::test]
+async fn model_compaction_rejects_missing_finish_reason() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::sse(&[
+            r#"{"choices":[{"delta":{"content":"Apparently complete summary"}}],"usage":{"prompt_tokens":40,"completion_tokens":6,"total_tokens":46}}"#,
+        ])
+    });
+    let client = ModelClient::from_profile(&mock_profile(server.base_url())).unwrap();
+
+    let error = compaction::compact(&client, &[Message::user("important context")])
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("finish reason: missing"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
 async fn model_compaction_rejects_truncated_summaries() {
     let server = MockServer::new(|_, _| {
         MockResponse::sse(&[
