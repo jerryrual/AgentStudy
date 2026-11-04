@@ -211,6 +211,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn no_follow_open_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.md");
+        let link = temp.path().join("AGENTS.md");
+        std::fs::write(&target, "target").unwrap();
+        symlink("target.md", &link).unwrap();
+
+        assert!(open_without_following_symlinks(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_symlinked_memory_files() {
         use std::os::unix::fs::symlink;
 
