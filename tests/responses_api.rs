@@ -200,11 +200,10 @@ async fn responses_non_streaming_json_extracts_output_text_and_usage() {
                     "id": "msg_json",
                     "type": "message",
                     "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": "Hello from Responses.",
-                        "annotations": []
-                    }]
+                    "content": [
+                        {"type": "output_text", "text": "Hello ", "annotations": []},
+                        {"type": "output_text", "text": "from Responses.", "annotations": []}
+                    ]
                 }],
                 "usage": {
                     "input_tokens": 4,

@@ -100,6 +100,8 @@ pub(super) fn request_body(
 #[derive(Default)]
 pub(super) struct ResponsesAccumulator {
     text: String,
+    snapshot_text: BTreeMap<usize, String>,
+    text_streamed: bool,
     reasoning: String,
     calls: BTreeMap<usize, ToolCall>,
     items: BTreeMap<usize, Value>,
@@ -228,21 +230,20 @@ impl ResponsesAccumulator {
             }
             "message" => {
                 if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                    let mut text = String::new();
                     for part in parts {
                         match part.get("type").and_then(Value::as_str).unwrap_or_default() {
-                            "output_text" => {
-                                if self.text.is_empty() {
-                                    self.text.push_str(value_str(part, "text"));
-                                }
-                            }
+                            "output_text" => text.push_str(value_str(part, "text")),
                             "refusal" => {
                                 self.refused = true;
-                                if self.text.is_empty() {
-                                    self.text.push_str(value_str(part, "refusal"));
-                                }
+                                text.push_str(value_str(part, "refusal"));
                             }
                             _ => {}
                         }
+                    }
+                    if !self.text_streamed {
+                        self.snapshot_text.insert(index, text);
+                        self.text = self.snapshot_text.values().map(String::as_str).collect();
                     }
                 }
             }
@@ -283,6 +284,11 @@ impl ResponsesAccumulator {
 
     fn push_text(&mut self, delta: &str, sink: &dyn EventSink) {
         if !delta.is_empty() {
+            if !self.text_streamed {
+                self.text.clear();
+                self.snapshot_text.clear();
+                self.text_streamed = true;
+            }
             self.text.push_str(delta);
             sink.text_delta(delta);
         }
@@ -401,6 +407,25 @@ mod tests {
                 .map(|call| call.arguments.as_str()),
             Some(r#"{"city":"London"}"#)
         );
+    }
+
+    #[test]
+    fn streamed_text_replaces_snapshot_fallback() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"snapshot"}]}}"#,
+                &NullSink,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_text.delta","output_index":0,"delta":"delta"}"#,
+                &NullSink,
+            )
+            .unwrap();
+
+        assert_eq!(accumulator.text, "delta");
     }
 
     #[test]
