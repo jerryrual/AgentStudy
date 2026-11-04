@@ -22,6 +22,7 @@
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
+| 模型协议 | Chat Completions；核心无状态 Responses API（文本、推理摘要、本地函数工具、流式/非流式） | `src/model/` |
 | 重试 | 429/5xx/transport 指数退避重试 | `src/model/client.rs` |
 
 ## 尚未移植
@@ -33,8 +34,7 @@
 - MCP 服务器、Skills、Hooks、子智能体、记忆（memory）。
 - 内建 diff 查看器、轮次回滚、轨迹（trajectory）与 token/耗时分析面板。
 - 真正的交互式 Shell 终端（当前 `!` 命令只回显输出，不接管全屏程序）。
-- Responses API（配置中可声明，运行时会明确报错）。
-- 图片/视觉输入、`web_search`、模型配置的 TUI 编辑（F2/F4）。
+- 模型配置的 TUI 编辑（F2/F4）。
 - 自动上下文压缩、按 token 预算分阶段裁剪工具结果，以及 Last Words；当前仅支持手动 `/compact`。
 - 多语言界面、主题切换、Windows/Linux 安装包与自更新。
 
@@ -47,6 +47,8 @@
 - 模型重试策略固定为 3 次指数退避；可通过 `ICODE_RETRY_BASE_MS` 调整基准间隔（测试用）。
 - 工具并发仅对 `read_file`、`list_dir`、`grep`、`glob` 开放；写操作、Shell、提问与
   todo 更新保持顺序执行，以保证审批、交互和会话状态的确定性。
+- Responses API 采用无状态完整历史重放；不支持已存储响应续传、服务端托管工具（如
+  `web_search`）或图片输入，遇到未支持的可执行输出类型会失败关闭。
 - `icode run` 与 iCode 一样绕过审批；`--approval deny` 提供只读保护。
 
 ## 设计取向

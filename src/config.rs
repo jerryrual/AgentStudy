@@ -63,7 +63,7 @@ pub enum ApiStyle {
     /// `POST {base}/chat/completions` with SSE streaming.
     #[default]
     Chat,
-    /// The Responses API is accepted in configuration but not implemented yet.
+    /// OpenAI-compatible Responses API.
     Responses,
 }
 
@@ -140,6 +140,16 @@ impl ModelProfile {
             base
         } else {
             format!("{base}/chat/completions")
+        }
+    }
+
+    /// Full Responses API endpoint.
+    pub fn responses_url(&self) -> String {
+        let base = self.resolved_base_url();
+        if base.ends_with("/responses") {
+            base
+        } else {
+            format!("{base}/responses")
         }
     }
 
@@ -530,6 +540,21 @@ mod tests {
         assert_eq!(
             profile.chat_completions_url(),
             "http://localhost:8080/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn responses_url_is_derived_from_base() {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.base_url = "https://api.openai.com/v1/".to_string();
+        assert_eq!(
+            profile.responses_url(),
+            "https://api.openai.com/v1/responses"
+        );
+        profile.base_url = "http://localhost:8080/v1/responses".to_string();
+        assert_eq!(
+            profile.responses_url(),
+            "http://localhost:8080/v1/responses"
         );
     }
 

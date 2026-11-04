@@ -38,6 +38,9 @@ pub struct AssistantMessage {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Provider-native Responses output items retained for stateless replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_items: Vec<Value>,
 }
 
 impl AssistantMessage {
@@ -46,6 +49,7 @@ impl AssistantMessage {
             content: Some(content.into()),
             reasoning: None,
             tool_calls: Vec::new(),
+            responses_items: Vec::new(),
         }
     }
 
@@ -235,6 +239,7 @@ mod tests {
                 name: "read_file".into(),
                 arguments: "{}".into(),
             }],
+            responses_items: Vec::new(),
         });
         let value = message.to_api();
         assert_eq!(value["role"], "assistant");
