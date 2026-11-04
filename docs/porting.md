@@ -19,6 +19,7 @@
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
 | 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化续写摘要 | `src/session.rs`、`src/compaction.rs` |
+| 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
@@ -27,16 +28,36 @@
 
 ## 尚未移植
 
-以下能力属于 iCode 的完整形态，本版本未实现（欢迎后续补充）：
+以下按依赖顺序推进；各阶段能力仍未实现。
 
-- ACP 服务（`icode acp` / `icode serve`）与编辑器集成。
-- 工作流（workflow）编排与节点可视化。
-- MCP 服务器、Skills、Hooks、子智能体、记忆（memory）。
-- 内建 diff 查看器、轮次回滚、轨迹（trajectory）与 token/耗时分析面板。
-- 真正的交互式 Shell 终端（当前 `!` 命令只回显输出，不接管全屏程序）。
-- 模型配置的 TUI 编辑（F2/F4）。
-- 自动上下文压缩、按 token 预算分阶段裁剪工具结果，以及 Last Words；当前仅支持手动 `/compact`。
-- 多语言界面、主题切换、Windows/Linux 安装包与自更新。
+### 1. 上下文 / 协议
+
+1. 自动上下文压缩、按 token 预算分阶段裁剪工具结果，以及 Last Words；当前仅支持手动 `/compact`。
+2. Responses API 的服务端续传、后台响应与托管工具。
+3. 图片输入、图片压缩与多模态消息持久化。
+
+### 2. 工具 / 扩展
+
+1. MCP 服务器与 Skills。
+2. Hooks 与子智能体；依赖统一的工具协议和上下文隔离。
+3. `web_search` / `web_fetch` 等联网工具；依赖托管工具或独立搜索提供方。
+4. 真正的交互式 Shell 终端；当前 `!` 命令只回显输出，不接管全屏程序。
+
+### 3. 可观测性 / 恢复
+
+1. 内建 diff 查看器与轮次回滚。
+2. 轨迹（trajectory）及 token / 耗时分析面板。
+
+### 4. 集成 / 工作流
+
+1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。
+2. 工作流（workflow）编排与节点可视化；依赖扩展协议和轨迹能力。
+
+### 5. UX / 分发
+
+1. 模型配置的 TUI 编辑（F2 / F4）。
+2. 多语言界面与主题切换。
+3. Windows / Linux 安装包与自更新。
 
 ## 有意保留差异
 

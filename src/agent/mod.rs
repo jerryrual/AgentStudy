@@ -112,6 +112,7 @@ pub struct Agent {
     approver: Arc<dyn Approver>,
     asker: Arc<dyn Asker>,
     options: AgentOptions,
+    project_memory: crate::memory::ProjectMemory,
     todos: Arc<Mutex<Vec<TodoItem>>>,
 }
 
@@ -123,12 +124,14 @@ impl Agent {
         asker: Arc<dyn Asker>,
         options: AgentOptions,
     ) -> Self {
+        let project_memory = crate::memory::load_project_memory(&options.cwd);
         Self {
             client,
             tools,
             approver,
             asker,
             options,
+            project_memory,
             todos: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -147,11 +150,16 @@ impl Agent {
             AgentKind::Code => CODE_SYSTEM_PROMPT,
             AgentKind::Qa => QA_SYSTEM_PROMPT,
         };
-        format!(
+        let mut prompt = format!(
             "{base}\n\nCurrent working directory: {}\nToday's date: {}",
             self.options.cwd.display(),
             today()
-        )
+        );
+        if !self.project_memory.prompt.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&self.project_memory.prompt);
+        }
+        prompt
     }
 
     /// Tools visible to the model for this agent kind.
@@ -193,6 +201,9 @@ impl Agent {
         let mut rounds = 0usize;
 
         self.ensure_system_prompt(messages);
+        if let Some(warning) = &self.project_memory.warning {
+            sink.info(warning);
+        }
         sink.turn_started();
 
         loop {
@@ -600,6 +611,27 @@ mod tests {
     fn civil_dates_match_known_values() {
         assert_eq!(civil_from_days(0), "1970-01-01");
         assert_eq!(civil_from_days(19_000), "2022-01-08");
+    }
+
+    #[test]
+    fn system_prompt_includes_project_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("AGENTS.md"), "Use cargo clippy.").unwrap();
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        let agent = Agent::new(
+            Arc::new(ModelClient::from_profile(&profile).unwrap()),
+            Arc::new(ToolRegistry::with_tools(Vec::new())),
+            Arc::new(AllowAll),
+            Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, temp.path()),
+        );
+
+        let prompt = agent.system_prompt();
+
+        assert!(prompt.contains("# Auto-loaded memory"));
+        assert!(prompt.contains("## File: AGENTS.md\n\nUse cargo clippy."));
     }
 
     #[test]

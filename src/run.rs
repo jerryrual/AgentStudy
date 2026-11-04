@@ -86,9 +86,7 @@ impl EventSink for RunSink {
     }
 
     fn info(&self, message: &str) {
-        if !self.json {
-            eprintln!("  · {message}");
-        }
+        eprintln!("  · {message}");
     }
 
     fn error(&self, message: &str) {
