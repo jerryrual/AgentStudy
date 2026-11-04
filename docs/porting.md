@@ -18,7 +18,7 @@
 | 审批 | ask / auto / deny，写操作与 Shell 需确认 | `src/interaction.rs` |
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
-| 会话 | JSONL 追加写入、列举、继续 | `src/session.rs` |
+| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化续写摘要 | `src/session.rs`、`src/compaction.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
@@ -35,7 +35,7 @@
 - 真正的交互式 Shell 终端（当前 `!` 命令只回显输出，不接管全屏程序）。
 - Responses API（配置中可声明，运行时会明确报错）。
 - 图片/视觉输入、`web_search`、模型配置的 TUI 编辑（F2/F4）。
-- 上下文压缩（`/compact` 目前只提示未实现）。
+- 自动上下文压缩、按 token 预算分阶段裁剪工具结果，以及 Last Words；当前仅支持手动 `/compact`。
 - 多语言界面、主题切换、Windows/Linux 安装包与自更新。
 
 ## 有意保留差异

@@ -11,10 +11,11 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
+use crate::compaction::Compaction;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
-use crate::session::{RecordBuffer, Session, SessionStore};
+use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
 use crate::APP_NAME;
@@ -87,6 +88,10 @@ pub enum UiEvent {
         reply: oneshot::Sender<String>,
     },
     TurnFinished(std::result::Result<TurnResult, String>, Vec<Message>),
+    CompactionFinished {
+        result: std::result::Result<Compaction, String>,
+        duration: Duration,
+    },
     ShellFinished {
         ok: bool,
         duration: Duration,
@@ -359,6 +364,54 @@ impl App {
                                 turn.duration.as_secs_f64(),
                                 turn.tool_calls,
                                 turn.rounds
+                            )));
+                        }
+                    }
+                    Err(error) => self.view.push(ViewItem::Error(error)),
+                }
+            }
+            UiEvent::CompactionFinished { result, duration } => {
+                self.running = false;
+                self.turn_started = None;
+                self.elapsed = duration;
+                match result {
+                    Ok(compaction) => {
+                        let record = Record::Compaction {
+                            summary: compaction.summary.clone(),
+                        };
+                        if let Err(error) = self.session.append(&record) {
+                            self.view.push(ViewItem::Error(format!(
+                                "failed to save compaction summary: {error:#}"
+                            )));
+                            return;
+                        }
+                        self.messages =
+                            vec![crate::compaction::summary_message(&compaction.summary)];
+                        self.recorder.reset();
+                        self.tokens.add(compaction.usage);
+                        let usage_error = self
+                            .session
+                            .append(&Record::Usage {
+                                prompt_tokens: compaction.usage.prompt_tokens,
+                                completion_tokens: compaction.usage.completion_tokens,
+                            })
+                            .err();
+                        self.view.clear();
+                        self.view.push(ViewItem::Info(
+                            "Compressed earlier conversation into this summary:".to_string(),
+                        ));
+                        self.view.push(ViewItem::Assistant {
+                            text: compaction.summary,
+                            reasoning: String::new(),
+                            streaming: false,
+                        });
+                        self.view.push(ViewItem::Info(format!(
+                            "Compacted in {:.1}s.",
+                            duration.as_secs_f64()
+                        )));
+                        if let Some(error) = usage_error {
+                            self.view.push(ViewItem::Error(format!(
+                                "failed to save compaction usage: {error:#}"
                             )));
                         }
                     }
@@ -750,6 +803,63 @@ impl App {
         }
     }
 
+    pub(crate) fn compaction_messages(&self) -> Result<Vec<Message>> {
+        Ok(self.store.load(self.session.id())?.messages())
+    }
+
+    fn start_compaction(&mut self) {
+        let messages = match self.compaction_messages() {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "cannot load conversation for compaction: {error:#}"
+                )));
+                return;
+            }
+        };
+        if !messages
+            .iter()
+            .any(|message| !matches!(message, Message::System { .. }))
+        {
+            self.view.push(ViewItem::Error(
+                "There is no conversation to compact.".to_string(),
+            ));
+            return;
+        }
+        self.running = true;
+        self.turn_id = self.turn_id.wrapping_add(1);
+        let turn_id = self.turn_id;
+        self.turn_started = Some(Instant::now());
+        self.tokens = Usage::default();
+        self.view
+            .push(ViewItem::Info("Compacting conversation...".to_string()));
+
+        let tx = self.events_tx.clone();
+        let profile = self.profile.clone();
+        let handle = self.runtime.clone();
+        let task = handle.spawn(async move {
+            let started = Instant::now();
+            let result = async {
+                let client =
+                    tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to resolve the model configuration: {error}")
+                        })??;
+                crate::compaction::compact(&client, &messages).await
+            }
+            .await;
+            let _ = tx.send(UiEvent::Turn {
+                id: turn_id,
+                event: Box::new(UiEvent::CompactionFinished {
+                    result: result.map_err(|error| format!("compaction failed: {error:#}")),
+                    duration: started.elapsed(),
+                }),
+            });
+        });
+        self.cancel_handle = Some(task);
+    }
+
     fn run_shell(&mut self, command: String) {
         if self.running {
             self.view.push(ViewItem::Info(
@@ -852,7 +962,7 @@ impl App {
         let mut parts = raw.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
         let argument = parts.next().unwrap_or_default().trim();
-        if self.running && matches!(command, "/new" | "/clear" | "/resume") {
+        if self.running && matches!(command, "/new" | "/clear" | "/resume" | "/compact") {
             self.view.push(ViewItem::Info(
                 "Cancel the running turn (Esc) before changing the session.".to_string(),
             ));
@@ -991,11 +1101,7 @@ impl App {
                     }
                 }
             }
-            "/compact" => self.view.push(ViewItem::Info(
-                "Context compaction is not implemented in the Rust port yet; use /new to start \
-                 a fresh session."
-                    .to_string(),
-            )),
+            "/compact" => self.start_compaction(),
             _ => self.view.push(ViewItem::Error(format!(
                 "Unknown command {command:?}; use /help for the command list."
             ))),
@@ -1167,6 +1273,17 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
                 duration: None,
                 output: preview_output(content),
             }),
+            crate::session::Record::Compaction { summary } => {
+                view.clear();
+                view.push(ViewItem::Info(
+                    "Compressed earlier conversation into this summary:".to_string(),
+                ));
+                view.push(ViewItem::Assistant {
+                    text: summary.clone(),
+                    reasoning: String::new(),
+                    streaming: false,
+                });
+            }
             crate::session::Record::Meta { .. } | crate::session::Record::Usage { .. } => {}
         }
     }

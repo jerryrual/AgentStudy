@@ -701,6 +701,65 @@ mod tests {
     }
 
     #[test]
+    fn compaction_uses_persisted_messages_after_cancelled_turn() {
+        use crate::model::{AssistantMessage, Message};
+
+        let mut app = test_app();
+        app.messages = vec![Message::user("old request")];
+        app.session
+            .append_message(&Message::user("old request"))
+            .unwrap();
+        app.session
+            .append_message(&Message::assistant(AssistantMessage::text(
+                "persisted result from a completed round",
+            )))
+            .unwrap();
+
+        let messages = app.compaction_messages().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].preview().contains("persisted result"));
+        assert_eq!(app.messages.len(), 1, "memory intentionally remains stale");
+    }
+
+    #[test]
+    fn completed_compaction_replaces_and_persists_model_context() {
+        use crate::compaction::Compaction;
+        use crate::model::{Message, Usage};
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.messages = vec![Message::user("old request")];
+        app.session
+            .append_message(&Message::user("old request"))
+            .unwrap();
+        app.running = true;
+        app.push_event(UiEvent::CompactionFinished {
+            result: Ok(Compaction {
+                summary: "Changed src/main.rs; tests pass.".to_string(),
+                usage: Usage {
+                    prompt_tokens: 20,
+                    completion_tokens: 8,
+                    total_tokens: 28,
+                },
+            }),
+            duration: std::time::Duration::from_millis(5),
+        });
+        app.pump();
+
+        assert!(!app.running);
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0]
+            .preview()
+            .contains("Earlier conversation summary"));
+        assert!(app.view.iter().any(
+            |item| matches!(item, ViewItem::Assistant { text, .. } if text.contains("tests pass"))
+        ));
+        let resumed = app.store.load(app.session.id()).unwrap().messages();
+        assert_eq!(resumed, app.messages);
+    }
+
+    #[test]
     fn renders_approval_modal() {
         let mut app = test_app();
         let (reply, _rx) = tokio::sync::oneshot::channel();

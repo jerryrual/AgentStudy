@@ -18,7 +18,8 @@
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
   `bash`、`todo_write`、`ask_user`。
 - **审批策略**：`ask`（默认，逐次确认写操作与 Shell）、`auto`、`deny`。
-- **会话**：JSONL 追加写入，支持 `--continue`、`/sessions`、`/resume <id>`。
+- **会话**：JSONL 追加写入，支持 `--continue`、`/sessions`、`/resume <id>`；`/compact`
+  用当前模型生成续写摘要并持久化，恢复会话时从最近摘要继续。
 - **无界面运行**：`icode run "..."`，支持 `--json` 供脚本消费。
 - **输入便捷**：`/` 命令、`!` 直接执行 Shell、`@file` 附加文件内容。
 
@@ -31,6 +32,8 @@
 ![执行写操作前的审批弹窗](docs/screenshots/tui-approval.png)
 
 ![批准后工具执行结果与最终回答](docs/screenshots/tui-tool-result.png)
+
+![手动压缩后以持久化摘要继续会话](docs/screenshots/compaction-after.png)
 
 ## 构建
 
@@ -107,7 +110,11 @@ icode models               # 查看已配置的模型
 | `Tab` | 补全 `/` 命令 |
 
 常用命令：`/help`、`/new`、`/models`、`/model <name>`、`/approval ask|auto|deny`、
-`/sessions`、`/resume <id>`、`/cwd <path>`、`!<shell 命令>`、`@<文件>`。
+`/sessions`、`/resume <id>`、`/compact`、`/cwd <path>`、`!<shell 命令>`、`@<文件>`。
+
+`/compact` 会把当前完整对话作为数据交给当前模型生成续写摘要；摘要写入追加式会话文件后，
+模型上下文才替换为该摘要。原始记录仍保留在 JSONL 文件中，压缩失败或被取消时不会改变当前上下文。
+当前版本只支持手动触发，尚不根据上下文窗口自动压缩。
 
 ### 无界面运行
 
@@ -126,6 +133,7 @@ icode run "总结 src/ 下各模块的职责" --cwd . --json
 ```
 src/
 ├── cli.rs        # clap 命令行入口
+├── compaction.rs # 模型辅助的上下文摘要
 ├── config.rs     # 模型配置、设置、API Key 解析
 ├── model/        # OpenAI Chat Completions 客户端 + SSE 解析
 ├── agent/        # 工具调用循环、事件流、系统提示词
