@@ -1,6 +1,6 @@
 //! Stateless OpenAI Responses API wire mapping.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -100,8 +100,8 @@ pub(super) fn request_body(
 #[derive(Default)]
 pub(super) struct ResponsesAccumulator {
     text: String,
-    snapshot_text: BTreeMap<usize, String>,
-    text_streamed: bool,
+    text_by_index: BTreeMap<usize, String>,
+    streamed_text: BTreeSet<usize>,
     reasoning: String,
     calls: BTreeMap<usize, ToolCall>,
     items: BTreeMap<usize, Value>,
@@ -123,7 +123,7 @@ impl ResponsesAccumulator {
             .unwrap_or_default()
         {
             "response.output_text.delta" => {
-                self.push_text(value_str(&event, "delta"), sink);
+                self.push_text(event_index(&event), value_str(&event, "delta"), sink);
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 self.push_reasoning(value_str(&event, "delta"), sink);
@@ -175,6 +175,13 @@ impl ResponsesAccumulator {
         }
         if self.incomplete && !self.calls.is_empty() {
             bail!("Responses API returned function calls in an incomplete response");
+        }
+        if self
+            .calls
+            .values()
+            .any(|call| call.name.trim().is_empty() || call.id.trim().is_empty())
+        {
+            bail!("Responses API returned a function call without a name or call_id");
         }
         if let Some(item_type) = &self.unsupported_item {
             bail!("Responses API returned unsupported output item type {item_type:?}");
@@ -241,9 +248,9 @@ impl ResponsesAccumulator {
                             _ => {}
                         }
                     }
-                    if !self.text_streamed {
-                        self.snapshot_text.insert(index, text);
-                        self.text = self.snapshot_text.values().map(String::as_str).collect();
+                    if !self.streamed_text.contains(&index) {
+                        self.text_by_index.insert(index, text);
+                        self.rebuild_text();
                     }
                 }
             }
@@ -282,16 +289,19 @@ impl ResponsesAccumulator {
             .unwrap_or(self.usage.prompt_tokens + self.usage.completion_tokens);
     }
 
-    fn push_text(&mut self, delta: &str, sink: &dyn EventSink) {
+    fn push_text(&mut self, index: usize, delta: &str, sink: &dyn EventSink) {
         if !delta.is_empty() {
-            if !self.text_streamed {
-                self.text.clear();
-                self.snapshot_text.clear();
-                self.text_streamed = true;
+            if self.streamed_text.insert(index) {
+                self.text_by_index.insert(index, String::new());
             }
-            self.text.push_str(delta);
+            self.text_by_index.entry(index).or_default().push_str(delta);
+            self.rebuild_text();
             sink.text_delta(delta);
         }
+    }
+
+    fn rebuild_text(&mut self) {
+        self.text = self.text_by_index.values().map(String::as_str).collect();
     }
 
     fn push_reasoning(&mut self, delta: &str, sink: &dyn EventSink) {
@@ -302,30 +312,28 @@ impl ResponsesAccumulator {
     }
 
     fn into_completion(mut self) -> Completion {
-        let mut text_backfilled = false;
-        for item in self.items.values_mut() {
-            if !text_backfilled
-                && item.get("type").and_then(Value::as_str) == Some("message")
+        for (index, item) in &mut self.items {
+            if item.get("type").and_then(Value::as_str) == Some("message")
                 && item
                     .get("content")
                     .and_then(Value::as_array)
                     .is_some_and(Vec::is_empty)
-                && !self.text.is_empty()
             {
-                item["content"] = json!([{
-                    "type": "output_text",
-                    "text": self.text,
-                    "annotations": []
-                }]);
-                text_backfilled = true;
+                let text = self
+                    .text_by_index
+                    .get(index)
+                    .filter(|text| !text.is_empty());
+                if let Some(text) = text {
+                    item["content"] = json!([{
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": []
+                    }]);
+                }
             }
         }
         let responses_items = self.items.into_values().collect();
-        let tool_calls = self
-            .calls
-            .into_values()
-            .filter(|call| !call.name.is_empty())
-            .collect();
+        let tool_calls = self.calls.into_values().collect();
         Completion {
             message: AssistantMessage {
                 content: (!self.text.is_empty()).then_some(self.text),
@@ -426,6 +434,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(accumulator.text, "delta");
+    }
+
+    #[test]
+    fn streaming_one_index_preserves_other_message_snapshots() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"A"}]}}"#,
+                &NullSink,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","content":[]}}"#,
+                &NullSink,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_text.delta","output_index":1,"delta":"B"}"#,
+                &NullSink,
+            )
+            .unwrap();
+
+        assert_eq!(accumulator.text, "AB");
+    }
+
+    #[test]
+    fn rejects_function_calls_without_identity() {
+        let error = decode_json(serde_json::json!({
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "arguments": "{}"
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("without a name or call_id"));
     }
 
     #[test]
