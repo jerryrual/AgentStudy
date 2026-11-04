@@ -236,7 +236,9 @@ impl ModelClient {
                 .push(&bytes)
                 .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
             {
-                if payload.trim() != "[DONE]"
+                let trimmed = payload.trim();
+                if !trimmed.is_empty()
+                    && trimmed != "[DONE]"
                     && accumulator
                         .apply(&payload, sink)
                         .map_err(ClientError::Fatal)?
@@ -249,7 +251,8 @@ impl ModelClient {
             .finish()
             .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
         {
-            if payload.trim() != "[DONE]" {
+            let trimmed = payload.trim();
+            if !trimmed.is_empty() && trimmed != "[DONE]" {
                 accumulator
                     .apply(&payload, sink)
                     .map_err(ClientError::Fatal)?;

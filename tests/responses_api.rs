@@ -258,6 +258,29 @@ async fn responses_stream_requires_a_terminal_event() {
 }
 
 #[tokio::test]
+async fn responses_stream_ignores_empty_data_events() {
+    let server = MockServer::new(|_, _| {
+        MockResponse {
+        status: 200,
+        content_type: "text/event-stream".to_string(),
+        body: concat!(
+            "data: \n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n"
+        )
+        .to_string(),
+    }
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, true)).unwrap();
+
+    let completion = client
+        .complete(&[Message::user("Hello")], &[], &RecordingSink::default())
+        .await
+        .unwrap();
+
+    assert_eq!(completion.message.content.as_deref(), Some("done"));
+}
+
+#[tokio::test]
 async fn responses_rejects_unsupported_executable_output_items() {
     let server = MockServer::new(|_, _| {
         MockResponse::json(

@@ -349,7 +349,10 @@ pub(super) fn decode_json(payload: Value) -> Result<Completion> {
     }
     let mut accumulator = ResponsesAccumulator::default();
     accumulator.learn_response(&payload);
-    accumulator.terminal = matches!(status, "completed" | "incomplete");
+    if !matches!(status, "" | "completed" | "incomplete") {
+        bail!("Responses API returned a non-terminal status {status:?}");
+    }
+    accumulator.terminal = true;
     accumulator.finish()
 }
 
@@ -362,4 +365,57 @@ fn event_index(event: &Value) -> usize {
 
 fn value_str<'a>(value: &'a Value, field: &str) -> &'a str {
     value.get(field).and_then(Value::as_str).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_json, ResponsesAccumulator};
+    use crate::agent::NullSink;
+
+    #[test]
+    fn accumulates_function_call_argument_deltas_before_completion() {
+        let mut accumulator = ResponsesAccumulator::default();
+        accumulator
+            .apply(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"weather","arguments":""}}"#,
+                &NullSink,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"city\":"}"#,
+                &NullSink,
+            )
+            .unwrap();
+        accumulator
+            .apply(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"London\"}"}"#,
+                &NullSink,
+            )
+            .unwrap();
+
+        assert_eq!(
+            accumulator
+                .calls
+                .get(&0)
+                .map(|call| call.arguments.as_str()),
+            Some(r#"{"city":"London"}"#)
+        );
+    }
+
+    #[test]
+    fn accepts_missing_status_but_rejects_non_terminal_status() {
+        let completion = decode_json(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(completion.message.content.as_deref(), Some("done"));
+
+        let error =
+            decode_json(serde_json::json!({"status": "in_progress", "output": []})).unwrap_err();
+        assert!(error.to_string().contains("non-terminal status"));
+    }
 }
