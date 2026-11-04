@@ -114,8 +114,9 @@ icode models               # 查看已配置的模型
 常用命令：`/help`、`/new`、`/models`、`/model <name>`、`/approval ask|auto|deny`、
 `/sessions`、`/resume <id>`、`/compact`、`/cwd <path>`、`!<shell 命令>`、`@<文件>`。
 
-主 agent 创建时会读取当前工作目录根部的 `AGENTS.md`，并按原文件整体加入系统上下文；
-不搜索父目录，也不加载 `ICODE.md`。内容会随模型请求发送给服务商，请勿在其中放置密钥或其他敏感信息。
+主 agent 创建时会读取当前工作目录根部的普通文件 `AGENTS.md`，并按原文件整体加入系统上下文；
+不搜索父目录，不加载 `ICODE.md`，也不跟随符号链接。内容会随模型请求发送给服务商，
+请勿在其中放置密钥或其他敏感信息。
 `AGENTS.md` 也能影响模型发起的工具调用；在不可信仓库中应先检查该文件，或以
 `--approval deny` 运行无界面任务。超过约 35,000 token 预算的文件会整体跳过并显示提示。
 
