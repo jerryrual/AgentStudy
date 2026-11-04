@@ -19,8 +19,9 @@
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
   `bash`、`todo_write`、`ask_user`。
 - **审批策略**：`ask`（默认，逐次确认写操作与 Shell）、`auto`、`deny`。
-- **会话**：JSONL 追加写入，支持 `--continue`、`/sessions`、`/resume <id>`；`/compact`
-  用当前模型生成续写摘要并持久化，恢复会话时从最近摘要继续。
+- **会话与记忆**：JSONL 追加写入，支持 `--continue`、`/sessions`、`/resume <id>`；
+  `/compact` 生成并持久化续写摘要；主 agent 自动将当前工作目录的 `AGENTS.md` 作为
+  项目参考上下文加载，文件缺失时静默跳过。
 - **无界面运行**：`icode run "..."`，支持 `--json` 供脚本消费。
 - **输入便捷**：`/` 命令、`!` 直接执行 Shell、`@file` 附加文件内容。
 
@@ -112,6 +113,10 @@ icode models               # 查看已配置的模型
 
 常用命令：`/help`、`/new`、`/models`、`/model <name>`、`/approval ask|auto|deny`、
 `/sessions`、`/resume <id>`、`/compact`、`/cwd <path>`、`!<shell 命令>`、`@<文件>`。
+
+主 agent 创建时会读取当前工作目录根部的 `AGENTS.md`，并按原文件整体加入系统上下文；
+不搜索父目录，也不加载 `ICODE.md`。内容会随模型请求发送给服务商，请勿在其中放置密钥或其他敏感信息。
+超过约 35,000 token 预算的文件会整体跳过并显示提示。
 
 `/compact` 会把当前完整对话作为数据交给当前模型生成续写摘要；摘要写入追加式会话文件后，
 模型上下文才替换为该摘要。原始记录仍保留在 JSONL 文件中，压缩失败或被取消时不会改变当前上下文。

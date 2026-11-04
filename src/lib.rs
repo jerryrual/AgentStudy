@@ -16,6 +16,7 @@ pub mod compaction;
 pub mod config;
 pub mod interaction;
 pub mod markdown;
+pub mod memory;
 pub mod model;
 pub mod run;
 pub mod session;
