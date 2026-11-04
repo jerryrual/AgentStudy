@@ -39,6 +39,11 @@ fn run_json_returns_a_machine_readable_result() {
     });
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
+    std::fs::write(
+        work.path().join("AGENTS.md"),
+        vec![b'a'; icode::memory::DEFAULT_MAX_MEMORY_TOKENS * 4 + 1],
+    )
+    .unwrap();
     write_settings(home.path(), &server.base_url());
 
     let output = icode()
@@ -58,6 +63,8 @@ fn run_json_returns_a_machine_readable_result() {
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("35,000-token"), "{stderr}");
     assert_eq!(payload["ok"], true);
     assert_eq!(payload["text"], "Hello from mock");
     assert_eq!(payload["tool_calls"], 0);

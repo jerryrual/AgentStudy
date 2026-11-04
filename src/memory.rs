@@ -26,6 +26,7 @@ pub fn load_project_memory(cwd: &Path) -> ProjectMemory {
     load_project_memory_with_limit(cwd, DEFAULT_MAX_MEMORY_TOKENS)
 }
 
+/// Resolve, contain, decode, render and budget the default memory source.
 fn load_project_memory_with_limit(cwd: &Path, max_tokens: usize) -> ProjectMemory {
     let Ok(cwd) = cwd.canonicalize() else {
         return ProjectMemory::default();
@@ -42,8 +43,10 @@ fn load_project_memory_with_limit(cwd: &Path, max_tokens: usize) -> ProjectMemor
         return ProjectMemory::default();
     }
 
-    let Some(contents) = read_lossy_bounded(&path, max_tokens.saturating_mul(4)) else {
-        return over_budget();
+    let contents = match read_lossy_bounded(&path, max_tokens.saturating_mul(4)) {
+        BoundedRead::Contents(contents) => contents,
+        BoundedRead::TooLarge => return over_budget(),
+        BoundedRead::Unavailable => return ProjectMemory::default(),
     };
     let prompt = format!("{MEMORY_HEADER}## File: {DEFAULT_MEMORY_FILE}\n\n{contents}");
     if estimate_tokens(&prompt) > max_tokens {
@@ -57,6 +60,7 @@ fn load_project_memory_with_limit(cwd: &Path, max_tokens: usize) -> ProjectMemor
     }
 }
 
+/// Return the nonfatal warning used when the memory source cannot fit.
 fn over_budget() -> ProjectMemory {
     ProjectMemory {
         warning: Some(format!(
@@ -66,6 +70,7 @@ fn over_budget() -> ProjectMemory {
     }
 }
 
+/// Estimate tokens as four ASCII characters or one non-ASCII character each.
 fn estimate_tokens(text: &str) -> usize {
     let (ascii, non_ascii) = text.chars().fold((0usize, 0usize), |counts, character| {
         if character.is_ascii() {
@@ -77,17 +82,33 @@ fn estimate_tokens(text: &str) -> usize {
     ascii.div_ceil(4) + non_ascii
 }
 
-fn read_lossy_bounded(path: &Path, max_bytes: usize) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
+enum BoundedRead {
+    Contents(String),
+    TooLarge,
+    Unavailable,
+}
+
+/// Read a memory file without allowing an unexpectedly large allocation.
+fn read_lossy_bounded(path: &Path, max_bytes: usize) -> BoundedRead {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return BoundedRead::Unavailable;
+    };
+    read_lossy_bounded_from(&mut file, max_bytes)
+}
+
+fn read_lossy_bounded_from(reader: &mut impl Read, max_bytes: usize) -> BoundedRead {
     let mut bytes = Vec::new();
-    file.by_ref()
+    if reader
         .take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > max_bytes {
-        return None;
+        .is_err()
+    {
+        return BoundedRead::Unavailable;
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    if bytes.len() > max_bytes {
+        return BoundedRead::TooLarge;
+    }
+    BoundedRead::Contents(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -125,6 +146,22 @@ mod tests {
         std::fs::write(temp.path().join("AGENTS.md"), [b'a', 0xff, b'b']).unwrap();
         let loaded = load_project_memory(temp.path());
         assert!(loaded.prompt.contains("a\u{fffd}b"));
+    }
+
+    #[test]
+    fn read_failures_are_unavailable_not_over_budget() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("unreadable"))
+            }
+        }
+
+        assert!(matches!(
+            read_lossy_bounded_from(&mut FailingReader, 1024),
+            BoundedRead::Unavailable
+        ));
     }
 
     #[test]
