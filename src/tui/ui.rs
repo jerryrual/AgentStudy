@@ -431,6 +431,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         ("/models, /model <name>", "list or switch model profiles"),
         ("/approval ask|auto|deny", "change the approval mode"),
         ("/sessions, /resume <id>", "list or resume sessions"),
+        ("/compact", "summarize the conversation to free context"),
         ("/cwd <path>", "change the working directory"),
         ("!<command>", "run a shell command"),
         ("@<file>", "attach a file to the message"),
@@ -459,7 +460,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         "  Esc closes this panel.",
         Style::default().fg(app.theme.dim),
     )));
-    let popup = centered(area, 70, 16);
+    let popup = centered(area, 70, 17);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -757,6 +758,17 @@ mod tests {
         ));
         let resumed = app.store.load(app.session.id()).unwrap().messages();
         assert_eq!(resumed, app.messages);
+    }
+
+    #[test]
+    fn help_lists_compaction_without_clipping_the_close_hint() {
+        let mut app = test_app();
+        app.modal = Some(Modal::Help);
+
+        let output = render(&mut app, 100, 24);
+
+        assert!(output.contains("/compact"), "{output}");
+        assert!(output.contains("Esc closes this panel."), "{output}");
     }
 
     #[test]
