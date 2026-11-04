@@ -217,7 +217,7 @@ impl Agent {
             let text = message.content.clone();
             let finish_reason = completion.finish_reason.clone();
             if message.is_empty() && calls.is_empty() {
-                let reason = if finish_reason == "length" {
+                let reason = if finish_reason.as_deref() == Some("length") {
                     "the model response was truncated (max_tokens reached)"
                 } else {
                     "the model returned an empty response"

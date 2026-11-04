@@ -210,7 +210,7 @@ impl Usage {
 pub struct Completion {
     pub message: AssistantMessage,
     pub usage: Usage,
-    pub finish_reason: String,
+    pub finish_reason: Option<String>,
 }
 
 #[cfg(test)]

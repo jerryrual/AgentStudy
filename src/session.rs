@@ -49,6 +49,9 @@ pub enum Record {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    Compaction {
+        summary: String,
+    },
 }
 
 impl Record {
@@ -165,6 +168,11 @@ impl LoadedSession {
                         pending.remove(position);
                         messages.push(Message::tool(call_id, name, content));
                     }
+                }
+                Record::Compaction { summary } => {
+                    pending.clear();
+                    messages.clear();
+                    messages.push(crate::compaction::summary_message(summary));
                 }
                 Record::Meta { .. } | Record::Usage { .. } => {}
             }
@@ -529,6 +537,30 @@ mod tests {
             }
             other => panic!("expected a synthetic tool result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn messages_replay_only_the_latest_compacted_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("old request"))
+            .unwrap();
+        session
+            .append(&Record::Compaction {
+                summary: "Changed src/main.rs and tests pass.".into(),
+            })
+            .unwrap();
+        session.append_message(&Message::user("continue")).unwrap();
+
+        let messages = store.load(session.id()).unwrap().messages();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[0],
+            Message::User { content } if content.contains("Changed src/main.rs")
+        ));
+        assert_eq!(messages[1], Message::user("continue"));
     }
 
     #[test]

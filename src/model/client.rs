@@ -236,7 +236,7 @@ impl ModelClient {
         Ok(Completion {
             message,
             usage: payload.usage.unwrap_or_default(),
-            finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            finish_reason: choice.finish_reason,
         })
     }
 }
@@ -360,7 +360,7 @@ impl Accumulator {
                 tool_calls,
             },
             usage: self.usage,
-            finish_reason: self.finish_reason.unwrap_or_else(|| "stop".to_string()),
+            finish_reason: self.finish_reason,
         }
     }
 }
@@ -496,7 +496,7 @@ mod tests {
         let completion = accumulator.finish();
         assert_eq!(completion.message.content.as_deref(), Some("hello world"));
         assert_eq!(completion.usage.total_tokens, 12);
-        assert_eq!(completion.finish_reason, "stop");
+        assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
     }
 
     #[test]
