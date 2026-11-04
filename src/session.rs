@@ -39,6 +39,8 @@ pub enum Record {
         reasoning: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        responses_items: Vec<serde_json::Value>,
     },
     Tool {
         call_id: String,
@@ -65,6 +67,7 @@ impl Record {
                 content: message.content.clone(),
                 reasoning: message.reasoning.clone(),
                 tool_calls: message.tool_calls.clone(),
+                responses_items: message.responses_items.clone(),
             }),
             Message::Tool {
                 call_id,
@@ -147,6 +150,7 @@ impl LoadedSession {
                     content,
                     reasoning,
                     tool_calls,
+                    responses_items,
                 } => {
                     flush(&mut messages, &mut pending);
                     pending = tool_calls
@@ -157,6 +161,7 @@ impl LoadedSession {
                         content: content.clone(),
                         reasoning: reasoning.clone(),
                         tool_calls: tool_calls.clone(),
+                        responses_items: responses_items.clone(),
                     }));
                 }
                 Record::Tool {
@@ -456,6 +461,14 @@ mod tests {
                     name: "bash".into(),
                     arguments: "{}".into(),
                 }],
+                responses_items: vec![serde_json::json!({
+                    "type": "function_call",
+                    "id": "fc_call_1",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{}",
+                    "status": "completed"
+                })],
             })
             .unwrap();
         session
@@ -471,6 +484,11 @@ mod tests {
         let messages = loaded.messages();
         assert_eq!(messages.len(), 3);
         assert!(matches!(&messages[0], Message::User { content } if content == "hello"));
+        assert!(matches!(
+            &messages[1],
+            Message::Assistant { message }
+                if message.responses_items[0]["id"] == "fc_call_1"
+        ));
         assert!(matches!(&messages[2], Message::Tool { name, .. } if name == "bash"));
 
         let summaries = store.list().unwrap();
@@ -516,6 +534,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 ],
+                responses_items: Vec::new(),
             })
             .unwrap();
         session
@@ -584,6 +603,7 @@ mod tests {
                     arguments: "{}".into(),
                 },
             ],
+            responses_items: Vec::new(),
         });
         buffer.record(&session, &assistant).unwrap();
         buffer
@@ -619,6 +639,7 @@ mod tests {
                 name: "bash".into(),
                 arguments: "{}".into(),
             }],
+            responses_items: Vec::new(),
         });
         buffer.record(&session, &assistant).unwrap();
         buffer

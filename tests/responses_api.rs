@@ -1,0 +1,412 @@
+mod common;
+
+use common::{MockResponse, MockServer, RecordingSink};
+use icode::config::{ApiStyle, ModelProfile};
+use icode::model::{AssistantMessage, Message, ModelClient, ToolCall, ToolDef};
+use serde_json::json;
+
+fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
+    ModelProfile {
+        name: "mock-responses".to_string(),
+        provider: "openai".to_string(),
+        api_style: ApiStyle::Responses,
+        model: "gpt-test".to_string(),
+        base_url: server.base_url(),
+        api_key: "test-key".to_string(),
+        max_tokens: Some(512),
+        temperature: None,
+        stream,
+    }
+}
+
+fn weather_tool() -> ToolDef {
+    ToolDef {
+        name: "get_weather".to_string(),
+        description: "Get the weather for a city".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"}
+            },
+            "required": ["city"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_maps_stateless_history_and_assembles_output() {
+    let server = MockServer::new(|path, body| {
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["model"], "gpt-test");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 512);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert!(body.get("messages").is_none());
+        assert!(body.get("max_tokens").is_none());
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get the weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                },
+                "strict": false
+            }])
+        );
+        assert_eq!(
+            body["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "Be concise."}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Weather in Paris?"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will check.", "annotations": []}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_call_previous",
+                    "call_id": "call_previous",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Paris\"}",
+                    "status": "completed"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_previous",
+                    "output": "{\"temperature_c\":18}"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "And London?"}]
+                }
+            ])
+        );
+
+        MockResponse::sse(&[
+            r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"Checking current conditions. "}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"London is "}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"cooler. "}"#,
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":2,"delta":"{\"city\":"}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":2,"delta":"\"London\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"Checking current conditions. "}]},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"London is cooler. ","annotations":[]}]},{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}","status":"completed"}],"usage":{"input_tokens":31,"output_tokens":9,"total_tokens":40}}}"#,
+        ])
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, true)).unwrap();
+    assert_eq!(client.endpoint(), format!("{}/v1/responses", server.url()));
+    let sink = RecordingSink::default();
+    let messages = vec![
+        Message::system("Be concise."),
+        Message::user("Weather in Paris?"),
+        Message::assistant(AssistantMessage {
+            content: Some("I will check.".to_string()),
+            reasoning: Some("Need fresh data.".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_previous".to_string(),
+                name: "get_weather".to_string(),
+                arguments: r#"{"city":"Paris"}"#.to_string(),
+            }],
+            responses_items: Vec::new(),
+        }),
+        Message::tool("call_previous", "get_weather", r#"{"temperature_c":18}"#),
+        Message::user("And London?"),
+    ];
+
+    let completion = client
+        .complete(&messages, &[weather_tool()], &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.message.content.as_deref(),
+        Some("London is cooler. ")
+    );
+    assert_eq!(
+        completion.message.reasoning.as_deref(),
+        Some("Checking current conditions. ")
+    );
+    assert_eq!(
+        completion.message.tool_calls,
+        vec![ToolCall {
+            id: "call_weather".to_string(),
+            name: "get_weather".to_string(),
+            arguments: r#"{"city":"London"}"#.to_string(),
+        }]
+    );
+    assert_eq!(completion.message.responses_items.len(), 3);
+    assert_eq!(completion.message.responses_items[0]["id"], "rs_1");
+    assert_eq!(
+        completion.message.responses_items[0]["encrypted_content"],
+        "opaque"
+    );
+    assert_eq!(completion.message.responses_items[2]["id"], "fc_1");
+    assert_eq!(completion.usage.prompt_tokens, 31);
+    assert_eq!(completion.usage.completion_tokens, 9);
+    assert_eq!(completion.usage.total_tokens, 40);
+    assert_eq!(
+        sink.events(),
+        vec![
+            "reasoning:Checking current conditions. ".to_string(),
+            "text:London is ".to_string(),
+            "text:cooler. ".to_string()
+        ]
+    );
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn responses_non_streaming_json_extracts_output_text_and_usage() {
+    let server = MockServer::new(|path, body| {
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["stream"], false);
+        assert_eq!(
+            body["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}]
+            }])
+        );
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_json",
+                "status": "completed",
+                "error": null,
+                "output": [{
+                    "id": "msg_json",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Hello from Responses.",
+                        "annotations": []
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 5,
+                    "total_tokens": 9
+                }
+            })
+            .to_string(),
+        )
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, false)).unwrap();
+    let sink = RecordingSink::default();
+
+    let completion = client
+        .complete(&[Message::user("Hello")], &[], &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.message.content.as_deref(),
+        Some("Hello from Responses.")
+    );
+    assert!(completion.message.tool_calls.is_empty());
+    assert_eq!(completion.usage.prompt_tokens, 4);
+    assert_eq!(completion.usage.completion_tokens, 5);
+    assert_eq!(completion.usage.total_tokens, 9);
+    assert!(sink.events().is_empty());
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn responses_stream_requires_a_terminal_event() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::sse(&[
+            r#"{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"partial"}"#,
+        ])
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, true)).unwrap();
+    let sink = RecordingSink::default();
+
+    let error = client
+        .complete(&[Message::user("Hello")], &[], &sink)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("before a terminal event"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn responses_rejects_unsupported_executable_output_items() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            })
+            .to_string(),
+        )
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, false)).unwrap();
+    let sink = RecordingSink::default();
+
+    let error = client
+        .complete(&[Message::user("Search")], &[], &sink)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("unsupported output item"),
+        "{error:#}"
+    );
+}
+
+#[tokio::test]
+async fn responses_rejects_refusal_with_function_calls() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "Cannot comply"}]},
+                    {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"}
+                ],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            })
+            .to_string(),
+        )
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, false)).unwrap();
+    let sink = RecordingSink::default();
+
+    let error = client
+        .complete(&[Message::user("Do it")], &[weather_tool()], &sink)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("refused"), "{error:#}");
+}
+
+#[tokio::test]
+async fn responses_replays_native_output_items_without_reconstruction() {
+    let native_items = vec![
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque",
+            "summary": []
+        }),
+        json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "get_weather",
+            "arguments": "{\"city\":\"Paris\"}",
+            "status": "completed"
+        }),
+    ];
+    let expected_items = native_items.clone();
+    let server = MockServer::new(move |_, body| {
+        assert_eq!(body["input"][1], expected_items[0]);
+        assert_eq!(body["input"][2], expected_items[1]);
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_2",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "Done", "annotations": []}]
+                }],
+                "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+            })
+            .to_string(),
+        )
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, false)).unwrap();
+    let messages = vec![
+        Message::user("Call it"),
+        Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: Some("display-only summary".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            responses_items: native_items,
+        }),
+        Message::tool("call_1", "get_weather", "sunny"),
+    ];
+
+    client
+        .complete(&messages, &[], &RecordingSink::default())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn responses_rejects_function_calls_from_incomplete_output() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_1",
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                    "status": "in_progress"
+                }],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            })
+            .to_string(),
+        )
+    });
+    let client = ModelClient::from_profile(&responses_profile(&server, false)).unwrap();
+
+    let error = client
+        .complete(
+            &[Message::user("Weather")],
+            &[weather_tool()],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("incomplete response"),
+        "{error:#}"
+    );
+}

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
 use reqwest::StatusCode;
@@ -21,6 +21,8 @@ const MAX_ERROR_BODY: usize = 600;
 /// A configured model endpoint.
 pub struct ModelClient {
     http: HttpClient,
+    api_style: ApiStyle,
+    include_encrypted_reasoning: bool,
     endpoint: String,
     api_key: String,
     model: String,
@@ -33,13 +35,6 @@ pub struct ModelClient {
 impl ModelClient {
     /// Build a client for a profile, resolving the API key.
     pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
-        if profile.api_style == ApiStyle::Responses {
-            bail!(
-                "model profile {:?} uses the Responses API, which the Rust port does not support yet; \
-                 set \"api_style\": \"chat\" or choose a model that supports Chat Completions",
-                profile.name
-            );
-        }
         let api_key = resolve_api_key(&profile.api_key)
             .with_context(|| format!("cannot use model profile {:?}", profile.name))?;
         let http = HttpClient::builder()
@@ -52,9 +47,16 @@ impl ModelClient {
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_millis(1000));
+        let endpoint = match profile.api_style {
+            ApiStyle::Chat => profile.chat_completions_url(),
+            ApiStyle::Responses => profile.responses_url(),
+        };
         Ok(Self {
             http,
-            endpoint: profile.chat_completions_url(),
+            api_style: profile.api_style,
+            include_encrypted_reasoning: profile.api_style == ApiStyle::Responses
+                && profile.provider.eq_ignore_ascii_case("openai"),
+            endpoint,
             api_key,
             model: profile.model.clone(),
             temperature: profile.temperature,
@@ -111,6 +113,17 @@ impl ModelClient {
     }
 
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Value {
+        if self.api_style == ApiStyle::Responses {
+            return super::responses::request_body(
+                messages,
+                tools,
+                &self.model,
+                self.stream,
+                self.temperature,
+                self.max_tokens,
+                self.include_encrypted_reasoning,
+            );
+        }
         let api_messages: Vec<Value> = messages.iter().map(Message::to_api).collect();
         let mut body = json!({
             "model": self.model,
@@ -178,6 +191,9 @@ impl ModelClient {
         response: reqwest::Response,
         sink: &dyn EventSink,
     ) -> Result<Completion, ClientError> {
+        if self.api_style == ApiStyle::Responses {
+            return self.consume_responses_stream(response, sink).await;
+        }
         let mut stream = response.bytes_stream();
         let mut parser = SseParser::new();
         let mut accumulator = Accumulator::default();
@@ -205,7 +221,50 @@ impl ModelClient {
         Ok(accumulator.finish())
     }
 
+    async fn consume_responses_stream(
+        &self,
+        response: reqwest::Response,
+        sink: &dyn EventSink,
+    ) -> Result<Completion, ClientError> {
+        let mut stream = response.bytes_stream();
+        let mut parser = SseParser::new();
+        let mut accumulator = super::responses::ResponsesAccumulator::default();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk
+                .map_err(|error| ClientError::Fatal(anyhow!("Responses stream failed: {error}")))?;
+            for payload in parser
+                .push(&bytes)
+                .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+            {
+                if payload.trim() != "[DONE]"
+                    && accumulator
+                        .apply(&payload, sink)
+                        .map_err(ClientError::Fatal)?
+                {
+                    return accumulator.finish().map_err(ClientError::Fatal);
+                }
+            }
+        }
+        for payload in parser
+            .finish()
+            .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+        {
+            if payload.trim() != "[DONE]" {
+                accumulator
+                    .apply(&payload, sink)
+                    .map_err(ClientError::Fatal)?;
+            }
+        }
+        accumulator.finish().map_err(ClientError::Fatal)
+    }
+
     async fn consume_json(&self, response: reqwest::Response) -> Result<Completion, ClientError> {
+        if self.api_style == ApiStyle::Responses {
+            let payload: Value = response.json().await.map_err(|error| {
+                ClientError::Fatal(anyhow!("invalid Responses API response: {error}"))
+            })?;
+            return super::responses::decode_json(payload).map_err(ClientError::Fatal);
+        }
         let payload: ChatResponse = response
             .json()
             .await
@@ -232,6 +291,7 @@ impl ModelClient {
                     arguments: call.function.arguments.unwrap_or_default(),
                 })
                 .collect(),
+            responses_items: Vec::new(),
         };
         Ok(Completion {
             message,
@@ -358,6 +418,7 @@ impl Accumulator {
                     Some(self.reasoning)
                 },
                 tool_calls,
+                responses_items: Vec::new(),
             },
             usage: self.usage,
             finish_reason: self.finish_reason,

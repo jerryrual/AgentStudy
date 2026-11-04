@@ -11,8 +11,9 @@
 
 - **TUI 对话界面**：基于 ratatui，包含对话视图、输入框、状态栏（模型 / 审批模式 /
   工作目录 / token / 会话），支持流式 Markdown 渲染、工具调用卡片与审批弹窗。
-- **模型接入**：任何兼容 OpenAI Chat Completions 协议的服务（默认 DeepSeek），
-  支持流式 SSE、`reasoning_content` 推理内容、token 用量统计、429/5xx 自动重试。
+- **模型接入**：兼容 OpenAI Chat Completions 或核心无状态 Responses API 的服务，
+  支持流式 SSE、推理摘要、token 用量统计、429/5xx 自动重试和本地函数工具；Responses
+  模式支持流式/非流式文本，但不支持已存储响应续传、服务端托管工具或图片。
 - **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
   写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
