@@ -115,6 +115,13 @@ pub trait Tool: Send + Sync {
     fn mutates(&self) -> bool {
         false
     }
+    /// Whether this tool may overlap other calls from the same model response.
+    ///
+    /// This is deliberately opt-in. A tool can be non-mutating yet still be
+    /// stateful or interactive (for example `todo_write` or `ask_user`).
+    fn parallel_safe(&self) -> bool {
+        false
+    }
     /// One-line summary shown in the TUI and the `icode run` progress output.
     fn summarize(&self, raw_arguments: &str) -> String;
     async fn run(&self, arguments: &Value, context: &ToolContext) -> Result<String>;
@@ -185,6 +192,16 @@ impl ToolRegistry {
         Self { tools, index }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        let index = tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| (tool.name().to_string(), index))
+            .collect();
+        Self { tools, index }
+    }
+
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.index
             .get(name)
@@ -247,6 +264,19 @@ mod tests {
         assert!(registry.get("bash").is_some());
         assert!(registry.get("nope").is_none());
         assert_eq!(registry.specs().len(), names.len());
+
+        for parallel in ["read_file", "list_dir", "grep", "glob"] {
+            assert!(
+                registry.get(parallel).unwrap().parallel_safe(),
+                "{parallel} should opt into parallel execution"
+            );
+        }
+        for sequential in ["write_file", "edit_file", "bash", "todo_write", "ask_user"] {
+            assert!(
+                !registry.get(sequential).unwrap().parallel_safe(),
+                "{sequential} must remain a sequential barrier"
+            );
+        }
     }
 
     #[test]

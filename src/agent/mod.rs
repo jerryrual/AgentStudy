@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use futures_util::future::join_all;
 use tokio::sync::Mutex;
 
 pub use events::{EventSink, NullSink};
@@ -247,14 +248,76 @@ impl Agent {
                 todos: self.todos.clone(),
             };
 
-            for call in calls {
-                tool_calls += 1;
-                let result = self.execute_tool(&call, &context, sink).await;
-                let message = Message::tool(call.id.clone(), call.name.clone(), result);
+            tool_calls += calls.len();
+            for message in self.execute_tool_batch(&calls, &context, sink).await {
                 messages.push(message.clone());
                 sink.message_added(&message);
             }
         }
+    }
+
+    /// Execute one model tool-call batch. Maximal contiguous runs of tools that
+    /// explicitly opt into parallel execution overlap; every other call is a
+    /// sequential barrier. Results always remain in provider call order.
+    async fn execute_tool_batch(
+        &self,
+        calls: &[crate::model::ToolCall],
+        context: &ToolContext,
+        sink: &dyn EventSink,
+    ) -> Vec<Message> {
+        let mut messages = Vec::with_capacity(calls.len());
+        let mut index = 0;
+        while index < calls.len() {
+            if !self.is_parallel_safe(&calls[index]) {
+                let call = &calls[index];
+                let result = self.execute_tool(call, context, sink).await;
+                messages.push(Message::tool(call.id.clone(), call.name.clone(), result));
+                index += 1;
+                continue;
+            }
+
+            let start = index;
+            while index < calls.len() && self.is_parallel_safe(&calls[index]) {
+                index += 1;
+            }
+            let prepared: Vec<_> = calls[start..index]
+                .iter()
+                .map(|call| {
+                    let summary = self.tool_summary(call);
+                    sink.tool_started(&call.name, &summary);
+                    (call, summary)
+                })
+                .collect();
+            let executions = join_all(
+                prepared
+                    .iter()
+                    .map(|(call, summary)| self.execute_tool_inner(call, context, summary)),
+            )
+            .await;
+
+            // `join_all` preserves input order. Emit finishes and persist tool
+            // messages in that order too, even if the calls completed in reverse.
+            for ((call, summary), (ok, duration, display, result)) in
+                prepared.into_iter().zip(executions)
+            {
+                sink.tool_finished(&call.name, ok, duration, &summary, &display);
+                messages.push(Message::tool(call.id.clone(), call.name.clone(), result));
+            }
+        }
+        messages
+    }
+
+    fn is_parallel_safe(&self, call: &crate::model::ToolCall) -> bool {
+        self.tools
+            .get(&call.name)
+            .is_some_and(|tool| tool.parallel_safe() && !tool.mutates())
+    }
+
+    fn tool_summary(&self, call: &crate::model::ToolCall) -> String {
+        self.tools
+            .get(&call.name)
+            .map(|tool| tool.summarize(&call.arguments))
+            .unwrap_or_else(|| call.name.clone())
     }
 
     async fn execute_tool(
@@ -263,20 +326,26 @@ impl Agent {
         context: &ToolContext,
         sink: &dyn EventSink,
     ) -> String {
-        let summary = self
-            .tools
-            .get(&call.name)
-            .map(|tool| tool.summarize(&call.arguments))
-            .unwrap_or_else(|| call.name.clone());
+        let summary = self.tool_summary(call);
         sink.tool_started(&call.name, &summary);
+        let (ok, duration, display, result) =
+            self.execute_tool_inner(call, context, &summary).await;
+        sink.tool_finished(&call.name, ok, duration, &summary, &display);
+        result
+    }
 
+    async fn execute_tool_inner(
+        &self,
+        call: &crate::model::ToolCall,
+        context: &ToolContext,
+        summary: &str,
+    ) -> (bool, Duration, String, String) {
         let started = Instant::now();
         let arguments = match call.parse_arguments() {
             Ok(arguments) => arguments,
             Err(error) => {
                 let message = format!("Error: invalid JSON arguments for {}: {error}", call.name);
-                sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
-                return message;
+                return (false, started.elapsed(), message.clone(), message);
             }
         };
 
@@ -291,8 +360,7 @@ impl Agent {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
-            return message;
+            return (false, started.elapsed(), message.clone(), message);
         };
 
         if self.options.kind == AgentKind::Qa && tool.mutates() {
@@ -300,31 +368,25 @@ impl Agent {
                 "Error: {} is not available to the read-only Q&A agent.",
                 call.name
             );
-            sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
-            return message;
+            return (false, started.elapsed(), message.clone(), message);
         }
 
         if tool.mutates() {
-            let request = ApprovalRequest::new(&call.name, &summary);
-            match self.approver.approve(&request).await {
-                ApprovalDecision::Deny => {
-                    let message = "Error: the user denied this operation.".to_string();
-                    sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
-                    return message;
-                }
-                ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways => {}
+            let request = ApprovalRequest::new(&call.name, summary);
+            if self.approver.approve(&request).await == ApprovalDecision::Deny {
+                let message = "Error: the user denied this operation.".to_string();
+                return (false, started.elapsed(), message.clone(), message);
             }
         }
 
         match tool.run(&arguments, context).await {
             Ok(output) => {
-                sink.tool_finished(&call.name, true, started.elapsed(), &summary, &output);
-                truncate_output(&output)
+                let model_output = truncate_output(&output);
+                (true, started.elapsed(), output, model_output)
             }
             Err(error) => {
                 let message = format!("Error: {error:#}");
-                sink.tool_finished(&call.name, false, started.elapsed(), &summary, &message);
-                message
+                (false, started.elapsed(), message.clone(), message)
             }
         }
     }
@@ -376,6 +438,156 @@ pub fn client_from_profile(profile: &crate::config::ModelProfile) -> Result<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use anyhow::{bail, Result};
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use tokio::sync::Barrier;
+
+    use crate::config::ModelProfile;
+    use crate::interaction::{AllowAll, NoAsker};
+    use crate::tools::{Tool, ToolContext};
+
+    struct ParallelProbe {
+        barrier: Arc<Barrier>,
+        completed: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ParallelProbe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "test probe"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+
+        fn summarize(&self, raw: &str) -> String {
+            raw.to_string()
+        }
+
+        async fn run(&self, arguments: &Value, _context: &ToolContext) -> Result<String> {
+            let id = arguments["id"].as_str().unwrap().to_string();
+            let delay = arguments["delay_ms"].as_u64().unwrap_or_default();
+            self.barrier.wait().await;
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            self.completed.lock().unwrap().push(id.clone());
+            if arguments["fail"].as_bool().unwrap_or(false) {
+                bail!("{id} failed");
+            }
+            Ok(id)
+        }
+    }
+
+    fn test_agent(tool: Box<dyn Tool>) -> Agent {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        let client = Arc::new(ModelClient::from_profile(&profile).unwrap());
+        Agent::new(
+            client,
+            Arc::new(ToolRegistry::with_tools(vec![tool])),
+            Arc::new(AllowAll),
+            Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, "/tmp"),
+        )
+    }
+
+    fn test_context() -> ToolContext {
+        ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            timeout: Duration::from_secs(1),
+            asker: Arc::new(NoAsker),
+            todos: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_tools_overlap_but_results_keep_call_order() {
+        let barrier = Arc::new(Barrier::new(2));
+        let completed = Arc::new(StdMutex::new(Vec::new()));
+        let agent = test_agent(Box::new(ParallelProbe {
+            barrier,
+            completed: completed.clone(),
+        }));
+        let calls = vec![
+            crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"slow","delay_ms":50}"#.into(),
+            },
+            crate::model::ToolCall {
+                id: "call_2".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"fast","delay_ms":0}"#.into(),
+            },
+        ];
+
+        let messages = tokio::time::timeout(
+            Duration::from_secs(1),
+            agent.execute_tool_batch(&calls, &test_context(), &NullSink),
+        )
+        .await
+        .expect("parallel calls should both reach the barrier");
+
+        assert_eq!(*completed.lock().unwrap(), ["fast", "slow"]);
+        let ids_and_outputs: Vec<_> = messages
+            .iter()
+            .map(|message| match message {
+                Message::Tool {
+                    call_id, content, ..
+                } => (call_id.as_str(), content.as_str()),
+                _ => panic!("expected tool result"),
+            })
+            .collect();
+        assert_eq!(ids_and_outputs, [("call_1", "slow"), ("call_2", "fast")]);
+    }
+
+    #[tokio::test]
+    async fn parallel_tool_failure_does_not_cancel_siblings() {
+        let barrier = Arc::new(Barrier::new(2));
+        let completed = Arc::new(StdMutex::new(Vec::new()));
+        let agent = test_agent(Box::new(ParallelProbe { barrier, completed }));
+        let calls = vec![
+            crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"broken","fail":true}"#.into(),
+            },
+            crate::model::ToolCall {
+                id: "call_2".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"ok"}"#.into(),
+            },
+        ];
+
+        let messages = agent
+            .execute_tool_batch(&calls, &test_context(), &NullSink)
+            .await;
+        let outputs: Vec<_> = messages
+            .iter()
+            .map(|message| match message {
+                Message::Tool { content, .. } => content.as_str(),
+                _ => panic!("expected tool result"),
+            })
+            .collect();
+        assert!(
+            outputs[0].contains("Error: broken failed"),
+            "{}",
+            outputs[0]
+        );
+        assert_eq!(outputs[1], "ok");
+    }
 
     #[test]
     fn agent_kind_parses() {

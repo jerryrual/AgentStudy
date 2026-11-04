@@ -57,6 +57,10 @@ pub enum Modal {
 
 /// Events sent from the agent task and the interaction handlers.
 pub enum UiEvent {
+    Turn {
+        id: u64,
+        event: Box<UiEvent>,
+    },
     TextDelta(String),
     ReasoningDelta(String),
     ToolStarted {
@@ -121,6 +125,7 @@ pub struct App {
     pub follow: bool,
     pub scroll_back: u16,
     pub running: bool,
+    turn_id: u64,
     pub turn_started: Option<Instant>,
     pub elapsed: Duration,
     pub tokens: Usage,
@@ -184,6 +189,7 @@ impl App {
             follow: true,
             scroll_back: 0,
             running: false,
+            turn_id: 0,
             turn_started: None,
             elapsed: Duration::default(),
             tokens: Usage::default(),
@@ -208,6 +214,14 @@ impl App {
         let _ = self.events_tx.send(event);
     }
 
+    #[cfg(test)]
+    pub(crate) fn push_stale_event(&self, event: UiEvent) {
+        let _ = self.events_tx.send(UiEvent::Turn {
+            id: self.turn_id.wrapping_sub(1),
+            event: Box::new(event),
+        });
+    }
+
     /// Drain pending events; returns true when the UI should redraw.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
@@ -227,9 +241,17 @@ impl App {
 
     fn apply(&mut self, event: UiEvent) {
         match event {
+            UiEvent::Turn { id, event } => {
+                if id == self.turn_id {
+                    self.apply(*event);
+                }
+            }
             UiEvent::TextDelta(delta) => self.append_assistant_text(&delta),
             UiEvent::ReasoningDelta(delta) => self.append_reasoning(&delta),
             UiEvent::ToolStarted { name, summary } => {
+                if !self.running {
+                    return;
+                }
                 self.view.push(ViewItem::Tool {
                     name,
                     summary,
@@ -246,8 +268,14 @@ impl App {
                 summary,
                 output,
             } => {
+                if !self.running {
+                    return;
+                }
                 let preview = preview_output(&output);
-                let found = self.view.iter_mut().rev().find_map(|item| match item {
+                // Parallel batches emit starts and finishes in provider order.
+                // Match the oldest identical running card so duplicate calls do
+                // not swap their outputs.
+                let found = self.view.iter_mut().find_map(|item| match item {
                     ViewItem::Tool {
                         name: tool_name,
                         summary: tool_summary,
@@ -636,6 +664,8 @@ impl App {
 
     fn start_agent(&mut self) {
         self.running = true;
+        self.turn_id = self.turn_id.wrapping_add(1);
+        let turn_id = self.turn_id;
         self.turn_started = Some(Instant::now());
         self.tokens = Usage::default();
         let tx = self.events_tx.clone();
@@ -647,7 +677,10 @@ impl App {
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
-        let sink: Arc<dyn EventSink> = Arc::new(TuiSink { tx: tx.clone() });
+        let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
+            tx: tx.clone(),
+            turn_id,
+        });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
             let result = async {
@@ -668,10 +701,13 @@ impl App {
                 agent.run(&mut messages, sink.as_ref()).await
             }
             .await;
-            let _ = tx.send(UiEvent::TurnFinished(
-                result.map_err(|error| format!("{error:#}")),
-                messages,
-            ));
+            let _ = tx.send(UiEvent::Turn {
+                id: turn_id,
+                event: Box::new(UiEvent::TurnFinished(
+                    result.map_err(|error| format!("{error:#}")),
+                    messages,
+                )),
+            });
         });
         self.cancel_handle = Some(task);
     }
@@ -690,10 +726,19 @@ impl App {
             let _ = reply.send(String::new());
         }
         self.running = false;
+        self.turn_id = self.turn_id.wrapping_add(1);
         self.turn_started = None;
-        for item in self.view.iter_mut().rev() {
-            if let ViewItem::Assistant { streaming, .. } = item {
-                *streaming = false;
+        for item in &mut self.view {
+            match item {
+                ViewItem::Assistant { streaming, .. } => *streaming = false,
+                ViewItem::Tool {
+                    status, ok, output, ..
+                } if *status == ToolStatus::Running => {
+                    *status = ToolStatus::Done;
+                    *ok = Some(false);
+                    *output = "Cancelled.".to_string();
+                }
+                _ => {}
             }
         }
         self.view.push(ViewItem::Info("Cancelled.".to_string()));
@@ -716,6 +761,8 @@ impl App {
             return;
         }
         self.running = true;
+        self.turn_id = self.turn_id.wrapping_add(1);
+        let turn_id = self.turn_id;
         self.turn_started = Some(Instant::now());
         self.view.push(ViewItem::Tool {
             name: "bash".to_string(),
@@ -735,27 +782,36 @@ impl App {
             let ok = result.is_ok();
             match result {
                 Ok(output) => {
-                    let _ = tx.send(UiEvent::ToolFinished {
-                        name: "bash".to_string(),
-                        ok: true,
-                        duration: started.elapsed(),
-                        summary: command.clone(),
-                        output,
+                    let _ = tx.send(UiEvent::Turn {
+                        id: turn_id,
+                        event: Box::new(UiEvent::ToolFinished {
+                            name: "bash".to_string(),
+                            ok: true,
+                            duration: started.elapsed(),
+                            summary: command.clone(),
+                            output,
+                        }),
                     });
                 }
                 Err(error) => {
-                    let _ = tx.send(UiEvent::ToolFinished {
-                        name: "bash".to_string(),
-                        ok: false,
-                        duration: started.elapsed(),
-                        summary: command.clone(),
-                        output: format!("{error:#}"),
+                    let _ = tx.send(UiEvent::Turn {
+                        id: turn_id,
+                        event: Box::new(UiEvent::ToolFinished {
+                            name: "bash".to_string(),
+                            ok: false,
+                            duration: started.elapsed(),
+                            summary: command.clone(),
+                            output: format!("{error:#}"),
+                        }),
                     });
                 }
             }
-            let _ = tx.send(UiEvent::ShellFinished {
-                ok,
-                duration: started.elapsed(),
+            let _ = tx.send(UiEvent::Turn {
+                id: turn_id,
+                event: Box::new(UiEvent::ShellFinished {
+                    ok,
+                    duration: started.elapsed(),
+                }),
             });
         });
         self.cancel_handle = Some(task);
@@ -1132,26 +1188,36 @@ fn preview_output(output: &str) -> String {
 
 struct TuiSink {
     tx: mpsc::UnboundedSender<UiEvent>,
+    turn_id: u64,
+}
+
+impl TuiSink {
+    fn send(&self, event: UiEvent) {
+        let _ = self.tx.send(UiEvent::Turn {
+            id: self.turn_id,
+            event: Box::new(event),
+        });
+    }
 }
 
 impl EventSink for TuiSink {
     fn text_delta(&self, delta: &str) {
-        let _ = self.tx.send(UiEvent::TextDelta(delta.to_string()));
+        self.send(UiEvent::TextDelta(delta.to_string()));
     }
 
     fn reasoning_delta(&self, delta: &str) {
-        let _ = self.tx.send(UiEvent::ReasoningDelta(delta.to_string()));
+        self.send(UiEvent::ReasoningDelta(delta.to_string()));
     }
 
     fn tool_started(&self, name: &str, summary: &str) {
-        let _ = self.tx.send(UiEvent::ToolStarted {
+        self.send(UiEvent::ToolStarted {
             name: name.to_string(),
             summary: summary.to_string(),
         });
     }
 
     fn tool_finished(&self, name: &str, ok: bool, duration: Duration, summary: &str, output: &str) {
-        let _ = self.tx.send(UiEvent::ToolFinished {
+        self.send(UiEvent::ToolFinished {
             name: name.to_string(),
             ok,
             duration,
@@ -1161,19 +1227,19 @@ impl EventSink for TuiSink {
     }
 
     fn message_added(&self, message: &Message) {
-        let _ = self.tx.send(UiEvent::MessageAdded(message.clone()));
+        self.send(UiEvent::MessageAdded(message.clone()));
     }
 
     fn usage(&self, usage: &Usage) {
-        let _ = self.tx.send(UiEvent::Usage(*usage));
+        self.send(UiEvent::Usage(*usage));
     }
 
     fn info(&self, message: &str) {
-        let _ = self.tx.send(UiEvent::Info(message.to_string()));
+        self.send(UiEvent::Info(message.to_string()));
     }
 
     fn error(&self, message: &str) {
-        let _ = self.tx.send(UiEvent::Error(message.to_string()));
+        self.send(UiEvent::Error(message.to_string()));
     }
 }
 

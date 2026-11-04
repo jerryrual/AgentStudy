@@ -579,6 +579,128 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_parallel_tools_keep_outputs_in_call_order() {
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.running = true;
+        for _ in 0..2 {
+            app.push_event(UiEvent::ToolStarted {
+                name: "read_file".to_string(),
+                summary: "same.txt".to_string(),
+            });
+        }
+        for output in ["first result", "second result"] {
+            app.push_event(UiEvent::ToolFinished {
+                name: "read_file".to_string(),
+                ok: true,
+                duration: std::time::Duration::from_millis(1),
+                summary: "same.txt".to_string(),
+                output: output.to_string(),
+            });
+        }
+        app.pump();
+
+        let outputs: Vec<_> = app
+            .view
+            .iter()
+            .filter_map(|item| match item {
+                ViewItem::Tool { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs, ["first result", "second result"]);
+    }
+
+    #[test]
+    fn cancellation_closes_running_tool_cards() {
+        let mut app = test_app();
+        app.running = true;
+        app.view.push(ViewItem::Tool {
+            name: "read_file".to_string(),
+            summary: "same.txt".to_string(),
+            status: ToolStatus::Running,
+            ok: None,
+            duration: None,
+            output: String::new(),
+        });
+
+        app.cancel();
+
+        match app
+            .view
+            .iter()
+            .find(|item| matches!(item, ViewItem::Tool { .. }))
+        {
+            Some(ViewItem::Tool {
+                status, ok, output, ..
+            }) => {
+                assert_eq!(*status, ToolStatus::Done);
+                assert_eq!(*ok, Some(false));
+                assert_eq!(output, "Cancelled.");
+            }
+            _ => panic!("expected tool card"),
+        }
+    }
+
+    #[test]
+    fn cancellation_ignores_queued_tool_events() {
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.running = true;
+        app.push_event(UiEvent::ToolStarted {
+            name: "read_file".to_string(),
+            summary: "queued.txt".to_string(),
+        });
+        app.push_event(UiEvent::ToolFinished {
+            name: "read_file".to_string(),
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+            summary: "queued.txt".to_string(),
+            output: "late result".to_string(),
+        });
+
+        app.cancel();
+        app.pump();
+
+        assert!(
+            !app.view.iter().any(
+                |item| matches!(item, ViewItem::Tool { summary, .. } if summary == "queued.txt")
+            ),
+            "cancelled turn must not recreate a tool card"
+        );
+    }
+
+    #[test]
+    fn stale_turn_events_cannot_mutate_a_new_turn() {
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        app.running = true;
+        app.push_stale_event(UiEvent::ToolFinished {
+            name: "bash".to_string(),
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+            summary: "new command".to_string(),
+            output: "old result".to_string(),
+        });
+        app.push_stale_event(UiEvent::ShellFinished {
+            ok: true,
+            duration: std::time::Duration::from_millis(1),
+        });
+        app.pump();
+
+        assert!(app.running, "stale ShellFinished must not end the new turn");
+        assert!(
+            !app.view.iter().any(
+                |item| matches!(item, ViewItem::Tool { output, .. } if output == "old result")
+            ),
+            "stale ToolFinished must not create or finish a card"
+        );
+    }
+
+    #[test]
     fn renders_approval_modal() {
         let mut app = test_app();
         let (reply, _rx) = tokio::sync::oneshot::channel();

@@ -44,6 +44,10 @@ impl Tool for Grep {
         })
     }
 
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     fn summarize(&self, raw: &str) -> String {
         match serde_json::from_str::<Value>(raw) {
             Ok(arguments) => {
@@ -59,102 +63,110 @@ impl Tool for Grep {
     }
 
     async fn run(&self, arguments: &Value, context: &ToolContext) -> Result<String> {
-        let pattern = required_str(arguments, "pattern")?;
-        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let case_sensitive = optional_bool(arguments, "case_sensitive").unwrap_or(false);
-        let max_results = optional_usize(arguments, "max_results")
-            .unwrap_or(60)
-            .clamp(1, 500);
-        let glob = arguments.get("glob").and_then(Value::as_str);
-        let regex = RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map_err(|error| anyhow!("invalid regular expression: {error}"))?;
-        let matcher = match glob {
-            Some(glob) => Some(compile_glob(glob)?),
-            None => None,
-        };
-        let root = context.resolve(path);
-        if !root.exists() {
-            bail!("{} does not exist", display_path(&context.cwd, &root));
-        }
-
-        let mut results = Vec::new();
-        let mut truncated = false;
-        let mut search_file = |file: &Path, results: &mut Vec<String>| -> bool {
-            if results.len() >= max_results {
-                return false;
-            }
-            if let Some(matcher) = &matcher {
-                let relative = file.strip_prefix(&root).unwrap_or(file);
-                if !matcher.is_match(relative) && !matcher.is_match(file) {
-                    return true;
-                }
-            }
-            let metadata = match std::fs::metadata(file) {
-                Ok(metadata) => metadata,
-                Err(_) => return true,
-            };
-            if metadata.len() > MAX_SEARCH_BYTES {
-                return true;
-            }
-            let bytes = match std::fs::read(file) {
-                Ok(bytes) => bytes,
-                Err(_) => return true,
-            };
-            if is_binary(&bytes) {
-                return true;
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
-                return true;
-            };
-            let display = display_path(&context.cwd, file);
-            for (index, line) in text.lines().enumerate() {
-                if regex.is_match(line) {
-                    let line = truncate_line(line);
-                    results.push(format!("{display}:{}: {line}", index + 1));
-                    if results.len() >= max_results {
-                        truncated = true;
-                        return false;
-                    }
-                }
-            }
-            true
-        };
-
-        if root.is_file() {
-            search_file(&root, &mut results);
-        } else {
-            let mut builder = WalkBuilder::new(&root);
-            builder.standard_filters(true);
-            for entry in builder.build() {
-                let entry = entry.with_context(|| "failed while walking the directory")?;
-                let Some(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if !file_type.is_file() {
-                    continue;
-                }
-                if !search_file(entry.path(), &mut results) {
-                    break;
-                }
-            }
-        }
-
-        if results.is_empty() {
-            return Ok(format!(
-                "No matches for {pattern:?} in {}.",
-                display_path(&context.cwd, &root)
-            ));
-        }
-        let mut output = results.join("\n");
-        if truncated {
-            output.push_str(&format!(
-                "\n[limited to {max_results} matches; refine the pattern or path]"
-            ));
-        }
-        Ok(output)
+        let arguments = arguments.clone();
+        let cwd = context.cwd.clone();
+        tokio::task::spawn_blocking(move || grep_sync(&arguments, &cwd))
+            .await
+            .context("grep worker failed")?
     }
+}
+
+fn grep_sync(arguments: &Value, cwd: &Path) -> Result<String> {
+    let pattern = required_str(arguments, "pattern")?;
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    let case_sensitive = optional_bool(arguments, "case_sensitive").unwrap_or(false);
+    let max_results = optional_usize(arguments, "max_results")
+        .unwrap_or(60)
+        .clamp(1, 500);
+    let glob = arguments.get("glob").and_then(Value::as_str);
+    let regex = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|error| anyhow!("invalid regular expression: {error}"))?;
+    let matcher = match glob {
+        Some(glob) => Some(compile_glob(glob)?),
+        None => None,
+    };
+    let root = super::resolve_path(cwd, path);
+    if !root.exists() {
+        bail!("{} does not exist", display_path(cwd, &root));
+    }
+
+    let mut results = Vec::new();
+    let mut truncated = false;
+    let mut search_file = |file: &Path, results: &mut Vec<String>| -> bool {
+        if results.len() >= max_results {
+            return false;
+        }
+        if let Some(matcher) = &matcher {
+            let relative = file.strip_prefix(&root).unwrap_or(file);
+            if !matcher.is_match(relative) && !matcher.is_match(file) {
+                return true;
+            }
+        }
+        let metadata = match std::fs::metadata(file) {
+            Ok(metadata) => metadata,
+            Err(_) => return true,
+        };
+        if metadata.len() > MAX_SEARCH_BYTES {
+            return true;
+        }
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(_) => return true,
+        };
+        if is_binary(&bytes) {
+            return true;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
+            return true;
+        };
+        let display = display_path(cwd, file);
+        for (index, line) in text.lines().enumerate() {
+            if regex.is_match(line) {
+                let line = truncate_line(line);
+                results.push(format!("{display}:{}: {line}", index + 1));
+                if results.len() >= max_results {
+                    truncated = true;
+                    return false;
+                }
+            }
+        }
+        true
+    };
+
+    if root.is_file() {
+        search_file(&root, &mut results);
+    } else {
+        let mut builder = WalkBuilder::new(&root);
+        builder.standard_filters(true);
+        for entry in builder.build() {
+            let entry = entry.with_context(|| "failed while walking the directory")?;
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            if !search_file(entry.path(), &mut results) {
+                break;
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return Ok(format!(
+            "No matches for {pattern:?} in {}.",
+            display_path(cwd, &root)
+        ));
+    }
+    let mut output = results.join("\n");
+    if truncated {
+        output.push_str(&format!(
+            "\n[limited to {max_results} matches; refine the pattern or path]"
+        ));
+    }
+    Ok(output)
 }
 
 pub struct Glob;
@@ -182,6 +194,10 @@ impl Tool for Glob {
         })
     }
 
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     fn summarize(&self, raw: &str) -> String {
         match serde_json::from_str::<Value>(raw) {
             Ok(arguments) => arguments
@@ -194,54 +210,62 @@ impl Tool for Glob {
     }
 
     async fn run(&self, arguments: &Value, context: &ToolContext) -> Result<String> {
-        let pattern = required_str(arguments, "pattern")?;
-        let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-        let max_results = optional_usize(arguments, "max_results")
-            .unwrap_or(200)
-            .clamp(1, 1000);
-        let matcher = compile_glob(pattern)?;
-        let root = context.resolve(path);
-        if !root.exists() {
-            bail!("{} does not exist", display_path(&context.cwd, &root));
-        }
-        let mut matches = Vec::new();
-        let mut truncated = false;
-        let consider = |file: &Path, matches: &mut Vec<String>| {
-            let relative = file.strip_prefix(&root).unwrap_or(file);
-            if matcher.is_match(relative) || matcher.is_match(file) {
-                matches.push(display_path(&context.cwd, file));
-            }
-        };
-        if root.is_file() {
-            consider(&root, &mut matches);
-        } else {
-            let mut builder = WalkBuilder::new(&root);
-            builder.standard_filters(true);
-            for entry in builder.build() {
-                let entry = entry.with_context(|| "failed while walking the directory")?;
-                if entry
-                    .file_type()
-                    .is_none_or(|file_type| !file_type.is_file())
-                {
-                    continue;
-                }
-                consider(entry.path(), &mut matches);
-                if matches.len() >= max_results {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-        if matches.is_empty() {
-            return Ok(format!("No files match {pattern:?}."));
-        }
-        matches.sort();
-        let mut output = matches.join("\n");
-        if truncated {
-            output.push_str(&format!("\n[limited to {max_results} paths]"));
-        }
-        Ok(output)
+        let arguments = arguments.clone();
+        let cwd = context.cwd.clone();
+        tokio::task::spawn_blocking(move || glob_sync(&arguments, &cwd))
+            .await
+            .context("glob worker failed")?
     }
+}
+
+fn glob_sync(arguments: &Value, cwd: &Path) -> Result<String> {
+    let pattern = required_str(arguments, "pattern")?;
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+    let max_results = optional_usize(arguments, "max_results")
+        .unwrap_or(200)
+        .clamp(1, 1000);
+    let matcher = compile_glob(pattern)?;
+    let root = super::resolve_path(cwd, path);
+    if !root.exists() {
+        bail!("{} does not exist", display_path(cwd, &root));
+    }
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    let consider = |file: &Path, matches: &mut Vec<String>| {
+        let relative = file.strip_prefix(&root).unwrap_or(file);
+        if matcher.is_match(relative) || matcher.is_match(file) {
+            matches.push(display_path(cwd, file));
+        }
+    };
+    if root.is_file() {
+        consider(&root, &mut matches);
+    } else {
+        let mut builder = WalkBuilder::new(&root);
+        builder.standard_filters(true);
+        for entry in builder.build() {
+            let entry = entry.with_context(|| "failed while walking the directory")?;
+            if entry
+                .file_type()
+                .is_none_or(|file_type| !file_type.is_file())
+            {
+                continue;
+            }
+            consider(entry.path(), &mut matches);
+            if matches.len() >= max_results {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    if matches.is_empty() {
+        return Ok(format!("No files match {pattern:?}."));
+    }
+    matches.sort();
+    let mut output = matches.join("\n");
+    if truncated {
+        output.push_str(&format!("\n[limited to {max_results} paths]"));
+    }
+    Ok(output)
 }
 
 fn compile_glob(pattern: &str) -> Result<GlobMatcher> {

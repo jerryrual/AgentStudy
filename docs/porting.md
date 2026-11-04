@@ -11,7 +11,7 @@
 | 流式回答 | SSE 增量解析，逐 token 渲染 | `src/model/sse.rs`、`client.rs` |
 | Markdown 渲染 | 标题、列表、行内代码、粗体、链接、代码块 | `src/markdown.rs` |
 | 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥 | `src/config.rs` |
-| 工具调用 | 多轮工具循环，结果回填，超长输出截断 | `src/agent/` |
+| 工具调用 | 多轮工具循环；纯只读工具批次并行执行，结果按调用顺序回填；超长输出截断 | `src/agent/` |
 | 文件读写 | `read_file`、`write_file`、`edit_file`（精确匹配替换） | `src/tools/fs.rs` |
 | 代码搜索 | `grep`（正则）、`glob`、`list_dir`，遵循 .gitignore | `src/tools/search.rs` |
 | Shell | `bash` 工具，超时与 `kill_on_drop` | `src/tools/shell.rs` |
@@ -37,7 +37,6 @@
 - 图片/视觉输入、`web_search`、模型配置的 TUI 编辑（F2/F4）。
 - 上下文压缩（`/compact` 目前只提示未实现）。
 - 多语言界面、主题切换、Windows/Linux 安装包与自更新。
-- 并行工具调用（当前逐个顺序执行，以保证审批顺序确定）。
 
 ## 有意保留差异
 
@@ -46,6 +45,8 @@
 - 会话目录默认在系统数据目录下（`ICODE_HOME` 可覆盖），iCode 的会话格式不同，
   不能直接互相读取。
 - 模型重试策略固定为 3 次指数退避；可通过 `ICODE_RETRY_BASE_MS` 调整基准间隔（测试用）。
+- 工具并发仅对 `read_file`、`list_dir`、`grep`、`glob` 开放；写操作、Shell、提问与
+  todo 更新保持顺序执行，以保证审批、交互和会话状态的确定性。
 - `icode run` 与 iCode 一样绕过审批；`--approval deny` 提供只读保护。
 
 ## 设计取向

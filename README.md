@@ -13,7 +13,8 @@
   工作目录 / token / 会话），支持流式 Markdown 渲染、工具调用卡片与审批弹窗。
 - **模型接入**：任何兼容 OpenAI Chat Completions 协议的服务（默认 DeepSeek），
   支持流式 SSE、`reasoning_content` 推理内容、token 用量统计、429/5xx 自动重试。
-- **智能体循环**：系统提示词 + 工具调用循环（多轮），内置 Code 与只读 Q&A 两种智能体。
+- **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
+  写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
   `bash`、`todo_write`、`ask_user`。
 - **审批策略**：`ask`（默认，逐次确认写操作与 Shell）、`auto`、`deny`。
