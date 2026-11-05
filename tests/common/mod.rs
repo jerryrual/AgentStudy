@@ -220,6 +220,7 @@ impl RecordingSink {
 impl icode::agent::EventSink for RecordingSink {
     fn persist_context_projection(
         &self,
+        _source: &[icode::model::Message],
         projection: &icode::compaction::ContextProjection,
     ) -> anyhow::Result<bool> {
         self.projections.lock().unwrap().push(projection.clone());

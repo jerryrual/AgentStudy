@@ -47,7 +47,11 @@ pub trait EventSink: Send + Sync {
     ///
     /// A `true` result guarantees earlier messages from the same turn were
     /// persisted first and the projection is durably ordered after them.
-    fn persist_context_projection(&self, _projection: &ContextProjection) -> anyhow::Result<bool> {
+    fn persist_context_projection(
+        &self,
+        _source: &[Message],
+        _projection: &ContextProjection,
+    ) -> anyhow::Result<bool> {
         Ok(false)
     }
 

@@ -210,6 +210,64 @@ impl Session {
         Ok(true)
     }
 
+    /// Archive the raw current-turn groups, then append their projection under one append lock.
+    pub(crate) fn append_archived_context_projection_if<F>(
+        &self,
+        source: &[Message],
+        projection: &ContextProjection,
+        should_append: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
+        if projection.is_empty() {
+            anyhow::bail!("cannot append an empty context projection");
+        }
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        if !should_append() {
+            return Ok(false);
+        }
+        let loaded = load_session_file(&self.path, self.id())?;
+        let current_user = loaded
+            .records
+            .iter()
+            .rposition(|record| matches!(record, Record::User { .. }))
+            .context("cannot archive a context projection without a persisted user turn")?;
+        let turn = loaded.records[..=current_user]
+            .iter()
+            .filter(|record| matches!(record, Record::User { .. }))
+            .count() as u64;
+        let round = loaded.records[current_user + 1..]
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record,
+                    Record::ContextProjection {
+                        projection: ContextProjection {
+                            current_turn: Some(_),
+                            ..
+                        }
+                    }
+                )
+            })
+            .count() as u64
+            + 1;
+        ArchiveStore::with_root(&self.archive_root).archive_context_projection(
+            self.id(),
+            turn,
+            round,
+            source,
+            projection,
+        )?;
+        self.append_unlocked(&Record::ContextProjection {
+            projection: projection.clone(),
+        })?;
+        Ok(true)
+    }
+
     /// Reload this session after all append work from cloned handles completes.
     pub fn load_messages(&self) -> Result<Vec<Message>> {
         let _guard = self

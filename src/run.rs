@@ -66,7 +66,11 @@ impl EventSink for RunSink {
         Ok(true)
     }
 
-    fn persist_context_projection(&self, projection: &ContextProjection) -> Result<bool> {
+    fn persist_context_projection(
+        &self,
+        source: &[Message],
+        projection: &ContextProjection,
+    ) -> Result<bool> {
         if self.has_unsaved_messages() {
             return Ok(false);
         }
@@ -74,7 +78,12 @@ impl EventSink for RunSink {
             .recorded
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        recorded.session.append_context_projection(projection)?;
+        if recorded.buffer.has_pending() {
+            return Ok(false);
+        }
+        recorded
+            .session
+            .append_archived_context_projection_if(source, projection, || true)?;
         recorded.buffer.reset();
         Ok(true)
     }
@@ -362,12 +371,14 @@ mod tests {
             save_failed: AtomicBool::new(false),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
+            content: Some("assistant context".into()),
+            reasoning: Some("private reasoning".into()),
             tool_calls: vec![crate::model::ToolCall {
                 id: "call_1".into(),
                 name: "grep".into(),
-                arguments: "{}".into(),
+                arguments: r#"{"pattern":"private-token"}"#.into(),
             }],
-            ..crate::model::AssistantMessage::default()
+            responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
         }));
         sink.message_added(&Message::tool("call_1", "grep", "large result"));
         let projection = ContextProjection {
@@ -378,7 +389,23 @@ mod tests {
             }),
         };
 
-        assert!(sink.persist_context_projection(&projection).unwrap());
+        let source = vec![
+            Message::user("current"),
+            Message::assistant(crate::model::AssistantMessage {
+                content: Some("assistant context".into()),
+                reasoning: Some("private reasoning".into()),
+                tool_calls: vec![crate::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"private-token"}"#.into(),
+                }],
+                responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
+            }),
+            Message::tool("call_1", "grep", "large result"),
+        ];
+        assert!(sink
+            .persist_context_projection(&source, &projection)
+            .unwrap());
 
         let loaded = store.load(session.id()).unwrap();
         assert!(matches!(
@@ -388,6 +415,80 @@ mod tests {
         assert!(matches!(
             loaded.messages().last(),
             Some(Message::LastWords { .. })
+        ));
+        let archive = crate::compaction_archive::ArchiveStore::with_root(session.archive_root())
+            .reconcile()
+            .unwrap();
+        assert_eq!(archive.live_records.len(), 1);
+        let catalog = &archive.live_records[0];
+        let archived =
+            std::fs::read_to_string(session.archive_root().join(&catalog.relative_path)).unwrap();
+        let record_id_line = format!("Record ID: `{}`", catalog.record_id);
+        for expected in [
+            "assistant context",
+            "private reasoning",
+            "\"pattern\": \"private-token\"",
+            "opaque-secret",
+            "large result",
+            "Group ID: `call_1`",
+            record_id_line.as_str(),
+        ] {
+            assert!(
+                archived.contains(expected),
+                "missing archive detail: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_sink_preserves_raw_history_when_archive_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let sink = RunSink {
+            json: true,
+            recorded: Mutex::new(RecordedSession {
+                session: session.clone(),
+                buffer: RecordBuffer::default(),
+            }),
+            wrote_text: AtomicBool::new(false),
+            save_failed: AtomicBool::new(false),
+        };
+        let assistant = Message::assistant(crate::model::AssistantMessage {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+            ..crate::model::AssistantMessage::default()
+        });
+        let result = Message::tool("call_1", "grep", "complete result");
+        sink.message_added(&assistant);
+        sink.message_added(&result);
+        std::fs::create_dir_all(session.archive_root()).unwrap();
+        std::fs::write(session.archive_root().join("compactions"), "blocked").unwrap();
+        let source = vec![Message::user("current"), assistant, result];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 2,
+            }),
+        };
+
+        assert!(sink
+            .persist_context_projection(&source, &projection)
+            .is_err());
+
+        let loaded = store.load(session.id()).unwrap();
+        assert!(loaded
+            .records
+            .iter()
+            .all(|record| !matches!(record, Record::ContextProjection { .. })));
+        assert!(matches!(
+            loaded.messages().last(),
+            Some(Message::Tool { content, .. }) if content == "complete result"
         ));
     }
 

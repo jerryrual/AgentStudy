@@ -79,6 +79,7 @@ pub(crate) enum UiEvent {
     Usage(Usage),
     MessageAdded(Message),
     PersistContextProjection {
+        source: Vec<Message>,
         projection: ContextProjection,
         reply: std::sync::mpsc::Sender<std::result::Result<bool, String>>,
     },
@@ -361,12 +362,17 @@ impl App {
                     }
                 }
             }
-            UiEvent::PersistContextProjection { projection, reply } => {
+            UiEvent::PersistContextProjection {
+                source,
+                projection,
+                reply,
+            } => {
                 let result = persist_context_projection(
                     &self.session,
                     &self.recorder,
                     self.persistence_gate.as_ref(),
                     self.unsaved_messages,
+                    &source,
                     &projection,
                 );
                 let _ = reply.send(result);
@@ -1446,6 +1452,7 @@ fn persist_context_projection(
     recorder: &Mutex<RecordBuffer>,
     persistence_gate: Option<&Arc<AtomicBool>>,
     unsaved_messages: bool,
+    source: &[Message],
     projection: &ContextProjection,
 ) -> std::result::Result<bool, String> {
     if unsaved_messages {
@@ -1455,7 +1462,7 @@ fn persist_context_projection(
         .lock()
         .map_err(|_| "session recorder lock is poisoned".to_string())?;
     let appended = session
-        .append_context_projection_if(projection, || {
+        .append_archived_context_projection_if(source, projection, || {
             persistence_gate.is_some_and(|gate| gate.load(Ordering::SeqCst))
         })
         .map_err(|error| format!("{error:#}"))?;
@@ -1492,7 +1499,11 @@ impl EventSink for TuiSink {
             .append_compression_batch_if(batch, || self.persistence_gate.load(Ordering::SeqCst))
     }
 
-    fn persist_context_projection(&self, projection: &ContextProjection) -> Result<bool> {
+    fn persist_context_projection(
+        &self,
+        source: &[Message],
+        projection: &ContextProjection,
+    ) -> Result<bool> {
         if !self.persistence_gate.load(Ordering::SeqCst) {
             return Ok(false);
         }
@@ -1501,6 +1512,7 @@ impl EventSink for TuiSink {
             .send(UiEvent::Turn {
                 id: self.turn_id,
                 event: Box::new(UiEvent::PersistContextProjection {
+                    source: source.to_vec(),
                     projection: projection.clone(),
                     reply,
                 }),
@@ -1765,7 +1777,9 @@ mod tests {
             ..crate::model::AssistantMessage::default()
         });
         sink.message_added(&assistant);
-        sink.message_added(&Message::tool("call_1", "read_file", "large result"));
+        let tool_result = Message::tool("call_1", "read_file", "large result");
+        sink.message_added(&tool_result);
+        let source = vec![Message::user("current"), assistant.clone(), tool_result];
         let projection = ContextProjection {
             historical_folds: Vec::new(),
             current_turn: Some(crate::compaction::CurrentTurnFold {
@@ -1776,7 +1790,8 @@ mod tests {
         let worker = {
             let sink = sink.clone();
             let projection = projection.clone();
-            std::thread::spawn(move || sink.persist_context_projection(&projection))
+            let source = source.clone();
+            std::thread::spawn(move || sink.persist_context_projection(&source, &projection))
         };
 
         for _ in 0..3 {
@@ -1788,12 +1803,17 @@ mod tests {
                 UiEvent::MessageAdded(message) => {
                     recorder.lock().unwrap().record(&session, &message).unwrap()
                 }
-                UiEvent::PersistContextProjection { projection, reply } => {
+                UiEvent::PersistContextProjection {
+                    source,
+                    projection,
+                    reply,
+                } => {
                     let result = persist_context_projection(
                         &session,
                         &recorder,
                         Some(&gate),
                         false,
+                        &source,
                         &projection,
                     );
                     let _ = reply.send(result);
@@ -1818,6 +1838,18 @@ mod tests {
             loaded.messages().last(),
             Some(Message::LastWords { .. })
         ));
+        let archive = crate::compaction_archive::ArchiveStore::with_root(session.archive_root())
+            .reconcile()
+            .unwrap();
+        assert_eq!(archive.live_records.len(), 1);
+        let archived = std::fs::read_to_string(
+            session
+                .archive_root()
+                .join(&archive.live_records[0].relative_path),
+        )
+        .unwrap();
+        assert!(archived.contains("large result"));
+        assert!(archived.contains("Group ID: `call_1`"));
     }
 
     #[test]
@@ -1860,7 +1892,7 @@ mod tests {
             current_turn: None,
         };
 
-        assert!(!sink.persist_context_projection(&projection).unwrap());
+        assert!(!sink.persist_context_projection(&[], &projection).unwrap());
         assert!(rx.try_recv().is_err());
     }
 
@@ -1887,7 +1919,7 @@ mod tests {
         };
         let worker = {
             let sink = sink.clone();
-            std::thread::spawn(move || sink.persist_context_projection(&projection))
+            std::thread::spawn(move || sink.persist_context_projection(&[], &projection))
         };
         let queued = rx.blocking_recv().expect("queued projection barrier");
 
