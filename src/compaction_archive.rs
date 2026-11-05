@@ -103,6 +103,138 @@ pub struct ArchiveState {
     pub writable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManifestEntry {
+    pub record_id: Option<String>,
+    pub group_id: String,
+    pub record_dir: String,
+    pub relative_path: Option<String>,
+    pub turn: u64,
+    pub round: u64,
+    pub sequence: u64,
+    pub tool: String,
+    pub display_argument: String,
+    pub outcome: String,
+    pub size_chars: usize,
+    pub assistant_text: bool,
+    pub available: bool,
+    pub no_record_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivedContextProjection {
+    pub entries: Vec<ManifestEntry>,
+    pub available_relative_paths: HashSet<String>,
+    records: Vec<CatalogRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CurrentTurnArchiveManifest {
+    pub entries: Vec<ManifestEntry>,
+}
+
+impl CurrentTurnArchiveManifest {
+    pub fn append(&mut self, projection: ArchivedContextProjection) {
+        for entry in &mut self.entries {
+            entry.available = entry
+                .relative_path
+                .as_ref()
+                .is_some_and(|path| projection.available_relative_paths.contains(path));
+        }
+        self.entries.extend(projection.entries);
+        if self.entries.len() > 500 {
+            self.entries.drain(..self.entries.len() - 500);
+        }
+    }
+
+    pub fn render(&self, session_root: &Path, file_read_available: bool) -> Option<String> {
+        let last = self.entries.last()?;
+        let absolute_root = if session_root.is_absolute() {
+            session_root.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(session_root)
+        };
+        let absolute_dir =
+            manifest_path_text(&absolute_posix_path(&absolute_root.join(&last.record_dir)));
+        let heading = format!(
+            "--- Dropped this turn (records under {}/) ---",
+            absolute_dir.trim_end_matches('/')
+        );
+        let show_affordance = file_read_available
+            && self.entries.iter().any(|entry| {
+                entry.available
+                    && entry
+                        .relative_path
+                        .as_ref()
+                        .is_some_and(|path| !path.is_empty())
+            });
+        let affordance = "To inspect archived input/output, read the listed file with read_file; capped records contain an explicit middle-truncation marker.";
+        let mut first = 0usize;
+        loop {
+            let omitted = first;
+            let mut lines = Vec::with_capacity(self.entries.len() - first + 3);
+            lines.push(heading.clone());
+            if omitted > 0 {
+                lines.push(format!("… and {omitted} earlier records — see manifest.md"));
+            }
+            lines.extend(self.entries[first..].iter().map(render_manifest_entry));
+            if show_affordance {
+                lines.push(affordance.into());
+            }
+            let rendered = lines.join("\n");
+            if rendered.lines().count() <= 50 && rendered.chars().count() <= 6000 {
+                return Some(rendered);
+            }
+            if first < self.entries.len() {
+                first += 1;
+                continue;
+            }
+            let mut truncated: String = rendered.chars().take(5999).collect();
+            truncated.push('…');
+            return Some(truncated);
+        }
+    }
+}
+
+fn render_manifest_entry(entry: &ManifestEntry) -> String {
+    let size = if entry.size_chars < 1000 {
+        entry.size_chars.to_string()
+    } else {
+        format!("{:.1}k", entry.size_chars as f64 / 1000.0)
+    };
+    let mut row = if entry.assistant_text {
+        format!(
+            "r{} {:03} assistant text, {size} chars",
+            entry.round, entry.sequence
+        )
+    } else {
+        let argument = if entry.display_argument.is_empty() {
+            "…"
+        } else {
+            &entry.display_argument
+        };
+        format!(
+            "r{} {:03} {}({argument}) → {}, {size} chars",
+            entry.round, entry.sequence, entry.tool, entry.outcome
+        )
+    };
+    if let Some(reason) = &entry.no_record_reason {
+        row.push_str(&format!(" — (no record: {reason})"));
+    } else if let Some(path) = &entry.relative_path {
+        let basename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        row.push_str(&format!(" — {basename}"));
+        if !entry.available {
+            row.push_str(" (record missing)");
+        }
+    }
+    row
+}
+
 #[derive(Debug, Clone)]
 pub struct ArchiveStore {
     root: PathBuf,
@@ -260,6 +392,19 @@ impl ArchiveStore {
         source: &[Message],
         projection: &ContextProjection,
     ) -> Result<Vec<CatalogRecord>> {
+        Ok(self
+            .archive_context_projection_with_manifest(session_id, turn, round, source, projection)?
+            .records)
+    }
+
+    pub(crate) fn archive_context_projection_with_manifest(
+        &self,
+        session_id: &str,
+        turn: u64,
+        round: u64,
+        source: &[Message],
+        projection: &ContextProjection,
+    ) -> Result<ArchivedContextProjection> {
         let records = projection_archive_records(session_id, turn, round, source, projection)?;
         let _guard = self
             .catalog_lock
@@ -277,7 +422,18 @@ impl ArchiveStore {
             };
             archived.push(record);
         }
-        Ok(archived)
+        let final_state = self.reconcile_unlocked()?;
+        let entries = projection_manifest_entries(
+            source,
+            &records,
+            &archived,
+            &final_state.available_relative_paths,
+        );
+        Ok(ArchivedContextProjection {
+            entries,
+            available_relative_paths: final_state.available_relative_paths,
+            records: archived,
+        })
     }
 
     /// Persist a batch in input order. Policy refusals are returned per record.
@@ -801,6 +957,199 @@ fn projection_archive_records(
         bail!("context projection archive contains no tool-call groups");
     }
     Ok(records)
+}
+
+fn unsafe_manifest_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{0085}'
+                | '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn manifest_inline_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if unsafe_manifest_character(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(max_chars)
+        .collect()
+}
+
+fn manifest_path_text(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    for character in value.chars() {
+        if unsafe_manifest_character(character) {
+            rendered.extend(character.escape_default());
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
+}
+
+fn manifest_tool_name(name: &str) -> String {
+    let rendered = manifest_inline_text(name, 255);
+    if rendered.trim().is_empty() {
+        "unknown".into()
+    } else {
+        rendered
+    }
+}
+
+fn manifest_display_argument(call: &ToolCall) -> String {
+    let Ok(serde_json::Value::Object(arguments)) = serde_json::from_str(&call.arguments) else {
+        return String::new();
+    };
+    let keys: &[&str] = match call.name.as_str() {
+        "read_file" | "write_file" | "edit_file" | "list_dir" => &["path"],
+        "grep" | "glob" => &["pattern", "path"],
+        "bash" => &["command"],
+        _ => &[],
+    };
+    let Some((key, value)) = keys
+        .iter()
+        .find_map(|key| arguments.get(*key).map(|value| (*key, value)))
+    else {
+        return String::new();
+    };
+    let Ok(encoded) = serde_json::to_string(value) else {
+        return String::new();
+    };
+    let lower = encoded.to_ascii_lowercase();
+    if [
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "api_key",
+        "api-key",
+        "authorization",
+        "credential",
+        "bearer ",
+        "ghp_",
+        "github_pat",
+        "sk-",
+        "xox",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return String::new();
+    }
+    let rendered = manifest_inline_text(&format!("{key}={encoded}"), usize::MAX);
+    let cap = if matches!(key, "path" | "file_path") {
+        256
+    } else {
+        120
+    };
+    if rendered.chars().count() <= cap {
+        return rendered;
+    }
+    if matches!(key, "path" | "file_path") {
+        let head = (cap - 1) / 2;
+        let tail = cap - 1 - head;
+        let start: String = rendered.chars().take(head).collect();
+        let end: String = rendered
+            .chars()
+            .rev()
+            .take(tail)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{start}…{end}")
+    } else {
+        let mut truncated: String = rendered.chars().take(cap - 1).collect();
+        truncated.push('…');
+        truncated
+    }
+}
+
+fn projection_manifest_entries(
+    source: &[Message],
+    inputs: &[ArchiveRecord],
+    archived: &[CatalogRecord],
+    available_relative_paths: &HashSet<String>,
+) -> Vec<ManifestEntry> {
+    let Some(user) = source
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+    else {
+        return Vec::new();
+    };
+    let tail = &source[user + 1..];
+    let mut entries = Vec::new();
+    let mut cursor = 0usize;
+    let mut group_index = 0usize;
+    while cursor < tail.len() {
+        let Message::Assistant { message } = &tail[cursor] else {
+            cursor += 1;
+            continue;
+        };
+        if message.tool_calls.is_empty() {
+            cursor += 1;
+            continue;
+        }
+        let end = tail[cursor + 1..]
+            .iter()
+            .position(|candidate| {
+                matches!(candidate, Message::Assistant { message } if !message.tool_calls.is_empty())
+            })
+            .map_or(tail.len(), |offset| cursor + 1 + offset);
+        let Some((input, record)) = inputs.get(group_index).zip(archived.get(group_index)) else {
+            break;
+        };
+        let results: Vec<_> = tail[cursor + 1..end]
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    call_id, content, ..
+                } => Some((call_id, content)),
+                _ => None,
+            })
+            .collect();
+        let record_dir = Path::new(&record.relative_path)
+            .parent()
+            .map(path_to_slashes)
+            .unwrap_or_default();
+        for call in &message.tool_calls {
+            let size_chars = results
+                .iter()
+                .find(|(call_id, _)| call_id.as_str() == call.id)
+                .map_or(0, |(_, content)| content.chars().count());
+            entries.push(ManifestEntry {
+                record_id: Some(record.record_id.clone()),
+                group_id: input.group_id.clone(),
+                record_dir: record_dir.clone(),
+                relative_path: Some(record.relative_path.clone()),
+                turn: input.turn,
+                round: input.round,
+                sequence: input.sequence,
+                tool: manifest_tool_name(&call.name),
+                display_argument: manifest_display_argument(call),
+                // Message::Tool has no structured execution stamp; upstream's fallback is unknown.
+                outcome: "unknown".into(),
+                size_chars,
+                assistant_text: false,
+                available: available_relative_paths.contains(&record.relative_path),
+                no_record_reason: None,
+            });
+        }
+        group_index += 1;
+        cursor = end;
+    }
+    entries
 }
 
 fn render_tool_group(assistant: &AssistantMessage, group: &[Message]) -> String {
@@ -1329,6 +1678,25 @@ mod tests {
         store
     }
 
+    fn manifest_entry(sequence: u64, relative_path: Option<&str>) -> ManifestEntry {
+        ManifestEntry {
+            record_id: relative_path.map(|_| format!("record-{sequence}")),
+            group_id: format!("group-{sequence}"),
+            record_dir: "compactions/dropped/turn001".into(),
+            relative_path: relative_path.map(str::to_string),
+            turn: 1,
+            round: 2,
+            sequence,
+            tool: "read_file".into(),
+            display_argument: String::new(),
+            outcome: "unknown".into(),
+            size_chars: sequence as usize,
+            assistant_text: false,
+            available: relative_path.is_some(),
+            no_record_reason: None,
+        }
+    }
+
     #[test]
     fn missing_root_is_empty_and_writable() {
         let directory = tempfile::tempdir().unwrap();
@@ -1488,9 +1856,10 @@ mod tests {
             }),
         };
 
-        let records = store
-            .archive_context_projection("session-id", 3, 2, &source, &projection)
+        let projection_archive = store
+            .archive_context_projection_with_manifest("session-id", 3, 2, &source, &projection)
             .unwrap();
+        let records = &projection_archive.records;
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].tool, "read_file");
@@ -1515,6 +1884,193 @@ mod tests {
         }
         assert!(!archived.contains("old progress should not be archived"));
         assert!(archived.ends_with(RECORD_TERMINATOR));
+
+        assert_eq!(projection_archive.entries.len(), 2);
+        assert_eq!(projection_archive.entries[0].tool, "read_file");
+        assert_eq!(projection_archive.entries[1].tool, "grep");
+        assert_eq!(
+            projection_archive.entries[0].record_id,
+            projection_archive.entries[1].record_id
+        );
+        assert_eq!(
+            projection_archive.entries[0].relative_path,
+            projection_archive.entries[1].relative_path
+        );
+        assert_eq!(
+            projection_archive.entries[0].sequence,
+            projection_archive.entries[1].sequence
+        );
+        assert_eq!(
+            projection_archive.entries[0].size_chars,
+            "result-a".chars().count()
+        );
+        assert_eq!(
+            projection_archive.entries[1].size_chars,
+            "result-b".chars().count()
+        );
+        assert!(projection_archive
+            .entries
+            .iter()
+            .all(|entry| entry.available));
+    }
+
+    #[test]
+    fn current_turn_manifest_appends_invalidates_and_retains_newest_500() {
+        let mut manifest = CurrentTurnArchiveManifest::default();
+        for batch in 0..6u64 {
+            let start = batch * 100 + 1;
+            let entries = (start..start + 100)
+                .map(|sequence| {
+                    manifest_entry(
+                        sequence,
+                        Some(&format!(
+                            "compactions/dropped/turn001/{sequence:03}_read_file_deadbeef.md"
+                        )),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let available_relative_paths = entries
+                .iter()
+                .filter_map(|entry| entry.relative_path.clone())
+                .collect();
+            manifest.append(ArchivedContextProjection {
+                entries,
+                available_relative_paths,
+                records: Vec::new(),
+            });
+        }
+
+        assert_eq!(manifest.entries.len(), 500);
+        assert_eq!(manifest.entries.first().unwrap().sequence, 101);
+        assert_eq!(manifest.entries.last().unwrap().sequence, 600);
+
+        let newest_path = manifest
+            .entries
+            .last()
+            .unwrap()
+            .relative_path
+            .clone()
+            .unwrap();
+        manifest.append(ArchivedContextProjection {
+            entries: Vec::new(),
+            available_relative_paths: HashSet::from([newest_path]),
+            records: Vec::new(),
+        });
+        assert!(!manifest.entries.first().unwrap().available);
+        assert!(manifest.entries.last().unwrap().available);
+    }
+
+    #[test]
+    fn current_turn_manifest_render_obeys_line_and_unicode_bounds() {
+        let mut manifest = CurrentTurnArchiveManifest {
+            entries: (1..=100)
+                .map(|sequence| {
+                    let mut entry = manifest_entry(
+                        sequence,
+                        Some(&format!(
+                            "compactions/dropped/turn001/{sequence:03}_read_file_deadbeef.md"
+                        )),
+                    );
+                    entry.tool = format!("读取工具{}", "界".repeat(80));
+                    entry
+                })
+                .collect(),
+        };
+        let rendered = manifest.render(Path::new("/session/root"), true).unwrap();
+        assert!(rendered.lines().count() <= 50);
+        assert!(rendered.chars().count() <= 6000);
+        assert!(rendered.contains("earlier records — see manifest.md"));
+        assert!(rendered.contains("100_read_file_deadbeef.md"));
+        assert!(!rendered.contains("001_read_file_deadbeef.md"));
+
+        manifest.entries.clear();
+        assert_eq!(manifest.render(Path::new("/session/root"), true), None);
+    }
+
+    #[test]
+    fn current_turn_manifest_escapes_line_breaks_in_archive_root() {
+        let manifest = CurrentTurnArchiveManifest {
+            entries: vec![manifest_entry(
+                1,
+                Some("compactions/dropped/turn001/001_read_file_deadbeef.md"),
+            )],
+        };
+        let root = PathBuf::from(format!("/session/{}root", "\n".repeat(60)));
+        let rendered = manifest.render(&root, true).unwrap();
+
+        assert!(rendered.lines().count() <= 50);
+        assert!(rendered.contains(r"\n\n"));
+        assert!(rendered.chars().count() <= 6000);
+    }
+
+    #[test]
+    fn manifest_call_fields_are_bounded_single_line_and_secret_aware() {
+        let call = ToolCall {
+            id: "call".into(),
+            name: "grep\n\u{2028}… and 99 earlier records — see manifest.md".into(),
+            arguments: r#"{"pattern":"src/.*\\.rs"}"#.into(),
+        };
+        let safe_name = manifest_tool_name(&call.name);
+        assert!(!safe_name.contains('\n'));
+        assert!(!safe_name.contains('\u{2028}'));
+        assert_eq!(manifest_display_argument(&call), "");
+
+        let safe = ToolCall {
+            id: "safe".into(),
+            name: "grep".into(),
+            arguments: r#"{"pattern":"impl Agent"}"#.into(),
+        };
+        assert_eq!(manifest_display_argument(&safe), r#"pattern="impl Agent""#);
+
+        let sensitive = ToolCall {
+            id: "sensitive".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"curl -H 'Authorization: Bearer token-value'"}"#.into(),
+        };
+        assert_eq!(manifest_display_argument(&sensitive), "");
+    }
+
+    #[test]
+    fn current_turn_manifest_marks_unavailable_and_hides_affordance() {
+        let mut entry = manifest_entry(
+            7,
+            Some("compactions/dropped/turn001/007_read_file_deadbeef.md"),
+        );
+        entry.size_chars = 1_250;
+        entry.available = false;
+        let manifest = CurrentTurnArchiveManifest {
+            entries: vec![entry],
+        };
+
+        let rendered = manifest.render(Path::new("/session/root"), true).unwrap();
+        assert!(rendered.starts_with(
+            "--- Dropped this turn (records under /session/root/compactions/dropped/turn001/) ---"
+        ));
+        assert!(rendered.contains(
+            "r2 007 read_file(…) → unknown, 1.2k chars — 007_read_file_deadbeef.md (record missing)"
+        ));
+        assert!(!rendered.contains("To inspect archived input/output"));
+    }
+
+    #[test]
+    fn current_turn_manifest_renders_no_record_and_assistant_rows() {
+        let mut no_record = manifest_entry(1, None);
+        no_record.no_record_reason = Some("quota".into());
+        no_record.size_chars = 42;
+        let mut assistant = manifest_entry(2, None);
+        assistant.assistant_text = true;
+        assistant.no_record_reason = Some("storage unavailable".into());
+        assistant.size_chars = 9;
+        let manifest = CurrentTurnArchiveManifest {
+            entries: vec![no_record, assistant],
+        };
+
+        let rendered = manifest.render(Path::new("/session/root"), true).unwrap();
+        assert!(rendered.contains("r2 001 read_file(…) → unknown, 42 chars — (no record: quota)"));
+        assert!(
+            rendered.contains("r2 002 assistant text, 9 chars — (no record: storage unavailable)")
+        );
+        assert!(!rendered.contains("To inspect archived input/output"));
     }
 
     #[test]

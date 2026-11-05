@@ -20,7 +20,7 @@
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
 | 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；请求时 Phase 3 以原子折叠批次持久化，轮次后 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部；Phase 4 用单条 `ContextProjection` 同时保存历史折叠与经严格边界校验的当前轮次 Last Words 替换，TUI 以 FIFO 屏障保证同轮消息先落盘；每个平铺的 `<id>.jsonl` 旁保留稳定的 `<id>/` 归档根，resume 时在不改写 JSONL 的前提下 reconciliation；TUI 取消后若暂时无法重载权威会话历史，会阻止新的模型轮次，直到重载成功或切换会话 | `src/session.rs`、`src/compaction.rs`、`src/tui/app.rs` |
-| Phase 4 归档 | 已实现上游目录/文件名约束、2 MiB 单记录与 64 MiB 单轮上限、256 MiB 会话配额与最旧记录淘汰、owner-only exclusive 写入、append-only `catalog.jsonl`/tombstone、可重建 `manifest.md`、严格 UTF-8 中段截断，以及 path/symlink/junction containment。当前轮次投影会把每个 assistant/tool 组完整未脱敏地序列化（并行调用共用一条记录，保留 assistant 文本、reasoning、provider-native items、完整参数和结果），Run/TUI 在同一 session append/FIFO 屏障内先归档再提交 `ContextProjection`；归档 I/O、限额或安全校验失败时拒绝投影并保留原始工具历史。每个逻辑轮次开始时还会冻结此前 live 记录数量，并在 `read_file` 可用时把经过安全校验的绝对 `catalog.jsonl` 路径注入该轮所有 Chat/Responses 请求；同轮新增归档不会改变该指针 | `src/compaction_archive.rs`、`src/session.rs`、`src/model/client.rs`、`src/run.rs`、`src/tui/app.rs` |
+| Phase 4 归档 | 已实现上游目录/文件名约束、2 MiB 单记录与 64 MiB 单轮上限、256 MiB 会话配额与最旧记录淘汰、owner-only exclusive 写入、append-only `catalog.jsonl`/tombstone、可重建 `manifest.md`、严格 UTF-8 中段截断，以及 path/symlink/junction containment。当前轮次投影会把每个 assistant/tool 组完整未脱敏地序列化（并行调用共用一条记录，保留 assistant 文本、reasoning、provider-native items、完整参数和结果），Run/TUI 在同一 session append/FIFO 屏障内先归档再提交 `ContextProjection`；归档 I/O、限额或安全校验失败时拒绝投影并保留原始工具历史。成功归档的同轮记录会累积为 Last Words manifest（状态保留最新 500 行、请求渲染不超过 50 行/6000 字符，配额淘汰后标记 missing），进入紧随其后的 Chat/Responses 主请求及后续同轮 Last Words side-call；新用户轮次会清空该 manifest。每个逻辑轮次开始时还会冻结此前 live 记录数量，并在 `read_file` 可用时把经过安全校验的绝对 `catalog.jsonl` 路径注入该轮所有 Chat/Responses 请求；同轮新增归档不会改变该指针 | `src/compaction_archive.rs`、`src/session.rs`、`src/model/client.rs`、`src/run.rs`、`src/tui/app.rs` |
 | 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
@@ -34,7 +34,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 压缩记录检索与其余 Phase 4 接线。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。被投影替换的 assistant/tool 组已经按上游格式完整未脱敏归档（并行调用共用记录），Run/TUI 在 FIFO/session append 屏障内先写 record/catalog/manifest 再提交投影，任何归档拒绝或错误都会保留 raw JSONL。此前轮次的 live catalog 数量和经过校验的绝对路径会在逻辑轮次开始时冻结，并在 `read_file` 可用时注入该轮所有请求。尚需把有界、可跨多次 Phase 4 累积的当轮 manifest 注入 Last Words，并实现压缩记录检索。side-call 累计配额与完整持久化 breaker 也尚未移植；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。
+1. 压缩记录检索与其余 Phase 4 接线。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。被投影替换的 assistant/tool 组已经按上游格式完整未脱敏归档（并行调用共用记录），Run/TUI 在 FIFO/session append 屏障内先写 record/catalog/manifest 再提交投影，任何归档拒绝或错误都会保留 raw JSONL。成功提交的同轮归档 rows 会跨多次 Phase 4 累积为有界 Last Words manifest，紧随当前提交的主请求会得到新 rows，后续 side-call 也能保留此前 rows；新用户轮次清空状态。此前轮次的 live catalog 数量和经过校验的绝对路径会在逻辑轮次开始时冻结，并在 `read_file` 可用时注入该轮所有请求。尚需实现压缩记录检索。side-call 累计配额与完整持久化 breaker 也尚未移植；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 
