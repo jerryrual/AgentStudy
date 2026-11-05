@@ -35,6 +35,7 @@ struct RunSink {
     recorded: Mutex<RecordedSession>,
     wrote_text: AtomicBool,
     save_failed: AtomicBool,
+    archive_pointer: Mutex<Option<String>>,
 }
 
 struct RecordedSession {
@@ -53,6 +54,28 @@ impl RunSink {
 }
 
 impl EventSink for RunSink {
+    fn turn_started(&self) {
+        let pointer = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session
+            .archive_catalog_pointer()
+            .ok()
+            .flatten();
+        *self
+            .archive_pointer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pointer;
+    }
+
+    fn archive_pointer(&self) -> Option<String> {
+        self.archive_pointer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
         if self.has_unsaved_messages() {
             return Ok(false);
@@ -197,6 +220,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         }),
         wrote_text: AtomicBool::new(false),
         save_failed: AtomicBool::new(false),
+        archive_pointer: Mutex::new(None),
     };
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
@@ -343,6 +367,7 @@ mod tests {
             }),
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
         };
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
@@ -369,6 +394,7 @@ mod tests {
             }),
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
@@ -438,6 +464,33 @@ mod tests {
                 "missing archive detail: {expected}"
             );
         }
+        sink.turn_started();
+        let frozen = sink.archive_pointer().unwrap();
+        assert!(frozen.contains("archived 1 record from previous turns"));
+        crate::compaction_archive::ArchiveStore::with_root(session.archive_root())
+            .archive_round(&[crate::compaction_archive::ArchiveRecord {
+                turn: 2,
+                round: 1,
+                sequence: 1,
+                tool: "grep".into(),
+                created_at: "2026-01-02T03:04:05Z".into(),
+                kind: "group".into(),
+                group_id: "later".into(),
+                session_id: session.id().into(),
+                markdown: "later record".into(),
+            }])
+            .unwrap();
+        assert_eq!(sink.archive_pointer().as_deref(), Some(frozen.as_str()));
+        assert!(session
+            .archive_catalog_pointer()
+            .unwrap()
+            .unwrap()
+            .contains("archived 2 records from previous turns"));
+        sink.turn_started();
+        assert!(sink
+            .archive_pointer()
+            .unwrap()
+            .contains("archived 2 records from previous turns"));
     }
 
     #[test]
@@ -454,6 +507,7 @@ mod tests {
             }),
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
         };
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -506,6 +560,7 @@ mod tests {
             }),
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
         };
 
         assert!(sink

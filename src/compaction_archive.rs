@@ -219,6 +219,38 @@ impl ArchiveStore {
         })
     }
 
+    /// Return the model-facing pointer to the current live archive catalog.
+    ///
+    /// Callers snapshot this once at a logical turn boundary so records
+    /// archived later in that turn do not change the reminder. The catalog
+    /// itself remains the session's append-only live index, matching upstream.
+    pub fn catalog_pointer_text(&self) -> Result<Option<String>> {
+        let _guard = self
+            .catalog_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self.reconcile_unlocked()?;
+        if !state.writable || state.live_records.is_empty() || !self.catalog_path_is_safe()? {
+            return Ok(None);
+        }
+        let catalog = self.root.join(CATALOG_RELATIVE_PATH);
+        let metadata = std::fs::symlink_metadata(&catalog)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        let resolved_root = self.root.canonicalize()?;
+        let resolved_catalog = catalog.canonicalize()?;
+        if !resolved_catalog.starts_with(&resolved_root) {
+            return Ok(None);
+        }
+        let path = absolute_posix_path(&resolved_catalog);
+        let count = state.live_records.len();
+        let label = if count == 1 { "record" } else { "records" };
+        Ok(Some(format!(
+            "Earlier context compaction archived {count} {label} from previous turns; catalog: {path} (contains each record's relative path)."
+        )))
+    }
+
     /// Serialize and archive every raw current-turn tool group replaced by a projection.
     pub fn archive_context_projection(
         &self,
@@ -1080,6 +1112,28 @@ fn civil_from_days(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+#[cfg(unix)]
+fn absolute_posix_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
+fn absolute_posix_path(path: &Path) -> String {
+    let rendered = path.to_string_lossy().replace('\\', "/");
+    if let Some(unc) = rendered.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
+    rendered
+        .strip_prefix("//?/")
+        .unwrap_or(&rendered)
+        .to_string()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn absolute_posix_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn path_to_slashes(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -1283,6 +1337,74 @@ mod tests {
         assert!(state.writable);
         assert!(state.live_records.is_empty());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn catalog_pointer_names_the_validated_absolute_live_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let store = ArchiveStore::with_root(&root);
+        assert_eq!(store.catalog_pointer_text().unwrap(), None);
+
+        store
+            .archive_round(&[record(1, 1, 1, "read_file", "one")])
+            .unwrap();
+        let catalog = root.join(CATALOG_RELATIVE_PATH).canonicalize().unwrap();
+        assert_eq!(
+            store.catalog_pointer_text().unwrap().unwrap(),
+            format!(
+                "Earlier context compaction archived 1 record from previous turns; catalog: {} (contains each record's relative path).",
+                absolute_posix_path(&catalog)
+            )
+        );
+
+        store
+            .archive_round(&[record(2, 1, 1, "grep", "two")])
+            .unwrap();
+        assert!(store
+            .catalog_pointer_text()
+            .unwrap()
+            .unwrap()
+            .contains("archived 2 records from previous turns"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_pointer_preserves_unix_backslashes_and_reads_the_same_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session\\with-backslash");
+        let store = ArchiveStore::with_root(&root);
+        store
+            .archive_round(&[record(1, 1, 1, "read_file", "one")])
+            .unwrap();
+        let pointer = store.catalog_pointer_text().unwrap().unwrap();
+        let rendered = pointer
+            .strip_prefix(
+                "Earlier context compaction archived 1 record from previous turns; catalog: ",
+            )
+            .unwrap()
+            .strip_suffix(" (contains each record's relative path).")
+            .unwrap();
+        let catalog = root.join(CATALOG_RELATIVE_PATH).canonicalize().unwrap();
+
+        assert_eq!(rendered, catalog.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(rendered).unwrap(),
+            std::fs::read_to_string(catalog).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_posix_path_preserves_windows_drive_and_unc_roots() {
+        assert_eq!(
+            absolute_posix_path(Path::new(r"\\?\C:\sessions\catalog.jsonl")),
+            "C:/sessions/catalog.jsonl"
+        );
+        assert_eq!(
+            absolute_posix_path(Path::new(r"\\?\UNC\server\share\sessions\catalog.jsonl")),
+            "//server/share/sessions/catalog.jsonl"
+        );
     }
 
     #[test]
@@ -1767,7 +1889,25 @@ mod tests {
             .archive_round(&[record(1, 1, 1, "bash", "secret")])
             .unwrap();
         assert_eq!(writes[0].no_record_reason, Some("storage unavailable"));
+        assert_eq!(store.catalog_pointer_text().unwrap(), None);
         assert!(outside.join("keep.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_catalog_file_has_no_model_pointer() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let dropped = root.join("compactions/dropped");
+        std::fs::create_dir_all(&dropped).unwrap();
+        let outside = directory.path().join("outside-catalog.jsonl");
+        std::fs::write(&outside, "{}\n").unwrap();
+        symlink(&outside, root.join(CATALOG_RELATIVE_PATH)).unwrap();
+
+        let store = ArchiveStore::with_root(&root);
+        assert_eq!(store.catalog_pointer_text().unwrap(), None);
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "{}\n");
     }
 
     #[cfg(unix)]

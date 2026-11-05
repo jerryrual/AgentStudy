@@ -107,6 +107,10 @@ impl Session {
         &self.archive_root
     }
 
+    pub(crate) fn archive_catalog_pointer(&self) -> Result<Option<String>> {
+        ArchiveStore::with_root(&self.archive_root).catalog_pointer_text()
+    }
+
     /// Append one record, flushing immediately.
     pub fn append(&self, record: &Record) -> Result<()> {
         let _guard = self
