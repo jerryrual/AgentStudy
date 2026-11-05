@@ -968,26 +968,34 @@ fn replace_path(temporary: &Path, destination: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn replace_path(temporary: &Path, destination: &Path) -> std::io::Result<()> {
-    let backup = destination.with_extension("bak");
-    let _ = std::fs::remove_file(&backup);
-    let had_destination = match std::fs::rename(destination, &backup) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Both paths are validated session-owned siblings; this performs one
+    // replace-existing transition and asks Windows to flush it before return.
+    let replaced = unsafe {
+        MoveFileExW(
+            temporary.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
     };
-    match std::fs::rename(temporary, destination) {
-        Ok(()) => {
-            if had_destination {
-                let _ = std::fs::remove_file(backup);
-            }
-            Ok(())
-        }
-        Err(error) => {
-            if had_destination {
-                let _ = std::fs::rename(backup, destination);
-            }
-            Err(error)
-        }
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
