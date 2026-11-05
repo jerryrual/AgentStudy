@@ -125,9 +125,27 @@ impl ModelClient {
 
     /// Build the provider-specific request and apply its context output cap.
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
+        let context_budget =
+            self.context_window
+                .zip(self.max_tokens)
+                .and_then(|(context_window, max_tokens)| {
+                    crate::context_budget::ContextBudget::derive(context_window, max_tokens)
+                });
+        let prepared_messages = match context_budget {
+            Some(budget) => {
+                crate::context_trim::trim_previous_tool_results(
+                    messages,
+                    budget.trigger_tokens,
+                    budget.target_tokens,
+                    |candidate| self.estimated_request_tokens(candidate, tools),
+                )
+                .messages
+            }
+            None => messages.to_vec(),
+        };
         let mut body = if self.api_style == ApiStyle::Responses {
             super::responses::request_body(
-                messages,
+                &prepared_messages,
                 tools,
                 &self.model,
                 self.stream,
@@ -136,7 +154,7 @@ impl ModelClient {
                 self.include_encrypted_reasoning,
             )
         } else {
-            let api_messages: Vec<Value> = messages.iter().map(Message::to_api).collect();
+            let api_messages: Vec<Value> = prepared_messages.iter().map(Message::to_api).collect();
             let mut body = json!({
                 "model": self.model,
                 "messages": api_messages,
@@ -157,7 +175,7 @@ impl ModelClient {
             }
             body
         };
-        let estimated_input = self.estimated_request_tokens(messages, tools);
+        let estimated_input = self.estimated_request_tokens(&prepared_messages, tools);
         self.apply_context_budget(&mut body, estimated_input)?;
         Ok(body)
     }
@@ -604,6 +622,177 @@ mod tests {
         profile.context_window = Some(2_000);
         profile.max_tokens = Some(500);
         ModelClient::from_profile(&profile).unwrap()
+    }
+
+    fn tool_call_message(id: &str, name: &str) -> Message {
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            }],
+            ..AssistantMessage::default()
+        })
+    }
+
+    fn projection_messages() -> Vec<Message> {
+        vec![
+            Message::user("old turn"),
+            tool_call_message("call_old", "old_tool"),
+            Message::tool("call_old", "old_tool", "OLD_TOOL_RESULT".repeat(300)),
+            Message::assistant(AssistantMessage::text("old turn complete")),
+            Message::user("current turn"),
+            tool_call_message("call_current", "current_tool"),
+            Message::tool(
+                "call_current",
+                "current_tool",
+                "CURRENT_TOOL_RESULT_MUST_STAY_EXACT",
+            ),
+        ]
+    }
+
+    #[test]
+    fn request_projection_trims_old_tools_for_chat_without_mutating_history() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = projection_messages();
+        let original = messages.clone();
+
+        let first = client.request_body(&messages, &[]).unwrap();
+        let second = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(messages, original);
+        let wire = first["messages"].as_array().unwrap();
+        let old_result = wire
+            .iter()
+            .find(|item| item["tool_call_id"] == "call_old")
+            .unwrap();
+        assert!(old_result["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Tool call: "));
+        let current_result = wire
+            .iter()
+            .find(|item| item["tool_call_id"] == "call_current")
+            .unwrap();
+        assert_eq!(
+            current_result["content"],
+            "CURRENT_TOOL_RESULT_MUST_STAY_EXACT"
+        );
+
+        let call_ids: Vec<&str> = wire
+            .iter()
+            .filter_map(|item| item.get("tool_calls"))
+            .flat_map(|calls| calls.as_array().unwrap())
+            .filter_map(|call| call["id"].as_str())
+            .collect();
+        let result_ids: Vec<&str> = wire
+            .iter()
+            .filter_map(|item| item["tool_call_id"].as_str())
+            .collect();
+        assert_eq!(call_ids, result_ids);
+    }
+
+    #[test]
+    fn request_projection_trims_old_tools_for_responses_and_keeps_pairs() {
+        let client = budget_client(ApiStyle::Responses);
+        let messages = projection_messages();
+        let original = messages.clone();
+
+        let first = client.request_body(&messages, &[]).unwrap();
+        let second = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(messages, original);
+        let wire = first["input"].as_array().unwrap();
+        let old_result = wire
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_old")
+            .unwrap();
+        assert!(old_result["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Tool call: "));
+        let current_result = wire
+            .iter()
+            .find(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "call_current"
+            })
+            .unwrap();
+        assert_eq!(
+            current_result["output"],
+            "CURRENT_TOOL_RESULT_MUST_STAY_EXACT"
+        );
+
+        let call_ids: Vec<&str> = wire
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["call_id"].as_str())
+            .collect();
+        let result_ids: Vec<&str> = wire
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| item["call_id"].as_str())
+            .collect();
+        assert_eq!(call_ids, result_ids);
+    }
+
+    #[test]
+    fn responses_projection_preserves_native_function_call_items() {
+        let client = budget_client(ApiStyle::Responses);
+        let messages = vec![
+            Message::user("old turn"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_old".to_string(),
+                    name: "old_tool".to_string(),
+                    arguments: r#"{"path":"large.txt"}"#.to_string(),
+                }],
+                responses_items: vec![json!({
+                    "type": "function_call",
+                    "call_id": "call_old",
+                    "name": "old_tool",
+                    "arguments": r#"{"path":"large.txt"}"#,
+                })],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("call_old", "old_tool", "OLD_TOOL_RESULT".repeat(300)),
+            Message::user("current turn"),
+        ];
+
+        let body = client.request_body(&messages, &[]).unwrap();
+        let wire = body["input"].as_array().unwrap();
+        assert!(wire
+            .iter()
+            .any(|item| { item["type"] == "function_call" && item["call_id"] == "call_old" }));
+        let output = wire
+            .iter()
+            .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_old")
+            .unwrap();
+        assert!(output["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("[Tool call: old_tool(path=\"large.txt\") → "));
+    }
+
+    #[test]
+    fn request_projection_is_disabled_without_context_window() {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        profile.context_window = None;
+        profile.max_tokens = Some(500);
+        let client = ModelClient::from_profile(&profile).unwrap();
+        let messages = projection_messages();
+
+        let body = client.request_body(&messages, &[]).unwrap();
+        let old_result = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["tool_call_id"] == "call_old")
+            .unwrap();
+        assert_eq!(old_result["content"], "OLD_TOOL_RESULT".repeat(300));
     }
 
     #[test]
