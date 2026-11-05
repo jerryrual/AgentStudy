@@ -77,6 +77,23 @@ impl ModelClient {
         &self.endpoint
     }
 
+    /// Whether one completed model call crossed the persisted-fold threshold.
+    pub(crate) fn should_force_compression(&self, usage: Usage) -> bool {
+        if usage.prompt_tokens == 0 {
+            return false;
+        }
+        let Some(budget) =
+            self.context_window
+                .zip(self.max_tokens)
+                .and_then(|(context_window, max_tokens)| {
+                    crate::context_budget::ContextBudget::derive(context_window, max_tokens)
+                })
+        else {
+            return false;
+        };
+        usage.prompt_tokens > u64::from(budget.force_tokens)
+    }
+
     /// Check whether messages leave a valid output allowance without sending them.
     pub(crate) fn validate_request_context(
         &self,
@@ -646,6 +663,29 @@ mod tests {
         profile.context_window = Some(2_000);
         profile.max_tokens = Some(500);
         ModelClient::from_profile(&profile).unwrap()
+    }
+
+    #[test]
+    fn forced_compression_uses_strict_prompt_threshold_and_known_usage() {
+        let mut client = budget_client(ApiStyle::Chat);
+        let force_tokens = crate::context_budget::ContextBudget::derive(2_000, 500)
+            .unwrap()
+            .force_tokens;
+        let usage = |prompt_tokens| Usage {
+            prompt_tokens,
+            completion_tokens: 1,
+            total_tokens: prompt_tokens.saturating_add(1),
+        };
+
+        assert!(!client.should_force_compression(usage(0)));
+        assert!(!client.should_force_compression(usage(u64::from(force_tokens))));
+        assert!(client.should_force_compression(usage(u64::from(force_tokens) + 1)));
+
+        client.context_window = None;
+        assert!(!client.should_force_compression(usage(u64::MAX)));
+        client.context_window = Some(2_000);
+        client.max_tokens = None;
+        assert!(!client.should_force_compression(usage(u64::MAX)));
     }
 
     fn phase1_client(api_style: ApiStyle) -> ModelClient {

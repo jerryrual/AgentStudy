@@ -33,6 +33,7 @@ struct RunSink {
     json: bool,
     recorded: Mutex<RecordedSession>,
     wrote_text: AtomicBool,
+    save_failed: AtomicBool,
 }
 
 struct RecordedSession {
@@ -43,6 +44,10 @@ struct RecordedSession {
 impl RunSink {
     fn text_written(&self) -> bool {
         self.wrote_text.load(Ordering::Relaxed)
+    }
+
+    fn has_unsaved_messages(&self) -> bool {
+        self.save_failed.load(Ordering::Relaxed)
     }
 }
 
@@ -80,6 +85,7 @@ impl EventSink for RunSink {
         if let Ok(mut recorded) = self.recorded.lock() {
             let RecordedSession { session, buffer } = &mut *recorded;
             if let Err(error) = buffer.record(session, message) {
+                self.save_failed.store(true, Ordering::Relaxed);
                 eprintln!("warning: failed to save session: {error:#}");
             }
         }
@@ -154,6 +160,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             buffer: RecordBuffer::default(),
         }),
         wrote_text: AtomicBool::new(false),
+        save_failed: AtomicBool::new(false),
     };
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
@@ -167,9 +174,30 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             std::process::exit(130);
         }
     };
+    drop(run);
 
     match result {
         Ok(turn) => {
+            if !sink.has_unsaved_messages() && agent.should_force_compression(&turn) {
+                if let Some(plan) = crate::compaction::plan_forced_compression(&messages) {
+                    let checkpoint = Record::Compaction {
+                        summary: plan.summary.clone(),
+                        compacted_messages: Some(plan.compacted_messages),
+                    };
+                    match session.append(&checkpoint) {
+                        Ok(()) => {
+                            let mut recorded = sink
+                                .recorded
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            recorded.buffer.reset();
+                        }
+                        Err(error) => {
+                            eprintln!("warning: failed to save automatic compaction: {error:#}");
+                        }
+                    }
+                }
+            }
             if options.json {
                 let payload = json!({
                     "ok": true,
@@ -259,4 +287,32 @@ fn truncate(text: &str, limit: usize) -> String {
     let mut result: String = text.chars().take(limit.saturating_sub(1)).collect();
     result.push('…');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_sink_tracks_unsaved_messages_for_compaction_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        std::fs::remove_dir_all(directory.path()).unwrap();
+        let sink = RunSink {
+            json: true,
+            recorded: Mutex::new(RecordedSession {
+                session,
+                buffer: RecordBuffer::default(),
+            }),
+            wrote_text: AtomicBool::new(false),
+            save_failed: AtomicBool::new(false),
+        };
+
+        sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
+            "answer",
+        )));
+
+        assert!(sink.has_unsaved_messages());
+    }
 }

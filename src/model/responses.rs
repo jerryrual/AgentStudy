@@ -20,7 +20,9 @@ pub(super) fn request_body(
     let mut input = Vec::new();
     for message in messages {
         match message {
-            Message::System { content } | Message::User { content } => input.push(json!({
+            Message::System { content }
+            | Message::User { content }
+            | Message::Summary { content } => input.push(json!({
                 "type": "message",
                 "role": if matches!(message, Message::System { .. }) { "system" } else { "user" },
                 "content": [{"type": "input_text", "text": content}],

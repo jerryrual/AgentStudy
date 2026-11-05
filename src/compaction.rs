@@ -20,6 +20,42 @@ pub struct Compaction {
     pub usage: Usage,
 }
 
+/// A deterministic replacement for one completed historical user turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForcedCompressionPlan {
+    range: std::ops::Range<usize>,
+    pub(crate) summary: String,
+    pub(crate) compacted_messages: usize,
+}
+
+impl ForcedCompressionPlan {
+    pub(crate) fn projected(&self, source: &[Message]) -> Vec<Message> {
+        let mut projected = source.to_vec();
+        projected.splice(self.range.clone(), [summary_message(self.summary.as_str())]);
+        projected
+    }
+}
+
+/// Plan a fold of the oldest completed turn after the latest summary boundary.
+pub(crate) fn plan_forced_compression(messages: &[Message]) -> Option<ForcedCompressionPlan> {
+    let boundary = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::Summary { .. }));
+    let mut user_starts = messages
+        .iter()
+        .enumerate()
+        .skip(boundary.map_or(0, |index| index + 1))
+        .filter_map(|(index, message)| matches!(message, Message::User { .. }).then_some(index));
+    let start = user_starts.next()?;
+    let end = user_starts.next()?;
+    let summary = crate::context_trim::automatic_turn_summary(&messages[start..end]);
+    Some(ForcedCompressionPlan {
+        range: start..end,
+        summary,
+        compacted_messages: end - start,
+    })
+}
+
 /// Generate a summary that can replace the current model conversation.
 pub async fn compact(client: &ModelClient, messages: &[Message]) -> Result<Compaction> {
     let transcript: Vec<_> = messages
@@ -113,7 +149,7 @@ fn next_char_boundary(text: &str, mut index: usize) -> usize {
 
 /// Build the single user message replayed after the conversation is compacted.
 pub fn summary_message(summary: &str) -> Message {
-    Message::user(format!("{SUMMARY_PREFIX}{}", summary.trim()))
+    Message::summary(format!("{SUMMARY_PREFIX}{}", summary.trim()))
 }
 
 struct QuietSink;
@@ -123,12 +159,112 @@ impl EventSink for QuietSink {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{AssistantMessage, ToolCall};
 
     #[test]
     fn summary_message_is_replayed_as_user_context() {
+        let summary = summary_message("  changed src/main.rs  ");
         assert_eq!(
-            summary_message("  changed src/main.rs  "),
-            Message::user("[Earlier conversation summary]\nchanged src/main.rs")
+            summary,
+            Message::summary("[Earlier conversation summary]\nchanged src/main.rs")
         );
+        assert_eq!(summary.to_api()["role"], "user");
+    }
+
+    #[test]
+    fn forced_plan_respects_latest_boundary_and_preserves_current_tail() {
+        let current_tail = vec![
+            Message::user("current turn"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let mut messages = vec![
+            Message::system("fixed"),
+            Message::user("before boundary"),
+            Message::assistant(AssistantMessage::text("already summarized")),
+            summary_message("prior work"),
+            Message::user("oldest eligible"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "z".into(),
+                        name: "zeta".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "a".into(),
+                        name: "alpha".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                responses_items: vec![serde_json::json!({
+                    "type": "function_call",
+                    "name": "alpha"
+                })],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("a", "alpha", "result"),
+        ];
+        messages.extend(current_tail.clone());
+
+        let plan = plan_forced_compression(&messages).unwrap();
+        assert_eq!(plan.summary, "User: oldest eligible; Tools: alpha, zeta");
+        assert_eq!(plan.compacted_messages, 3);
+        let projected = plan.projected(&messages);
+
+        assert_eq!(&projected[..4], &messages[..4]);
+        assert_eq!(projected[4], summary_message(&plan.summary));
+        assert_eq!(&projected[5..], current_tail.as_slice());
+    }
+
+    #[test]
+    fn forced_plans_stack_one_completed_turn_at_a_time() {
+        let messages = vec![
+            Message::system("fixed"),
+            Message::user("first"),
+            Message::assistant(AssistantMessage::text("first answer")),
+            Message::user("second"),
+            Message::assistant(AssistantMessage::text("second answer")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+
+        let first = plan_forced_compression(&messages)
+            .unwrap()
+            .projected(&messages);
+        assert_eq!(first[1], summary_message("User: first"));
+        let second = plan_forced_compression(&first).unwrap().projected(&first);
+        assert_eq!(
+            second,
+            vec![
+                Message::system("fixed"),
+                summary_message("User: first"),
+                summary_message("User: second"),
+                Message::user("current"),
+                Message::assistant(AssistantMessage::text("current answer")),
+            ]
+        );
+        assert!(plan_forced_compression(&second).is_none());
+    }
+
+    #[test]
+    fn forced_plan_requires_a_prior_turn_and_matches_prefix_exactly() {
+        assert!(plan_forced_compression(&[
+            Message::system("fixed"),
+            Message::user("only completed turn"),
+            Message::assistant(AssistantMessage::text("answer")),
+        ])
+        .is_none());
+
+        let prefixed_user = format!("{SUMMARY_PREFIX}literal user task");
+        let messages = vec![
+            Message::system("fixed"),
+            Message::user(prefixed_user.clone()),
+            Message::assistant(AssistantMessage::text("old answer")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let plan = plan_forced_compression(&messages).unwrap();
+        assert_eq!(plan.summary, format!("User: {prefixed_user}"));
+        assert_eq!(plan.compacted_messages, 2);
     }
 }

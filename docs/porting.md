@@ -11,7 +11,7 @@
 | 流式回答 | SSE 增量解析，逐 token 渲染 | `src/model/sse.rs`、`client.rs` |
 | Markdown 渲染 | 标题、列表、行内代码、粗体、链接、代码块 | `src/markdown.rs` |
 | 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥；可选 `context_window` 派生 token 预算并按估算剩余上下文下调请求输出上限 | `src/config.rs`、`src/model/` |
-| 上下文裁剪（Phase 1 / 2 / 3） | 请求输入跨过派生触发阈值后，在仅供该次请求使用的投影中，Phase 1 按从旧到新的顺序将已完成旧轮次的工具结果替换为确定性摘要；仅当仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍超过目标预算，Phase 3 才按从旧到新的顺序将已完成的历史轮次替换为确定性的压缩上下文摘要。当前轮次、JSONL 中的权威历史及 `/resume` 恢复历史、TUI 历史和手动 `/compact` 历史保持原样。这是 Rust 版请求投影语义，不表示与上游的持久化压缩行为完全一致 | `src/context_trim.rs`、`src/model/client.rs` |
+| 上下文裁剪（Phase 1 / 2 / 3 + 轮次后强制折叠） | 请求输入跨过派生触发阈值后，在仅供该次请求使用的投影中，Phase 1 按从旧到新的顺序将已完成旧轮次的工具结果替换为确定性摘要；仅当仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍超过目标预算，Phase 3 才按从旧到新的顺序将已完成的历史轮次替换为确定性的压缩上下文摘要。成功轮次结束后，若最终一次模型调用报告的输入 token 严格超过派生 force 阈值，则持久化折叠一个最旧的先前已完成轮次，同时保留刚完成轮次和所有较新历史；原始 JSONL 记录仍为追加式审计历史。这是 Rust 版渐进移植语义，不表示请求时投影已全部持久化 | `src/context_trim.rs`、`src/compaction.rs`、`src/model/client.rs` |
 | 工具调用 | 多轮工具循环；纯只读工具批次并行执行，结果按调用顺序回填；超长输出截断 | `src/agent/` |
 | 文件读写 | `read_file`、`write_file`、`edit_file`（精确匹配替换） | `src/tools/fs.rs` |
 | 代码搜索 | `grep`（正则）、`glob`、`list_dir`，遵循 .gitignore | `src/tools/search.rs` |
@@ -19,7 +19,7 @@
 | 审批 | ask / auto / deny，写操作与 Shell 需确认 | `src/interaction.rs` |
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
-| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化续写摘要 | `src/session.rs`、`src/compaction.rs` |
+| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；自动 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部 | `src/session.rs`、`src/compaction.rs` |
 | 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
@@ -33,7 +33,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 上游风格的自动持久化摘要压缩（包括轮次结束后的强制行为）和 Last Words；当前已实现 Phase 1 / 2 / 3 的 Rust 请求投影，但这不表示与上游的持久化压缩行为完全一致。持久化摘要压缩仍仅支持手动 `/compact`，其摘要输入超限时会优先保留最近内容。
+1. 请求时 Phase 3 的持久化折叠、上下文溢出后的压缩重试，以及 Last Words；当前 Phase 1 / 2 / 3 仍是仅供单次请求使用的投影。轮次结束后的 force 路径已能持久化折叠一个最旧的先前已完成轮次，但尚无上游的压缩块检索、当前轮次裁剪或 Last Words 状态。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 

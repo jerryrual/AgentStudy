@@ -743,6 +743,76 @@ mod tests {
     }
 
     #[test]
+    fn forced_compression_keeps_full_context_when_messages_are_unsaved() {
+        use crate::agent::TurnResult;
+        use crate::model::{AssistantMessage, Message};
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        let messages = vec![
+            Message::user("old request"),
+            Message::assistant(AssistantMessage::text("old answer")),
+            Message::user("current request"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        app.unsaved_messages = true;
+        app.running = true;
+        app.push_event(UiEvent::TurnFinished(
+            Ok(TurnResult::default()),
+            messages.clone(),
+            true,
+        ));
+
+        app.pump();
+
+        assert_eq!(app.messages, messages);
+        assert!(app.unsaved_messages);
+    }
+
+    #[test]
+    fn forced_compression_reloads_persisted_history_before_planning() {
+        use crate::agent::TurnResult;
+        use crate::compaction::plan_forced_compression;
+        use crate::model::{AssistantMessage, Message};
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        let persisted_messages = vec![
+            Message::user("old request"),
+            Message::assistant(AssistantMessage::text("persisted cancelled-turn output")),
+            Message::user("current request"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        for message in &persisted_messages {
+            app.session.append_message(message).unwrap();
+        }
+        let projected = plan_forced_compression(&persisted_messages)
+            .expect("forced compression plan")
+            .projected(&persisted_messages);
+        let stale_in_memory_messages = vec![
+            Message::user("old request"),
+            Message::user("current request"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let visible_items = app.view.len();
+        app.running = true;
+        app.push_event(UiEvent::TurnFinished(
+            Ok(TurnResult::default()),
+            stale_in_memory_messages,
+            true,
+        ));
+
+        app.pump();
+
+        assert_eq!(app.messages, projected);
+        assert_eq!(
+            app.store.load(app.session.id()).unwrap().messages(),
+            projected
+        );
+        assert_eq!(app.view.len(), visible_items);
+    }
+
+    #[test]
     fn completed_compaction_replaces_and_persists_model_context() {
         use crate::compaction::Compaction;
         use crate::model::{Message, Usage};
