@@ -28,6 +28,7 @@ pub struct ModelClient {
     model: String,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    context_window: Option<u32>,
     stream: bool,
     retry_base: Duration,
 }
@@ -61,6 +62,7 @@ impl ModelClient {
             model: profile.model.clone(),
             temperature: profile.temperature,
             max_tokens: profile.max_tokens,
+            context_window: profile.context_window,
             stream: profile.stream,
             retry_base,
         })
@@ -75,6 +77,15 @@ impl ModelClient {
         &self.endpoint
     }
 
+    /// Check whether messages leave a valid output allowance without sending them.
+    pub(crate) fn validate_request_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> Result<()> {
+        self.request_body(messages, tools).map(|_| ())
+    }
+
     /// Run one completion, streaming deltas through `sink`.
     ///
     /// Transient failures (HTTP 429/5xx and transport errors) are retried up to
@@ -86,7 +97,7 @@ impl ModelClient {
         tools: &[ToolDef],
         sink: &dyn EventSink,
     ) -> Result<Completion> {
-        let body = self.request_body(messages, tools);
+        let body = self.request_body(messages, tools)?;
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             match self.send_once(&body, sink).await {
@@ -112,9 +123,10 @@ impl ModelClient {
         Err(last_error.unwrap_or_else(|| anyhow!("model request failed")))
     }
 
-    fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Value {
-        if self.api_style == ApiStyle::Responses {
-            return super::responses::request_body(
+    /// Build the provider-specific request and apply its context output cap.
+    fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
+        let mut body = if self.api_style == ApiStyle::Responses {
+            super::responses::request_body(
                 messages,
                 tools,
                 &self.model,
@@ -122,28 +134,93 @@ impl ModelClient {
                 self.temperature,
                 self.max_tokens,
                 self.include_encrypted_reasoning,
+            )
+        } else {
+            let api_messages: Vec<Value> = messages.iter().map(Message::to_api).collect();
+            let mut body = json!({
+                "model": self.model,
+                "messages": api_messages,
+                "stream": self.stream,
+            });
+            if !tools.is_empty() {
+                body["tools"] = Value::Array(tools.iter().map(ToolDef::to_api).collect());
+                body["tool_choice"] = json!("auto");
+            }
+            if self.stream {
+                body["stream_options"] = json!({"include_usage": true});
+            }
+            if let Some(temperature) = self.temperature {
+                body["temperature"] = json!(temperature);
+            }
+            if let Some(max_tokens) = self.max_tokens {
+                body["max_tokens"] = json!(max_tokens);
+            }
+            body
+        };
+        let estimated_input = self.estimated_request_tokens(messages, tools);
+        self.apply_context_budget(&mut body, estimated_input)?;
+        Ok(body)
+    }
+
+    /// Conservatively estimate the semantic history and tools sent by this API style.
+    fn estimated_request_tokens(&self, messages: &[Message], tools: &[ToolDef]) -> u32 {
+        let semantic_messages: Vec<Value> = messages
+            .iter()
+            .map(|message| match message {
+                Message::Assistant { message }
+                    if self.api_style == ApiStyle::Responses
+                        && !message.responses_items.is_empty() =>
+                {
+                    json!({
+                        "role": "assistant",
+                        "responses_items": message.responses_items,
+                    })
+                }
+                _ => message.to_api(),
+            })
+            .collect();
+        let semantic_tools: Vec<Value> = tools.iter().map(ToolDef::to_api).collect();
+        crate::context_budget::estimate_json_tokens(&json!({
+            "messages": semantic_messages,
+            "tools": semantic_tools,
+        }))
+    }
+
+    /// Clamp the request output limit or reject a request with no valid output room.
+    fn apply_context_budget(&self, body: &mut Value, estimated_input: u32) -> Result<()> {
+        let (Some(context_window), Some(configured_output)) =
+            (self.context_window, self.max_tokens)
+        else {
+            return Ok(());
+        };
+        let output = crate::context_budget::clamp_output_tokens(
+            context_window,
+            configured_output,
+            estimated_input,
+        );
+        if output == 0 {
+            anyhow::bail!(
+                "estimated model input ({estimated_input} tokens) exhausts the configured context window ({context_window} tokens); compact the conversation or increase context_window"
             );
         }
-        let api_messages: Vec<Value> = messages.iter().map(Message::to_api).collect();
-        let mut body = json!({
-            "model": self.model,
-            "messages": api_messages,
-            "stream": self.stream,
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.iter().map(ToolDef::to_api).collect());
-            body["tool_choice"] = json!("auto");
+        let minimum_output = if self.api_style == ApiStyle::Responses {
+            16
+        } else {
+            1
+        };
+        if output < minimum_output {
+            anyhow::bail!(
+                "estimated model input leaves room for {output} output tokens, below the {} API minimum of {minimum_output}; compact the conversation or increase context_window",
+                self.api_style.as_str()
+            );
         }
-        if self.stream {
-            body["stream_options"] = json!({"include_usage": true});
-        }
-        if let Some(temperature) = self.temperature {
-            body["temperature"] = json!(temperature);
-        }
-        if let Some(max_tokens) = self.max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
-        body
+        let field = if self.api_style == ApiStyle::Responses {
+            "max_output_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[field] = json!(output);
+        Ok(())
     }
 
     async fn send_once(
@@ -518,6 +595,124 @@ mod tests {
 
     struct NullSink;
     impl EventSink for NullSink {}
+
+    fn budget_client(api_style: ApiStyle) -> ModelClient {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_style = api_style;
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        profile.context_window = Some(2_000);
+        profile.max_tokens = Some(500);
+        ModelClient::from_profile(&profile).unwrap()
+    }
+
+    #[test]
+    fn request_budget_counts_responses_native_history_once() {
+        let client = budget_client(ApiStyle::Responses);
+        let native_item = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "native"}],
+        });
+        let messages = vec![Message::assistant(AssistantMessage {
+            content: Some("duplicate chat text".repeat(100)),
+            responses_items: vec![native_item.clone()],
+            ..AssistantMessage::default()
+        })];
+        let expected = json!({
+            "messages": [{
+                "role": "assistant",
+                "responses_items": [native_item],
+            }],
+            "tools": [],
+        });
+
+        assert_eq!(
+            client.estimated_request_tokens(&messages, &[]),
+            crate::context_budget::estimate_json_tokens(&expected)
+        );
+    }
+
+    #[test]
+    fn request_budget_uses_chat_history_after_model_switch() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = vec![Message::assistant(AssistantMessage {
+            content: Some("actual chat content".repeat(100)),
+            responses_items: vec![json!({"type": "message", "content": "small"})],
+            ..AssistantMessage::default()
+        })];
+        let expected = json!({
+            "messages": [messages[0].to_api()],
+            "tools": [],
+        });
+
+        assert_eq!(
+            client.estimated_request_tokens(&messages, &[]),
+            crate::context_budget::estimate_json_tokens(&expected)
+        );
+    }
+
+    #[test]
+    fn request_budget_clamps_chat_and_responses_output() {
+        let messages = vec![Message::user("x".repeat(1_600))];
+        let mut caps = Vec::new();
+        for (style, field) in [
+            (ApiStyle::Chat, "max_tokens"),
+            (ApiStyle::Responses, "max_output_tokens"),
+        ] {
+            let body = budget_client(style).request_body(&messages, &[]).unwrap();
+            let cap = body[field].as_u64().unwrap();
+            assert!((16..500).contains(&cap), "{style:?}: {body}");
+            caps.push(cap);
+        }
+        assert_eq!(caps[0], caps[1]);
+    }
+
+    #[test]
+    fn request_budget_counts_tool_definitions() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = vec![Message::user("hello")];
+        let uncapped = client.request_body(&messages, &[]).unwrap();
+        let tool = ToolDef {
+            name: "large_tool".to_string(),
+            description: "x".repeat(1_600),
+            parameters: json!({"type": "object"}),
+        };
+        let capped = client.request_body(&messages, &[tool]).unwrap();
+
+        assert_eq!(uncapped["max_tokens"], 500);
+        assert!(capped["max_tokens"].as_u64().unwrap() < 500);
+    }
+
+    #[test]
+    fn request_budget_enforces_provider_output_minimums() {
+        let responses = budget_client(ApiStyle::Responses);
+        let mut body = json!({"max_output_tokens": 500});
+        responses.apply_context_budget(&mut body, 1_984).unwrap();
+        assert_eq!(body["max_output_tokens"], 16);
+
+        for estimated_input in [1_985, 1_999] {
+            let mut body = json!({"max_output_tokens": 500});
+            let error = responses
+                .apply_context_budget(&mut body, estimated_input)
+                .unwrap_err();
+            assert!(error.to_string().contains("minimum of 16"));
+        }
+
+        let chat = budget_client(ApiStyle::Chat);
+        let mut body = json!({"max_tokens": 500});
+        chat.apply_context_budget(&mut body, 1_999).unwrap();
+        assert_eq!(body["max_tokens"], 1);
+    }
+
+    #[test]
+    fn request_budget_rejects_exhausted_context_before_http() {
+        let messages = vec![Message::user("x".repeat(4_000))];
+        let error = budget_client(ApiStyle::Chat)
+            .request_body(&messages, &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("exhausts"));
+    }
 
     #[test]
     fn accumulator_merges_streamed_tool_calls() {

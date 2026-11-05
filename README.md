@@ -68,6 +68,7 @@ export ICODE_HOME="$HOME/.icode"
       "model": "deepseek-chat",
       "base_url": "https://api.deepseek.com",
       "api_key": "{{DEEPSEEK_API_KEY}}",
+      "context_window": 128000,
       "max_tokens": 8192,
       "temperature": 0.1,
       "stream": true
@@ -79,6 +80,13 @@ export ICODE_HOME="$HOME/.icode"
   "max_tool_rounds": 40
 }
 ```
+
+模型配置可选填 `context_window`，表示该模型的总上下文窗口（token）。与 `max_tokens` 同时
+设置后，每次请求都会以 UTF-8 字节数保守估算系统提示、对话历史和工具定义占用的 token，
+并将 `max_tokens`（Responses API 中为 `max_output_tokens`）下调到估算的剩余上下文以内；
+该限制不会调高配置的 `max_tokens`，Chat 与 Responses 对同一语义上下文使用相同估算。
+此预算与输出上限调整不会自动压缩或裁剪普通对话，自动触发压缩仍未实现。手动 `/compact`
+在摘要请求超出窗口时会丢弃最旧的摘要输入并保留最近内容，使已超限会话仍可恢复。
 
 API 密钥有三种写法：
 

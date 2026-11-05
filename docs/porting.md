@@ -10,7 +10,7 @@
 | 终端 TUI 对话 | ratatui 实现：对话区、输入框、状态栏、审批弹窗、帮助面板 | `src/tui/` |
 | 流式回答 | SSE 增量解析，逐 token 渲染 | `src/model/sse.rs`、`client.rs` |
 | Markdown 渲染 | 标题、列表、行内代码、粗体、链接、代码块 | `src/markdown.rs` |
-| 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥 | `src/config.rs` |
+| 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥；可选 `context_window` 派生 token 预算并按估算剩余上下文下调请求输出上限 | `src/config.rs`、`src/model/` |
 | 工具调用 | 多轮工具循环；纯只读工具批次并行执行，结果按调用顺序回填；超长输出截断 | `src/agent/` |
 | 文件读写 | `read_file`、`write_file`、`edit_file`（精确匹配替换） | `src/tools/fs.rs` |
 | 代码搜索 | `grep`（正则）、`glob`、`list_dir`，遵循 .gitignore | `src/tools/search.rs` |
@@ -28,11 +28,11 @@
 
 ## 尚未移植
 
-以下按依赖顺序推进；各阶段能力仍未实现。
+以下按依赖顺序推进；各项列出尚未实现的部分。
 
 ### 1. 上下文 / 协议
 
-1. 自动上下文压缩、按 token 预算分阶段裁剪工具结果，以及 Last Words；当前仅支持手动 `/compact`。
+1. 确定性的按 token 预算分阶段裁剪工具结果、达到预算时自动触发压缩，以及 Last Words；模型配置派生的 token 预算与请求输出上限钳制已实现，当前压缩仍仅支持手动 `/compact`，其摘要输入超限时会优先保留最近内容。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 
