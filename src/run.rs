@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
 use crate::compaction::{CompressionBatch, ContextProjection};
+use crate::compaction_archive::CurrentTurnArchiveManifest;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
@@ -36,6 +37,7 @@ struct RunSink {
     wrote_text: AtomicBool,
     save_failed: AtomicBool,
     archive_pointer: Mutex<Option<String>>,
+    current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
 }
 
 struct RecordedSession {
@@ -67,6 +69,11 @@ impl EventSink for RunSink {
             .archive_pointer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = pointer;
+        *self
+            .current_turn_manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            CurrentTurnArchiveManifest::default();
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -74,6 +81,20 @@ impl EventSink for RunSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn current_turn_archive_manifest(&self, file_read_available: bool) -> Option<String> {
+        let root = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .session
+            .archive_root()
+            .to_path_buf();
+        self.current_turn_manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render(&root, file_read_available)
     }
 
     fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
@@ -97,17 +118,29 @@ impl EventSink for RunSink {
         if self.has_unsaved_messages() {
             return Ok(false);
         }
-        let mut recorded = self
-            .recorded
+        let archived = {
+            let mut recorded = self
+                .recorded
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recorded.buffer.has_pending() {
+                return Ok(false);
+            }
+            let Some(archived) = recorded.session.append_archived_context_projection_if(
+                source,
+                projection,
+                || true,
+            )?
+            else {
+                return Ok(false);
+            };
+            recorded.buffer.reset();
+            archived
+        };
+        self.current_turn_manifest
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if recorded.buffer.has_pending() {
-            return Ok(false);
-        }
-        recorded
-            .session
-            .append_archived_context_projection_if(source, projection, || true)?;
-        recorded.buffer.reset();
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .append(archived);
         Ok(true)
     }
 
@@ -221,6 +254,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         wrote_text: AtomicBool::new(false),
         save_failed: AtomicBool::new(false),
         archive_pointer: Mutex::new(None),
+        current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
     };
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
@@ -368,6 +402,7 @@ mod tests {
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
@@ -395,6 +430,7 @@ mod tests {
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
@@ -432,6 +468,10 @@ mod tests {
         assert!(sink
             .persist_context_projection(&source, &projection)
             .unwrap());
+        let manifest = sink.current_turn_archive_manifest(true).unwrap();
+        assert!(manifest.contains("--- Dropped this turn"));
+        assert!(manifest.contains("r1 001 grep(…) → unknown, 12 chars"));
+        assert!(manifest.contains("To inspect archived input/output"));
 
         let loaded = store.load(session.id()).unwrap();
         assert!(matches!(
@@ -465,6 +505,7 @@ mod tests {
             );
         }
         sink.turn_started();
+        assert_eq!(sink.current_turn_archive_manifest(true), None);
         let frozen = sink.archive_pointer().unwrap();
         assert!(frozen.contains("archived 1 record from previous turns"));
         crate::compaction_archive::ArchiveStore::with_root(session.archive_root())
@@ -508,6 +549,7 @@ mod tests {
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -561,6 +603,7 @@ mod tests {
             wrote_text: AtomicBool::new(false),
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
 
         assert!(sink

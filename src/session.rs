@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
-use crate::compaction_archive::ArchiveStore;
+use crate::compaction_archive::{ArchiveStore, ArchivedContextProjection};
 use crate::model::{AssistantMessage, Message, ToolCall};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,7 +220,7 @@ impl Session {
         source: &[Message],
         projection: &ContextProjection,
         should_append: F,
-    ) -> Result<bool>
+    ) -> Result<Option<ArchivedContextProjection>>
     where
         F: FnOnce() -> bool,
     {
@@ -232,7 +232,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         if !should_append() {
-            return Ok(false);
+            return Ok(None);
         }
         let loaded = load_session_file(&self.path, self.id())?;
         let current_user = loaded
@@ -259,17 +259,12 @@ impl Session {
             })
             .count() as u64
             + 1;
-        ArchiveStore::with_root(&self.archive_root).archive_context_projection(
-            self.id(),
-            turn,
-            round,
-            source,
-            projection,
-        )?;
+        let archived = ArchiveStore::with_root(&self.archive_root)
+            .archive_context_projection_with_manifest(self.id(), turn, round, source, projection)?;
         self.append_unlocked(&Record::ContextProjection {
             projection: projection.clone(),
         })?;
-        Ok(true)
+        Ok(Some(archived))
     }
 
     /// Reload this session after all append work from cloned handles completes.

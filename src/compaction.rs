@@ -153,14 +153,22 @@ fn apply_current_turn_fold(fold: &CurrentTurnFold, messages: &mut Vec<Message>) 
     Ok(())
 }
 
-pub(crate) fn archive_pointer_message(pointer: &str) -> Message {
-    let escaped = pointer
+fn request_reminder_message(content: &str) -> Message {
+    let escaped = content
         .trim()
         .replace(REMINDER_TAG_OPEN, ESCAPED_REMINDER_TAG_OPEN)
         .replace(REMINDER_TAG_CLOSE, ESCAPED_REMINDER_TAG_CLOSE);
     Message::last_words(format!(
         "{REMINDER_TAG_OPEN}\n{escaped}\n{REMINDER_TAG_CLOSE}"
     ))
+}
+
+pub(crate) fn archive_pointer_message(pointer: &str) -> Message {
+    request_reminder_message(pointer)
+}
+
+pub(crate) fn current_turn_manifest_message(manifest: &str) -> Message {
+    request_reminder_message(manifest)
 }
 
 pub(crate) fn last_words_message(note: &str) -> Message {

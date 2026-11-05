@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
+use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveManifest};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -81,7 +82,8 @@ pub(crate) enum UiEvent {
     PersistContextProjection {
         source: Vec<Message>,
         projection: ContextProjection,
-        reply: std::sync::mpsc::Sender<std::result::Result<bool, String>>,
+        reply:
+            std::sync::mpsc::Sender<std::result::Result<Option<ArchivedContextProjection>, String>>,
     },
     Info(String),
     Error(String),
@@ -840,6 +842,7 @@ impl App {
             recorder: self.recorder.clone(),
             persistence_gate,
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -1455,22 +1458,22 @@ fn persist_context_projection(
     unsaved_messages: bool,
     source: &[Message],
     projection: &ContextProjection,
-) -> std::result::Result<bool, String> {
+) -> std::result::Result<Option<ArchivedContextProjection>, String> {
     if unsaved_messages {
-        return Ok(false);
+        return Ok(None);
     }
     let mut recorder = recorder
         .lock()
         .map_err(|_| "session recorder lock is poisoned".to_string())?;
-    let appended = session
+    let archived = session
         .append_archived_context_projection_if(source, projection, || {
             persistence_gate.is_some_and(|gate| gate.load(Ordering::SeqCst))
         })
         .map_err(|error| format!("{error:#}"))?;
-    if appended {
+    if archived.is_some() {
         recorder.reset();
     }
-    Ok(appended)
+    Ok(archived)
 }
 
 struct TuiSink {
@@ -1480,6 +1483,7 @@ struct TuiSink {
     recorder: Arc<Mutex<RecordBuffer>>,
     persistence_gate: Arc<AtomicBool>,
     archive_pointer: Mutex<Option<String>>,
+    current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
 }
 
 impl TuiSink {
@@ -1498,6 +1502,11 @@ impl EventSink for TuiSink {
             .archive_pointer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = pointer;
+        *self
+            .current_turn_manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            CurrentTurnArchiveManifest::default();
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -1505,6 +1514,13 @@ impl EventSink for TuiSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn current_turn_archive_manifest(&self, file_read_available: bool) -> Option<String> {
+        self.current_turn_manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .render(self.session.archive_root(), file_read_available)
     }
 
     fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
@@ -1537,7 +1553,16 @@ impl EventSink for TuiSink {
             .map_err(|_| anyhow::anyhow!("TUI event loop closed before projection persistence"))?;
         loop {
             match response.recv_timeout(Duration::from_millis(100)) {
-                Ok(result) => return result.map_err(anyhow::Error::msg),
+                Ok(result) => {
+                    let Some(archived) = result.map_err(anyhow::Error::msg)? else {
+                        return Ok(false);
+                    };
+                    self.current_turn_manifest
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .append(archived);
+                    return Ok(true);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
                     if !self.persistence_gate.load(Ordering::SeqCst) =>
                 {
@@ -1734,6 +1759,7 @@ mod tests {
             recorder: recorder.clone(),
             persistence_gate: Arc::new(AtomicBool::new(true)),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
 
         assert!(sink
@@ -1786,6 +1812,7 @@ mod tests {
             recorder: recorder.clone(),
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         });
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -1841,6 +1868,9 @@ mod tests {
             }
         }
         assert!(worker.join().unwrap().unwrap());
+        let manifest = sink.current_turn_archive_manifest(true).unwrap();
+        assert!(manifest.contains("r1 001 read_file(…) → unknown, 12 chars"));
+        assert!(manifest.contains("To inspect archived input/output"));
 
         let loaded = store.load(session.id()).unwrap();
         let projection_index = loaded
@@ -1884,6 +1914,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
 
         assert!(!sink
@@ -1904,6 +1935,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         };
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {
@@ -1931,6 +1963,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
         });
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {

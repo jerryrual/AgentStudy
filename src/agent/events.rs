@@ -20,6 +20,11 @@ pub trait EventSink: Send + Sync {
         None
     }
 
+    /// Render the cumulative current-turn archive manifest for model context.
+    fn current_turn_archive_manifest(&self, _file_read_available: bool) -> Option<String> {
+        None
+    }
+
     /// A chunk of assistant text arrived.
     fn text_delta(&self, _delta: &str) {}
 

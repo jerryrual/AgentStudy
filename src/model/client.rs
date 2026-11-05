@@ -175,9 +175,16 @@ impl ModelClient {
         tools: &[ToolDef],
         sink: &dyn EventSink,
     ) -> Result<PersistentCompletion> {
+        let file_read_available = tools.iter().any(|tool| tool.name == "read_file");
         let archive_pointer = Self::request_archive_pointer(tools, sink);
-        let prepared =
-            self.prepare_persistent_request(messages, tools, false, archive_pointer.as_deref())?;
+        let current_manifest = sink.current_turn_archive_manifest(file_read_available);
+        let prepared = self.prepare_persistent_request(
+            messages,
+            tools,
+            false,
+            archive_pointer.as_deref(),
+            current_manifest.as_deref(),
+        )?;
         let mut auxiliary_usage = Usage::default();
         let mut phase_four_attempted = false;
         if self.phase_four_needed(&prepared, messages) {
@@ -188,6 +195,7 @@ impl ModelClient {
                     tools,
                     &prepared,
                     archive_pointer.as_deref(),
+                    file_read_available,
                     sink,
                 )
                 .await
@@ -224,6 +232,7 @@ impl ModelClient {
                     tools,
                     true,
                     archive_pointer.as_deref(),
+                    current_manifest.as_deref(),
                 )?;
                 if !phase_four_attempted && Self::phase_four_eligible(messages) {
                     match self
@@ -232,6 +241,7 @@ impl ModelClient {
                             tools,
                             &retry,
                             archive_pointer.as_deref(),
+                            file_read_available,
                             sink,
                         )
                         .await
@@ -308,13 +318,17 @@ impl ModelClient {
         tools: &[ToolDef],
         prepared: &PreparedRequest,
         archive_pointer: Option<&str>,
+        file_read_available: bool,
         sink: &dyn EventSink,
     ) -> std::result::Result<(PreparedRequest, Usage), PhaseFourPrepareError> {
         let historical = prepared
             .compression
             .projected(messages)
             .map_err(PhaseFourPrepareError::Fatal)?;
-        let generated = self.generate_last_words(&historical, sink).await?;
+        let prior_manifest = sink.current_turn_archive_manifest(file_read_available);
+        let generated = self
+            .generate_last_words(&historical, prior_manifest.as_deref(), sink)
+            .await?;
         let user = historical
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
@@ -333,27 +347,53 @@ impl ModelClient {
         let projected = projection
             .projected(messages)
             .map_err(PhaseFourPrepareError::Fatal)?;
-        let retry = self
-            .prepare_persistent_request(&projected, tools, false, archive_pointer)
+        let provisional_retry = self
+            .prepare_persistent_request(
+                &projected,
+                tools,
+                false,
+                archive_pointer,
+                prior_manifest.as_deref(),
+            )
             .map_err(|error| {
                 PhaseFourPrepareError::Skipped(PhaseFourSkipped {
                     error,
                     usage: generated.usage,
                 })
             })?;
-        if retry.estimated_input >= prepared.estimated_input {
+        if provisional_retry.estimated_input >= prepared.estimated_input {
             return Err(PhaseFourPrepareError::Skipped(PhaseFourSkipped {
                 error: anyhow!("Last Words did not reduce the estimated model input"),
                 usage: generated.usage,
             }));
         }
-        if !retry.compression.is_empty() {
+        if !provisional_retry.compression.is_empty() {
             return Err(PhaseFourPrepareError::Fatal(anyhow!(
                 "Last Words projection left an uncommitted historical fold"
             )));
         }
         Self::persist_prepared_projection(messages, &projection, projected, sink)
             .map_err(PhaseFourPrepareError::Fatal)?;
+        let current_manifest = sink.current_turn_archive_manifest(file_read_available);
+        let retry = self
+            .prepare_persistent_request(
+                messages,
+                tools,
+                false,
+                archive_pointer,
+                current_manifest.as_deref(),
+            )
+            .map_err(PhaseFourPrepareError::Fatal)?;
+        if retry.estimated_input >= prepared.estimated_input {
+            return Err(PhaseFourPrepareError::Fatal(anyhow!(
+                "Last Words plus its archive manifest did not reduce the estimated model input"
+            )));
+        }
+        if !retry.compression.is_empty() {
+            return Err(PhaseFourPrepareError::Fatal(anyhow!(
+                "Last Words manifest retry left an uncommitted historical fold"
+            )));
+        }
         Ok((retry, generated.usage))
     }
 
@@ -439,12 +479,20 @@ impl ModelClient {
         tools: &[ToolDef],
         force_compaction: bool,
         archive_pointer: Option<&str>,
+        current_manifest: Option<&str>,
     ) -> Result<PreparedRequest> {
-        let Some(pointer) = archive_pointer.filter(|pointer| !pointer.trim().is_empty()) else {
+        let archive_pointer = archive_pointer.filter(|pointer| !pointer.trim().is_empty());
+        let current_manifest = current_manifest.filter(|manifest| !manifest.trim().is_empty());
+        if archive_pointer.is_none() && current_manifest.is_none() {
             return self.prepare_request(messages, tools, force_compaction);
-        };
+        }
         let mut enriched = messages.to_vec();
-        enriched.push(crate::compaction::archive_pointer_message(pointer));
+        if let Some(manifest) = current_manifest {
+            enriched.push(crate::compaction::current_turn_manifest_message(manifest));
+        }
+        if let Some(pointer) = archive_pointer {
+            enriched.push(crate::compaction::archive_pointer_message(pointer));
+        }
         self.prepare_request(&enriched, tools, force_compaction)
     }
 
@@ -583,6 +631,7 @@ impl ModelClient {
     async fn generate_last_words(
         &self,
         messages: &[Message],
+        current_manifest: Option<&str>,
         usage_sink: &dyn EventSink,
     ) -> std::result::Result<LastWordsResult, PhaseFourPrepareError> {
         let user = messages
@@ -610,10 +659,13 @@ impl ModelClient {
                 Usage::default(),
             )
         })?;
-        let mut request = vec![
-            Message::system(LAST_WORDS_SYSTEM_PROMPT),
-            Message::user(format!("Current-turn transcript JSON:\n{transcript}")),
-        ];
+        let mut request = vec![Message::system(LAST_WORDS_SYSTEM_PROMPT)];
+        if let Some(manifest) = current_manifest.filter(|manifest| !manifest.trim().is_empty()) {
+            request.push(crate::compaction::current_turn_manifest_message(manifest));
+        }
+        request.push(Message::user(format!(
+            "Current-turn transcript JSON:\n{transcript}"
+        )));
         let mut usage = Usage::default();
         for attempt in 0..LAST_WORDS_GENERATION_ATTEMPTS {
             let body = self
@@ -1467,21 +1519,24 @@ mod tests {
     }
 
     #[test]
-    fn persistent_requests_budget_and_send_the_archive_pointer() {
+    fn persistent_requests_budget_and_send_archive_reminders() {
         let messages = vec![Message::system("system"), Message::user("task")];
         let pointer = "Earlier context compaction archived 2 records from previous turns; catalog: /tmp/session/compactions/dropped/catalog.jsonl (contains each record's relative path).";
+        let manifest = "--- Dropped this turn (records under /tmp/session/compactions/dropped/turn002/) ---\nr1 001 grep(…) → unknown, 12 chars — 001_grep_deadbeef.md";
 
         for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
             let client = budget_client(api_style);
             let plain = client.prepare_request(&messages, &[], false).unwrap();
             let enriched = client
-                .prepare_persistent_request(&messages, &[], false, Some(pointer))
+                .prepare_persistent_request(&messages, &[], false, Some(pointer), Some(manifest))
                 .unwrap();
 
             assert!(enriched.estimated_input > plain.estimated_input);
             let body = enriched.body.to_string();
             assert!(body.contains("Earlier context compaction archived 2 records"));
             assert!(body.contains("/tmp/session/compactions/dropped/catalog.jsonl"));
+            assert!(body.contains("Dropped this turn"));
+            assert!(body.contains("001_grep_deadbeef.md"));
             assert!(body.contains("<system-reminder>"));
         }
     }
@@ -1494,11 +1549,15 @@ mod tests {
             let body = client
                 .last_words_request_body(&[
                     Message::system(LAST_WORDS_SYSTEM_PROMPT),
+                    crate::compaction::current_turn_manifest_message(
+                        "--- Dropped this turn (records under /tmp/turn001/) ---\nr1 001 grep(…) → unknown, 12 chars — 001_grep_deadbeef.md",
+                    ),
                     Message::user("transcript"),
                 ])
                 .unwrap();
 
             assert_eq!(body["stream"], false);
+            assert!(body.to_string().contains("001_grep_deadbeef.md"));
             assert!(body.get("tools").is_none());
             assert!(body.get("tool_choice").is_none());
             assert!(body.get("stream_options").is_none());
