@@ -187,10 +187,19 @@ impl LoadedSession {
                     }
                     Some(count) => {
                         flush(&mut messages, &mut pending);
-                        let range_start = messages
+                        let summary_end = messages
                             .iter()
                             .rposition(|message| matches!(message, Message::Summary { .. }))
                             .map_or(0, |position| position + 1);
+                        let Some(range_start) =
+                            messages.iter().enumerate().skip(summary_end).find_map(
+                                |(position, message)| {
+                                    matches!(message, Message::User { .. }).then_some(position)
+                                },
+                            )
+                        else {
+                            continue;
+                        };
                         let available = messages.len() - range_start;
                         // A corrupt persisted count must not discard an unknown tail.
                         if *count == 0 || *count > available {
@@ -687,6 +696,37 @@ mod tests {
     }
 
     #[test]
+    fn persisted_prefix_fold_starts_at_the_first_user_after_leading_messages() {
+        let leading_text = "output whose user record was not saved";
+        let messages = loaded(vec![
+            assistant_record(leading_text),
+            Record::User {
+                text: "old request".into(),
+            },
+            assistant_record("old answer"),
+            Record::User {
+                text: "current request".into(),
+            },
+            assistant_record("current answer"),
+            Record::Compaction {
+                summary: "folded old turn".into(),
+                compacted_messages: Some(2),
+            },
+        ])
+        .messages();
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::assistant(AssistantMessage::text(leading_text)),
+                crate::compaction::summary_message("folded old turn"),
+                Message::user("current request"),
+                Message::assistant(AssistantMessage::text("current answer")),
+            ]
+        );
+    }
+
+    #[test]
     fn stacked_prefix_folds_preserve_summaries_and_current_tail() {
         let messages = loaded(vec![
             Record::User {
@@ -770,6 +810,9 @@ mod tests {
     #[test]
     fn prefix_fold_flushes_pending_tool_state_before_splicing() {
         let messages = loaded(vec![
+            Record::User {
+                text: "interrupted request".into(),
+            },
             Record::Assistant {
                 content: Some("calling".into()),
                 reasoning: None,
@@ -782,7 +825,7 @@ mod tests {
             },
             Record::Compaction {
                 summary: "interrupted turn folded".into(),
-                compacted_messages: Some(2),
+                compacted_messages: Some(3),
             },
             Record::Tool {
                 call_id: "call_1".into(),
