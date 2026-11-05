@@ -1,7 +1,7 @@
 //! Deterministic request-only context projections.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::model::{Message, ToolCall};
 
@@ -17,6 +17,7 @@ const SUMMARY_TRUNCATION_MARKER: &str = "... [truncated]";
 pub(crate) struct TrimResult<'a> {
     pub(crate) messages: Cow<'a, [Message]>,
     pub(crate) summarized: usize,
+    pub(crate) removed: usize,
     pub(crate) estimated_tokens: u32,
 }
 
@@ -40,6 +41,7 @@ where
         return TrimResult {
             messages: projected,
             summarized: 0,
+            removed: 0,
             estimated_tokens: initial,
         };
     }
@@ -50,6 +52,7 @@ where
         return TrimResult {
             messages: projected,
             summarized: 0,
+            removed: 0,
             estimated_tokens: initial,
         };
     };
@@ -103,8 +106,148 @@ where
     TrimResult {
         messages: projected,
         summarized,
+        removed: 0,
         estimated_tokens,
     }
+}
+
+/// Remove completed historical tool-call batches until `target_tokens`.
+///
+/// Each candidate removes one assistant batch atomically, including all of its
+/// sibling calls, matching results, and call-associated reasoning. Ordinary
+/// assistant content and provider-native message items are retained.
+pub(crate) fn remove_previous_tool_groups<'a, F>(
+    mut projection: TrimResult<'a>,
+    target_tokens: u32,
+    mut estimate: F,
+) -> TrimResult<'a>
+where
+    F: FnMut(&[Message]) -> u32,
+{
+    while projection.estimated_tokens > target_tokens {
+        let Some(current_turn_start) = projection
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, Message::User { .. }))
+        else {
+            break;
+        };
+        let groups = removable_tool_groups(projection.messages.as_ref(), current_turn_start);
+        let mut committed = false;
+
+        for group in groups {
+            let candidate = remove_tool_group(projection.messages.as_ref(), &group);
+            let candidate_tokens = estimate(&candidate);
+            if candidate_tokens >= projection.estimated_tokens {
+                continue;
+            }
+            projection.messages = Cow::Owned(candidate);
+            projection.removed += 1;
+            projection.estimated_tokens = candidate_tokens;
+            committed = true;
+            break;
+        }
+
+        if !committed {
+            break;
+        }
+    }
+    projection
+}
+
+#[derive(Debug)]
+struct ToolGroup {
+    assistant_index: usize,
+    call_ids: HashSet<String>,
+    result_indices: HashSet<usize>,
+}
+
+fn removable_tool_groups(messages: &[Message], end: usize) -> Vec<ToolGroup> {
+    let mut groups = Vec::<ToolGroup>::new();
+    let mut group_by_call = HashMap::<String, usize>::new();
+    for (index, message) in messages[..end].iter().enumerate() {
+        match message {
+            Message::Assistant { message } => {
+                let mut call_ids: HashSet<String> = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.clone())
+                    .collect();
+                call_ids.extend(
+                    message
+                        .responses_items
+                        .iter()
+                        .filter_map(native_function_call_id),
+                );
+                if call_ids.is_empty() {
+                    continue;
+                }
+                let group_index = groups.len();
+                for call_id in &call_ids {
+                    group_by_call.insert(call_id.clone(), group_index);
+                }
+                groups.push(ToolGroup {
+                    assistant_index: index,
+                    call_ids,
+                    result_indices: HashSet::new(),
+                });
+            }
+            Message::Tool { call_id, .. } => {
+                if let Some(group_index) = group_by_call.get(call_id).copied() {
+                    groups[group_index].result_indices.insert(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    groups.retain(|group| {
+        group.call_ids.iter().all(|call_id| {
+            group.result_indices.iter().any(|index| {
+                matches!(&messages[*index], Message::Tool { call_id: result_id, .. } if result_id == call_id)
+            })
+        })
+    });
+    groups
+}
+
+fn native_function_call_id(item: &serde_json::Value) -> Option<String> {
+    (item.get("type").and_then(serde_json::Value::as_str) == Some("function_call"))
+        .then(|| item.get("call_id")?.as_str().map(str::to_owned))
+        .flatten()
+}
+
+fn remove_tool_group(messages: &[Message], group: &ToolGroup) -> Vec<Message> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::Tool { .. } if group.result_indices.contains(&index) => None,
+            Message::Assistant { message } if index == group.assistant_index => {
+                let mut message = message.clone();
+                message
+                    .tool_calls
+                    .retain(|call| !group.call_ids.contains(&call.id));
+                message.responses_items.retain(|item| {
+                    let item_type = item.get("type").and_then(serde_json::Value::as_str);
+                    item_type != Some("reasoning")
+                        && !(item_type == Some("function_call")
+                            && item
+                                .get("call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|call_id| group.call_ids.contains(call_id)))
+                });
+                message.reasoning = None;
+                (message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                    || !message.tool_calls.is_empty()
+                    || !message.responses_items.is_empty())
+                .then_some(Message::assistant(message))
+            }
+            _ => Some(message.clone()),
+        })
+        .collect()
 }
 
 fn tool_result_groups(messages: &[Message], end: usize) -> Vec<Vec<usize>> {
@@ -347,6 +490,7 @@ mod tests {
         let messages = history();
         let result = trim_previous_tool_results(&messages, 1, 0, tool_content_len);
         assert_eq!(result.summarized, 2);
+        assert_eq!(result.removed, 0);
         assert!(
             matches!(&result.messages[2], Message::Tool { content, .. } if content.starts_with(SUMMARY_PREFIX))
         );
@@ -423,5 +567,278 @@ mod tests {
         let result = trim_previous_tool_results(&no_user, 1, 0, tool_content_len);
         assert_eq!(result.messages, no_user);
         assert_eq!(result.summarized, 0);
+    }
+
+    fn phase_two<'a>(messages: &'a [Message], target: u32) -> TrimResult<'a> {
+        remove_previous_tool_groups(
+            TrimResult {
+                messages: Cow::Borrowed(messages),
+                summarized: 0,
+                removed: 0,
+                estimated_tokens: messages.len() as u32,
+            },
+            target,
+            |candidate| candidate.len() as u32,
+        )
+    }
+
+    #[test]
+    fn phase_one_target_stops_before_phase_two() {
+        let messages = history();
+        let phase_one = trim_previous_tool_results(&messages, 600, 500, |candidate| {
+            if candidate.iter().any(
+                |message| matches!(message, Message::Tool { content, .. } if content.starts_with(SUMMARY_PREFIX)),
+            ) { 500 } else { 600 }
+        });
+        let result = if phase_one.estimated_tokens > 500 {
+            remove_previous_tool_groups(phase_one, 500, |_| 0)
+        } else {
+            phase_one
+        };
+        assert_eq!(result.summarized, 1);
+        assert_eq!(result.removed, 0);
+    }
+
+    #[test]
+    fn phase_two_is_oldest_first_exact_and_current_safe() {
+        let messages = history();
+        let source = messages.clone();
+        let result = phase_two(&messages, (messages.len() - 2) as u32);
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.estimated_tokens, (messages.len() - 2) as u32);
+        assert!(!result
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { call_id, .. } if call_id == "a")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { call_id, .. } if call_id == "b")));
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { call_id, .. } if call_id == "c")));
+        assert_eq!(messages, source);
+        assert!(matches!(result.messages, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn phase_two_scopes_reused_call_ids_to_the_historical_batch() {
+        let messages = vec![
+            Message::user("old"),
+            call("shared", "read_file", "{}"),
+            Message::tool("shared", "read_file", "old result"),
+            Message::user("current"),
+            call("shared", "read_file", "{}"),
+            Message::tool("shared", "read_file", "current result"),
+        ];
+
+        let result = phase_two(&messages, 4);
+
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.messages.len(), 4);
+        assert!(result.messages.iter().any(
+            |message| matches!(message, Message::Tool { call_id, content, .. } if call_id == "shared" && content == "current result"),
+        ));
+        assert!(!result.messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "old result"),
+        ));
+    }
+
+    #[test]
+    fn phase_two_scopes_reused_call_ids_across_historical_batches() {
+        let messages = vec![
+            Message::user("old one"),
+            call("shared", "read_file", "{}"),
+            Message::tool("shared", "read_file", "first result"),
+            Message::user("old two"),
+            call("shared", "read_file", "{}"),
+            Message::tool("shared", "read_file", "second result"),
+            Message::user("current"),
+        ];
+
+        let result = phase_two(&messages, 5);
+
+        assert_eq!(result.removed, 1);
+        assert!(!result.messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "first result"),
+        ));
+        assert!(result.messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "second result"),
+        ));
+    }
+
+    #[test]
+    fn phase_two_retains_an_incomplete_older_reused_id_batch() {
+        let messages = vec![
+            Message::user("old incomplete"),
+            call("shared", "read_file", "{}"),
+            Message::user("old complete"),
+            call("shared", "read_file", "{}"),
+            Message::tool("shared", "read_file", "completed result"),
+            Message::user("current"),
+        ];
+
+        let result = phase_two(&messages, 4);
+
+        assert_eq!(result.removed, 1);
+        assert!(!result.messages.iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "completed result"),
+        ));
+        assert!(matches!(
+            &result.messages[1],
+            Message::Assistant { message } if message.tool_calls.iter().any(|call| call.id == "shared")
+        ));
+    }
+
+    #[test]
+    fn phase_two_removes_parallel_siblings_atomically() {
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "grep".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("a", "read_file", "one"),
+            Message::tool("b", "grep", "two"),
+            Message::user("current"),
+        ];
+        let result = phase_two(&messages, 2);
+        assert_eq!(result.removed, 1);
+        assert!(!result
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { .. })));
+    }
+
+    #[test]
+    fn phase_two_keeps_an_incomplete_sibling_batch_intact() {
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "grep".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("a", "read_file", "one"),
+            Message::user("current"),
+        ];
+
+        let result = phase_two(&messages, 0);
+
+        assert_eq!(result.messages.as_ref(), messages);
+        assert_eq!(result.removed, 0);
+    }
+
+    #[test]
+    fn phase_two_preserves_fused_narration() {
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant(AssistantMessage {
+                content: Some("I checked the file.".into()),
+                reasoning: Some("tool-specific reasoning".into()),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: Vec::new(),
+            }),
+            Message::tool("a", "read_file", "result"),
+            Message::user("current"),
+        ];
+        let result = phase_two(&messages, 3);
+        let Message::Assistant { message } = &result.messages[1] else {
+            panic!("narration should survive")
+        };
+        assert_eq!(message.content.as_deref(), Some("I checked the file."));
+        assert_eq!(message.reasoning, None);
+        assert!(message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn phase_two_filters_native_call_and_reasoning_but_keeps_text() {
+        let text = serde_json::json!({"type": "message", "content": [{"type": "output_text", "text": "kept"}]});
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant(AssistantMessage {
+                responses_items: vec![
+                    serde_json::json!({"type": "reasoning", "encrypted_content": "secret"}),
+                    serde_json::json!({"type": "function_call", "call_id": "a", "name": "read_file", "arguments": "{}"}),
+                    text.clone(),
+                ],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("a", "read_file", "result"),
+            Message::user("current"),
+        ];
+        let result = phase_two(&messages, 3);
+        let Message::Assistant { message } = &result.messages[1] else {
+            panic!("text item should survive")
+        };
+        assert_eq!(message.responses_items, vec![text]);
+        assert_eq!(result.removed, 1);
+    }
+
+    #[test]
+    fn phase_two_stops_on_non_reducing_candidate() {
+        let messages = vec![
+            Message::user("old"),
+            call("a", "read_file", "{}"),
+            Message::tool("a", "read_file", "result"),
+            Message::user("current"),
+        ];
+        let result = remove_previous_tool_groups(
+            TrimResult {
+                messages: Cow::Borrowed(&messages),
+                summarized: 0,
+                removed: 0,
+                estimated_tokens: 100,
+            },
+            10,
+            |_| 100,
+        );
+        assert_eq!(result.messages, messages);
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.estimated_tokens, 100);
+    }
+
+    #[test]
+    fn phase_two_stops_when_non_tool_budget_is_impossible() {
+        let messages = vec![Message::system("fixed overhead"), Message::user("current")];
+        let result = remove_previous_tool_groups(
+            TrimResult {
+                messages: Cow::Borrowed(&messages),
+                summarized: 0,
+                removed: 0,
+                estimated_tokens: 100,
+            },
+            10,
+            |_| 100,
+        );
+        assert_eq!(result.messages, messages);
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.estimated_tokens, 100);
     }
 }
