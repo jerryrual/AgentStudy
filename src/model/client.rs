@@ -36,6 +36,7 @@ pub struct ModelClient {
 struct PreparedRequest {
     body: Value,
     compression: crate::compaction::CompressionBatch,
+    estimated_input: u32,
 }
 
 impl ModelClient {
@@ -140,7 +141,7 @@ impl ModelClient {
                 if self.can_retry_context_overflow(named_limit) =>
             {
                 let retry = self.prepare_request(messages, tools, true)?;
-                if retry.body == prepared.body {
+                if retry.estimated_input >= prepared.estimated_input {
                     return Err(error);
                 }
                 sink.info("model context overflow; compacting and retrying once");
@@ -306,7 +307,11 @@ impl ModelClient {
             body
         };
         self.apply_context_budget(&mut body, estimated_input)?;
-        Ok(PreparedRequest { body, compression })
+        Ok(PreparedRequest {
+            body,
+            compression,
+            estimated_input,
+        })
     }
 
     /// Conservatively estimate the semantic history and tools sent by this API style.
@@ -643,7 +648,11 @@ fn named_context_limit(text: &str) -> Option<u32> {
             rest = tail;
         }
     }
-    (limits.len() == 1).then(|| *limits.first().expect("one context limit"))
+    let mut limits = limits.into_iter();
+    match (limits.next(), limits.next()) {
+        (Some(limit), None) => Some(limit),
+        _ => None,
+    }
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -987,6 +996,7 @@ mod tests {
 
         assert_eq!(normal.body["messages"][2]["content"], "x".repeat(200));
         assert_ne!(forced.body["messages"], normal.body["messages"]);
+        assert!(forced.estimated_input < normal.estimated_input);
         assert!(!forced.body["messages"]
             .as_array()
             .unwrap()
@@ -1008,6 +1018,7 @@ mod tests {
         let forced = client.prepare_request(&messages, &[], true).unwrap();
         assert!(normal.compression.is_empty());
         assert_eq!(forced.compression.folds.len(), 1);
+        assert!(forced.estimated_input < normal.estimated_input);
         let sink = PersistSink {
             committed: true,
             calls: AtomicUsize::new(0),
