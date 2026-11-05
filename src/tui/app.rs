@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
-use crate::compaction::{Compaction, ForcedCompressionPlan};
+use crate::compaction::Compaction;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -87,11 +87,7 @@ pub(crate) enum UiEvent {
         question: String,
         reply: oneshot::Sender<String>,
     },
-    TurnFinished(
-        std::result::Result<TurnResult, String>,
-        Vec<Message>,
-        Option<ForcedCompressionPlan>,
-    ),
+    TurnFinished(std::result::Result<TurnResult, String>, Vec<Message>, bool),
     CompactionFinished {
         result: std::result::Result<Compaction, String>,
         duration: Duration,
@@ -354,7 +350,7 @@ impl App {
                     "Type your answer and press Enter.".to_string(),
                 ));
             }
-            UiEvent::TurnFinished(result, messages, forced_compression) => {
+            UiEvent::TurnFinished(result, messages, force_compression) => {
                 self.messages = messages;
                 self.running = false;
                 self.turn_started = None;
@@ -366,21 +362,31 @@ impl App {
                 match result {
                     Ok(turn) => {
                         self.elapsed = turn.duration;
-                        if !self.unsaved_messages {
-                            if let Some(plan) = forced_compression {
-                                let record = Record::Compaction {
-                                    summary: plan.summary.clone(),
-                                    compacted_messages: Some(plan.compacted_messages),
-                                };
-                                match self.session.append(&record) {
-                                    Ok(()) => {
-                                        self.messages = plan.projected(&self.messages);
-                                        self.recorder.reset();
+                        if force_compression && !self.unsaved_messages {
+                            match self.store.load(self.session.id()) {
+                                Ok(loaded) => {
+                                    let persisted_messages = loaded.messages();
+                                    if let Some(plan) = crate::compaction::plan_forced_compression(
+                                        &persisted_messages,
+                                    ) {
+                                        let record = Record::Compaction {
+                                            summary: plan.summary.clone(),
+                                            compacted_messages: Some(plan.compacted_messages),
+                                        };
+                                        match self.session.append(&record) {
+                                            Ok(()) => {
+                                                self.messages = plan.projected(&persisted_messages);
+                                                self.recorder.reset();
+                                            }
+                                            Err(error) => self.view.push(ViewItem::Error(format!(
+                                                "failed to save automatic compaction: {error:#}"
+                                            ))),
+                                        }
                                     }
-                                    Err(error) => self.view.push(ViewItem::Error(format!(
-                                        "failed to save automatic compaction: {error:#}"
-                                    ))),
                                 }
+                                Err(error) => self.view.push(ViewItem::Error(format!(
+                                    "failed to reload session for automatic compaction: {error:#}"
+                                ))),
                             }
                         }
                         if turn.tool_calls > 0 {
@@ -780,21 +786,17 @@ impl App {
                 };
                 let agent = Agent::new(client, tools, approver, asker, options);
                 let turn = agent.run(&mut messages, sink.as_ref()).await?;
-                let forced_compression = if agent.should_force_compression(&turn) {
-                    crate::compaction::plan_forced_compression(&messages)
-                } else {
-                    None
-                };
-                Ok::<_, anyhow::Error>((turn, forced_compression))
+                let force_compression = agent.should_force_compression(&turn);
+                Ok::<_, anyhow::Error>((turn, force_compression))
             }
             .await;
-            let (result, forced_compression) = match completed {
-                Ok((turn, plan)) => (Ok(turn), plan),
-                Err(error) => (Err(format!("{error:#}")), None),
+            let (result, force_compression) = match completed {
+                Ok((turn, force)) => (Ok(turn), force),
+                Err(error) => (Err(format!("{error:#}")), false),
             };
             let _ = tx.send(UiEvent::Turn {
                 id: turn_id,
-                event: Box::new(UiEvent::TurnFinished(result, messages, forced_compression)),
+                event: Box::new(UiEvent::TurnFinished(result, messages, force_compression)),
             });
         });
         self.cancel_handle = Some(task);

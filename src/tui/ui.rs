@@ -745,7 +745,6 @@ mod tests {
     #[test]
     fn forced_compression_keeps_full_context_when_messages_are_unsaved() {
         use crate::agent::TurnResult;
-        use crate::compaction::plan_forced_compression;
         use crate::model::{AssistantMessage, Message};
         use crate::tui::app::UiEvent;
 
@@ -756,13 +755,12 @@ mod tests {
             Message::user("current request"),
             Message::assistant(AssistantMessage::text("current answer")),
         ];
-        let plan = plan_forced_compression(&messages).expect("forced compression plan");
         app.unsaved_messages = true;
         app.running = true;
         app.push_event(UiEvent::TurnFinished(
             Ok(TurnResult::default()),
             messages.clone(),
-            Some(plan),
+            true,
         ));
 
         app.pump();
@@ -772,30 +770,36 @@ mod tests {
     }
 
     #[test]
-    fn forced_compression_persists_before_projecting_model_context() {
+    fn forced_compression_reloads_persisted_history_before_planning() {
         use crate::agent::TurnResult;
         use crate::compaction::plan_forced_compression;
         use crate::model::{AssistantMessage, Message};
         use crate::tui::app::UiEvent;
 
         let mut app = test_app();
-        let messages = vec![
+        let persisted_messages = vec![
             Message::user("old request"),
-            Message::assistant(AssistantMessage::text("old answer")),
+            Message::assistant(AssistantMessage::text("persisted cancelled-turn output")),
             Message::user("current request"),
             Message::assistant(AssistantMessage::text("current answer")),
         ];
-        for message in &messages {
+        for message in &persisted_messages {
             app.session.append_message(message).unwrap();
         }
-        let plan = plan_forced_compression(&messages).expect("forced compression plan");
-        let projected = plan.projected(&messages);
+        let projected = plan_forced_compression(&persisted_messages)
+            .expect("forced compression plan")
+            .projected(&persisted_messages);
+        let stale_in_memory_messages = vec![
+            Message::user("old request"),
+            Message::user("current request"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
         let visible_items = app.view.len();
         app.running = true;
         app.push_event(UiEvent::TurnFinished(
             Ok(TurnResult::default()),
-            messages,
-            Some(plan),
+            stale_in_memory_messages,
+            true,
         ));
 
         app.pump();
