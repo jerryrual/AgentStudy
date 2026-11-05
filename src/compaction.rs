@@ -41,14 +41,21 @@ impl CompressionBatch {
 
     /// Project every fold in persistence order without changing `source`.
     pub(crate) fn projected(&self, source: &[Message]) -> Result<Vec<Message>> {
+        Self::project_folds(&self.folds, source)
+    }
+
+    /// Project a borrowed fold sequence without cloning its summary payloads.
+    pub(crate) fn project_folds(
+        folds: &[CompressionFold],
+        source: &[Message],
+    ) -> Result<Vec<Message>> {
         let mut projected = source.to_vec();
-        self.apply(&mut projected)?;
+        Self::apply_folds(folds, &mut projected)?;
         Ok(projected)
     }
 
-    /// Apply every fold from the first real user turn after the latest summary.
-    pub(crate) fn apply(&self, messages: &mut Vec<Message>) -> Result<()> {
-        for fold in &self.folds {
+    fn apply_folds(folds: &[CompressionFold], messages: &mut Vec<Message>) -> Result<()> {
+        for fold in folds {
             let boundary = messages
                 .iter()
                 .rposition(|message| matches!(message, Message::Summary { .. }));

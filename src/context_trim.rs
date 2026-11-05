@@ -184,6 +184,7 @@ where
         return projection;
     }
 
+    let baseline = projection.clone();
     let summary_boundary = source
         .iter()
         .rposition(|message| matches!(message, Message::Summary { .. }));
@@ -235,9 +236,6 @@ where
         let mut candidate = projection.messages.as_ref().to_vec();
         candidate.splice(projected_start..projected_end, [summary_message(&summary)]);
         let candidate_tokens = estimate(&candidate);
-        if candidate_tokens >= projection.estimated_tokens {
-            break;
-        }
 
         projection.messages = Cow::Owned(candidate);
         projection.compressed += 1;
@@ -245,7 +243,11 @@ where
         projection.estimated_tokens = candidate_tokens;
     }
 
-    projection
+    if projection.estimated_tokens >= baseline.estimated_tokens {
+        baseline
+    } else {
+        projection
+    }
 }
 
 fn user_indices(messages: &[Message]) -> Vec<usize> {
@@ -1103,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn phase_three_skips_nonreducing_and_system_turns() {
+    fn phase_three_stops_at_a_system_turn_boundary() {
         let source = vec![
             Message::user("system turn"),
             Message::system("embedded"),
@@ -1113,18 +1115,46 @@ mod tests {
             Message::assistant(AssistantMessage::text("two")),
             Message::user("current"),
         ];
-        let result = compress_previous_text_turns(
-            phase_three(&source, 100),
-            &source,
-            50,
-            |candidate| {
-                if candidate.iter().any(|message| matches!(message, Message::User { content } if content.contains("User: reducing"))) { 40 } else { 100 }
-            },
-        );
+        let result = compress_previous_text_turns(phase_three(&source, 100), &source, 50, |_| 40);
 
         assert_eq!(result.compressed, 0);
         assert!(result.compression.is_empty());
         assert_eq!(result.messages.as_ref(), source);
+    }
+
+    #[test]
+    fn phase_three_accepts_a_nonreducing_prefix_when_the_batch_reduces() {
+        let source = vec![
+            Message::user("ok"),
+            Message::assistant(AssistantMessage::text("done")),
+            Message::user("large historical request"),
+            Message::assistant(AssistantMessage::text("large historical response")),
+            Message::user("current"),
+        ];
+        let result =
+            compress_previous_text_turns(phase_three(&source, 100), &source, 50, |candidate| {
+                match candidate
+                    .iter()
+                    .filter(|message| matches!(message, Message::Summary { .. }))
+                    .count()
+                {
+                    1 => 110,
+                    2 => 40,
+                    _ => 100,
+                }
+            });
+
+        assert_eq!(result.compressed, 2);
+        assert_eq!(result.estimated_tokens, 40);
+        assert_eq!(result.compression.folds.len(), 2);
+        assert!(matches!(result.messages[0], Message::Summary { .. }));
+        assert!(matches!(result.messages[1], Message::Summary { .. }));
+        assert_eq!(result.messages[2], Message::user("current"));
+
+        let no_gain = compress_previous_text_turns(phase_three(&source, 100), &source, 50, |_| 100);
+        assert_eq!(no_gain.compressed, 0);
+        assert!(no_gain.compression.is_empty());
+        assert_eq!(no_gain.messages.as_ref(), source);
     }
 
     #[test]

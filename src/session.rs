@@ -112,9 +112,23 @@ impl Session {
             .create(true)
             .open(&self.path)
             .with_context(|| format!("failed to open session {}", self.path.display()))?;
-        let line = serde_json::to_string(record)?;
-        writeln!(file, "{line}")
-            .with_context(|| format!("failed to write session {}", self.path.display()))?;
+        let previous_len = file
+            .metadata()
+            .with_context(|| format!("failed to inspect session {}", self.path.display()))?
+            .len();
+        let mut bytes = serde_json::to_vec(record)?;
+        bytes.push(b'\n');
+        if let Err(error) = file.write_all(&bytes) {
+            let write_error = anyhow::Error::new(error)
+                .context(format!("failed to write session {}", self.path.display()));
+            if let Err(rollback_error) = file.set_len(previous_len) {
+                return Err(write_error.context(format!(
+                    "also failed to roll back session {}: {rollback_error}",
+                    self.path.display()
+                )));
+            }
+            return Err(write_error);
+        }
         Ok(())
     }
 
@@ -222,10 +236,7 @@ impl LoadedSession {
                 },
                 Record::CompressionBatch { folds } => {
                     flush(&mut messages, &mut pending);
-                    let batch = CompressionBatch {
-                        folds: folds.clone(),
-                    };
-                    if let Ok(projected) = batch.projected(&messages) {
+                    if let Ok(projected) = CompressionBatch::project_folds(folds, &messages) {
                         messages = projected;
                     }
                 }
