@@ -4,6 +4,7 @@ use anyhow::Result;
 use common::*;
 use serde_json::{json, Value};
 
+use icode::compaction_archive::{ArchiveRecord, ArchiveStore};
 use icode::tools::{ToolContext, ToolRegistry};
 
 async fn run(
@@ -47,6 +48,68 @@ async fn read_file_numbers_lines_and_pages() {
     assert!(output.contains("2\ttwo"), "{output}");
     assert!(!output.contains("1\tone"), "{output}");
     assert!(output.contains("more lines"), "{output}");
+}
+
+#[tokio::test]
+async fn read_file_retrieves_an_archived_record_through_its_catalog() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let archive_root = directory.path().join("session archive");
+    std::fs::create_dir(&workspace).unwrap();
+    let store = ArchiveStore::with_root(&archive_root);
+    store
+        .archive_round(&[ArchiveRecord {
+            turn: 1,
+            round: 2,
+            sequence: 3,
+            tool: "read_file".into(),
+            created_at: "2026-11-05T14:20:00Z".into(),
+            kind: "group".into(),
+            group_id: "call_archived".into(),
+            session_id: "session-id".into(),
+            markdown: "## Tool result\n\narchived retrieval detail\n".into(),
+        }])
+        .unwrap();
+    let catalog_pointer = store.catalog_pointer_text().unwrap().unwrap();
+    let catalog_path = catalog_pointer
+        .split("; catalog: ")
+        .nth(1)
+        .unwrap()
+        .strip_suffix(" (contains each record's relative path).")
+        .unwrap();
+    let context = tool_context(&workspace);
+    let registry = registry();
+
+    let catalog = run(
+        &registry,
+        "read_file",
+        json!({"path": catalog_path}),
+        &context,
+    )
+    .await
+    .unwrap();
+    let catalog_line = catalog
+        .lines()
+        .find_map(|line| line.split_once('\t').map(|(_, value)| value))
+        .unwrap();
+    let entry: Value = serde_json::from_str(catalog_line).unwrap();
+    let relative_path = entry["relative_path"].as_str().unwrap();
+    let record_path = archive_root.join(relative_path);
+    let record = run(
+        &registry,
+        "read_file",
+        json!({"path": record_path}),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        catalog.contains("compactions/dropped/turn001/"),
+        "{catalog}"
+    );
+    assert!(record.contains("archived retrieval detail"), "{record}");
+    assert!(record.contains("<!-- end of record -->"), "{record}");
 }
 
 #[tokio::test]
