@@ -482,14 +482,27 @@ async fn stale_last_words_never_drops_new_current_tool_history() {
 }
 
 #[tokio::test]
-async fn compacts_and_immediately_retries_one_context_overflow() {
+async fn overflow_falls_back_to_historical_compression_when_last_words_is_invalid() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts_for_handler = attempts.clone();
-    let server = MockServer::new(move |_path, _body| {
-        if attempts_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-            context_overflow_response()
-        } else {
-            MockResponse::sse(&[&text_chunk("recovered"), &done_chunk("stop")])
+    let server = MockServer::new(move |_path, body| {
+        match attempts_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => context_overflow_response(),
+            1 | 2 => {
+                assert_eq!(body["stream"], false);
+                MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "too short"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+                    })
+                    .to_string(),
+                )
+            }
+            _ => MockResponse::sse(&[&text_chunk("recovered"), &done_chunk("stop")]),
         }
     });
     let directory = tempfile::tempdir().unwrap();
@@ -504,15 +517,25 @@ async fn compacts_and_immediately_retries_one_context_overflow() {
         Message::user(prior_user.clone()),
         Message::assistant(AssistantMessage::text("prior answer")),
         Message::user(current_user),
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![icode::model::ToolCall {
+                id: "call_current".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            ..AssistantMessage::default()
+        }),
+        Message::tool("call_current", "read_file", "current result"),
     ];
 
     let turn = agent.run(&mut messages, &sink).await.unwrap();
 
     assert_eq!(turn.text, "recovered");
     assert_eq!(turn.rounds, 1, "the retry is part of one model round");
-    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(turn.usage.total_tokens, 35);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
     let requests = server.requests();
-    assert_eq!(requests.len(), 2, "one failed request and one retry");
+    assert_eq!(requests.len(), 4, "overflow, two side calls, and one retry");
 
     let first_messages = requests[0]["messages"].as_array().unwrap();
     assert!(first_messages
@@ -524,7 +547,7 @@ async fn compacts_and_immediately_retries_one_context_overflow() {
             .is_some_and(|content| content.starts_with("[Earlier conversation summary]"))
     }));
 
-    let retry_messages = requests[1]["messages"].as_array().unwrap();
+    let retry_messages = requests[3]["messages"].as_array().unwrap();
     assert!(retry_messages.iter().any(|message| {
         message["content"]
             .as_str()

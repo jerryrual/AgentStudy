@@ -79,13 +79,6 @@ impl PhaseFourPrepareError {
     fn skipped(error: anyhow::Error, usage: Usage) -> Self {
         Self::Skipped(PhaseFourSkipped { error, usage })
     }
-
-    fn into_error(self) -> anyhow::Error {
-        match self {
-            Self::Skipped(skipped) => skipped.error,
-            Self::Fatal(error) => error,
-        }
-    }
 }
 
 impl ModelClient {
@@ -220,22 +213,30 @@ impl ModelClient {
             {
                 let retry = self.prepare_request(messages, tools, true)?;
                 if !phase_four_attempted && Self::phase_four_eligible(messages) {
-                    let (phase_four, phase_four_usage) = self
+                    match self
                         .prepare_phase_four_retry(messages, tools, &retry, sink)
                         .await
-                        .map_err(PhaseFourPrepareError::into_error)?;
-                    auxiliary_usage.add(phase_four_usage);
-                    sink.info(
-                        "model context overflow; compacting current tool history and retrying once",
-                    );
-                    let completion = self
-                        .complete_body(&phase_four.body, sink)
-                        .await
-                        .map_err(ClientError::into_error)?;
-                    return Ok(PersistentCompletion {
-                        completion,
-                        auxiliary_usage,
-                    });
+                    {
+                        Ok((phase_four, phase_four_usage)) => {
+                            auxiliary_usage.add(phase_four_usage);
+                            sink.info(
+                                "model context overflow; compacting current tool history and retrying once",
+                            );
+                            let completion = self
+                                .complete_body(&phase_four.body, sink)
+                                .await
+                                .map_err(ClientError::into_error)?;
+                            return Ok(PersistentCompletion {
+                                completion,
+                                auxiliary_usage,
+                            });
+                        }
+                        Err(PhaseFourPrepareError::Skipped(skipped)) => {
+                            auxiliary_usage.add(skipped.usage);
+                            sink.info(&format!("Last Words skipped: {:#}", skipped.error));
+                        }
+                        Err(PhaseFourPrepareError::Fatal(error)) => return Err(error),
+                    }
                 }
                 if retry.estimated_input >= prepared.estimated_input {
                     return Err(error);
