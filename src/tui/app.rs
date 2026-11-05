@@ -1,6 +1,7 @@
 //! TUI state and event handling.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -144,6 +145,7 @@ pub struct App {
     events: mpsc::UnboundedReceiver<UiEvent>,
     events_tx: mpsc::UnboundedSender<UiEvent>,
     cancel_handle: Option<tokio::task::JoinHandle<()>>,
+    persistence_gate: Option<Arc<AtomicBool>>,
     pub approver: Arc<dyn Approver>,
     pub asker: Arc<dyn Asker>,
     pub tools: Arc<ToolRegistry>,
@@ -209,6 +211,7 @@ impl App {
             events,
             events_tx,
             cancel_handle: None,
+            persistence_gate: None,
             approver,
             asker,
             tools: Arc::new(ToolRegistry::builtin()),
@@ -351,6 +354,7 @@ impl App {
                 ));
             }
             UiEvent::TurnFinished(result, messages, force_compression) => {
+                self.persistence_gate = None;
                 self.messages = messages;
                 self.running = false;
                 self.turn_started = None;
@@ -764,11 +768,13 @@ impl App {
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
+        let persistence_gate = Arc::new(AtomicBool::new(!self.unsaved_messages));
+        self.persistence_gate = Some(persistence_gate.clone());
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
             turn_id,
             session: self.session.clone(),
-            persistence_enabled: !self.unsaved_messages,
+            persistence_gate,
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -807,6 +813,9 @@ impl App {
     pub fn cancel(&mut self) {
         if !self.running {
             return;
+        }
+        if let Some(gate) = self.persistence_gate.take() {
+            gate.store(false, Ordering::SeqCst);
         }
         if let Some(handle) = self.cancel_handle.take() {
             handle.abort();
@@ -1373,7 +1382,7 @@ struct TuiSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     turn_id: u64,
     session: Session,
-    persistence_enabled: bool,
+    persistence_gate: Arc<AtomicBool>,
 }
 
 impl TuiSink {
@@ -1387,11 +1396,8 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
-        if !self.persistence_enabled {
-            return Ok(false);
-        }
-        self.session.append_compression_batch(batch)?;
-        Ok(true)
+        self.session
+            .append_compression_batch_if(batch, || self.persistence_gate.load(Ordering::SeqCst))
     }
 
     fn text_delta(&self, delta: &str) {
@@ -1552,7 +1558,7 @@ mod tests {
             tx,
             turn_id: 1,
             session,
-            persistence_enabled: false,
+            persistence_gate: Arc::new(AtomicBool::new(false)),
         };
 
         assert!(!sink

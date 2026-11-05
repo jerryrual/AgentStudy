@@ -121,7 +121,11 @@ impl Session {
         if let Err(error) = file.write_all(&bytes) {
             let write_error = anyhow::Error::new(error)
                 .context(format!("failed to write session {}", self.path.display()));
-            if let Err(rollback_error) = file.set_len(previous_len) {
+            let rollback = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .and_then(|handle| handle.set_len(previous_len));
+            if let Err(rollback_error) = rollback {
                 return Err(write_error.context(format!(
                     "also failed to roll back session {}: {rollback_error}",
                     self.path.display()
@@ -137,6 +141,28 @@ impl Session {
         self.append(&Record::CompressionBatch {
             folds: batch.folds.clone(),
         })
+    }
+
+    /// Append a batch only if its turn is still active after acquiring the append lock.
+    pub(crate) fn append_compression_batch_if<F>(
+        &self,
+        batch: &CompressionBatch,
+        should_append: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        if !should_append() {
+            return Ok(false);
+        }
+        self.append_unlocked(&Record::CompressionBatch {
+            folds: batch.folds.clone(),
+        })?;
+        Ok(true)
     }
 
     /// Reload this session after all append work from cloned handles completes.
@@ -1056,6 +1082,43 @@ mod tests {
             missing_user,
             vec![Message::assistant(AssistantMessage::text("leading"))]
         );
+    }
+
+    #[test]
+    fn disabled_turn_gate_prevents_a_late_batch_before_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_session = session.clone();
+        let writer_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            writer_session.append_compression_batch_if(
+                &CompressionBatch {
+                    folds: vec![CompressionFold {
+                        summary: "late".into(),
+                        compacted_messages: 1,
+                    }],
+                },
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    writer_gate.load(std::sync::atomic::Ordering::SeqCst)
+                },
+            )
+        });
+
+        entered_rx.recv().unwrap();
+        gate.store(false, std::sync::atomic::Ordering::SeqCst);
+        let loader_session = session.clone();
+        let loader = std::thread::spawn(move || loader_session.load_messages());
+        release_tx.send(()).unwrap();
+
+        assert!(!writer.join().unwrap().unwrap());
+        assert!(loader.join().unwrap().unwrap().is_empty());
+        assert_eq!(store.load(session.id()).unwrap().records.len(), 1);
     }
 
     #[test]
