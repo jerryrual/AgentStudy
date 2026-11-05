@@ -11,7 +11,7 @@
 | 流式回答 | SSE 增量解析，逐 token 渲染 | `src/model/sse.rs`、`client.rs` |
 | Markdown 渲染 | 标题、列表、行内代码、粗体、链接、代码块 | `src/markdown.rs` |
 | 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥；可选 `context_window` 派生 token 预算并按估算剩余上下文下调请求输出上限 | `src/config.rs`、`src/model/` |
-| 上下文裁剪（Phase 1 / 2 / 3 + 轮次后强制折叠） | 请求输入跨过派生触发阈值后，Phase 1 按从旧到新的顺序将已完成旧轮次的工具结果替换为确定性摘要；仅当仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍超过目标预算，Phase 3 才按从旧到新的顺序折叠已完成的历史轮次。Phase 1 / 2 仍仅作用于当次请求；Phase 3 批次会在 provider 调用前原子追加到 JSONL，失败则不调用 provider。成功轮次结束后，若最终一次模型调用报告的输入 token 严格超过派生 force 阈值，仍会持久化折叠一个最旧的先前已完成轮次，同时保留刚完成轮次和所有较新历史；原始 JSONL 记录仍为追加式审计历史，TUI 可见记录不因请求时折叠而改变 | `src/context_trim.rs`、`src/compaction.rs`、`src/model/client.rs` |
+| 上下文裁剪（Phase 1 / 2 / 3 + 轮次后强制折叠） | 请求输入跨过派生触发阈值后，Phase 1 按从旧到新的顺序将已完成旧轮次的工具结果替换为确定性摘要；仅当仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍超过目标预算，Phase 3 才按从旧到新的顺序折叠已完成的历史轮次。Phase 1 / 2 仍仅作用于当次请求；Phase 3 批次会在 provider 调用前原子追加到 JSONL，失败则不调用 provider。严格的 provider 上下文溢出会绕过常规触发阈值，强制运行现有 Phase 1–3，并仅在保守估算的输入上下文严格缩小时立即重试一次；provider 明示更小窗口、无法继续缩小或第二次仍溢出时直接返回错误。成功轮次结束后，若最终一次模型调用报告的输入 token 严格超过派生 force 阈值，仍会持久化折叠一个最旧的先前已完成轮次，同时保留刚完成轮次和所有较新历史；原始 JSONL 记录仍为追加式审计历史，TUI 可见记录不因请求时折叠而改变 | `src/context_trim.rs`、`src/compaction.rs`、`src/model/client.rs` |
 | 工具调用 | 多轮工具循环；纯只读工具批次并行执行，结果按调用顺序回填；超长输出截断 | `src/agent/` |
 | 文件读写 | `read_file`、`write_file`、`edit_file`（精确匹配替换） | `src/tools/fs.rs` |
 | 代码搜索 | `grep`（正则）、`glob`、`list_dir`，遵循 .gitignore | `src/tools/search.rs` |
@@ -25,7 +25,7 @@
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
 | 模型协议 | Chat Completions；核心无状态 Responses API（文本、推理摘要、本地函数工具、流式/非流式） | `src/model/` |
-| 重试 | 429/5xx/transport 指数退避重试 | `src/model/client.rs` |
+| 重试 | 429/5xx/transport 指数退避重试；严格的上下文溢出在强制 Phase 1–3 严格降低输入估算后零延迟重试一次，且不占用 agent round | `src/model/client.rs` |
 
 ## 尚未移植
 
@@ -33,7 +33,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 上下文溢出后的压缩重试、当前轮次丢弃，以及 Last Words。请求时 Phase 3 已在 provider 调用前持久化；Phase 1 / 2 仍是仅供单次请求使用的投影。轮次结束后的 force 路径仍会持久化折叠一个最旧的先前已完成轮次，但尚无上游的压缩块检索、当前轮次裁剪或 Last Words 状态。
+1. 当前轮次丢弃与 Last Words。上下文溢出后的现有 Phase 1–3 压缩重试已实现：严格识别 provider 溢出后重建同一逻辑调用，并仅在保守输入估算严格缩小时立即重试一次，Phase 3 仍在调用前持久化；Phase 1 / 2 仍只作用于当次请求。轮次结束后的 force 路径仍会持久化折叠一个最旧的先前已完成轮次，但尚无上游的压缩块检索、当前轮次裁剪或 Last Words 状态。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 

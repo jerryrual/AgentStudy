@@ -1,6 +1,6 @@
 //! OpenAI-compatible chat-completions client with SSE streaming and retries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -36,6 +36,7 @@ pub struct ModelClient {
 struct PreparedRequest {
     body: Value,
     compression: crate::compaction::CompressionBatch,
+    estimated_input: u32,
 }
 
 impl ModelClient {
@@ -120,7 +121,9 @@ impl ModelClient {
         sink: &dyn EventSink,
     ) -> Result<Completion> {
         let body = self.request_body(messages, tools)?;
-        self.complete_body(&body, sink).await
+        self.complete_body(&body, sink)
+            .await
+            .map_err(ClientError::into_error)
     }
 
     /// Complete an agent request with atomic Phase 3 persistence metadata.
@@ -130,22 +133,63 @@ impl ModelClient {
         tools: &[ToolDef],
         sink: &dyn EventSink,
     ) -> Result<Completion> {
-        let prepared = self.prepare_request(messages, tools)?;
-        if !prepared.compression.is_empty() {
-            let projected = prepared.compression.projected(messages)?;
-            if sink.persist_compression(&prepared.compression)? {
-                *messages = projected;
+        let prepared = self.prepare_request(messages, tools, false)?;
+        Self::persist_prepared_compression(messages, &prepared.compression, sink)?;
+        match self.complete_body(&prepared.body, sink).await {
+            Ok(completion) => Ok(completion),
+            Err(ClientError::ContextOverflow { error, named_limit })
+                if self.can_retry_context_overflow(named_limit) =>
+            {
+                let retry = self.prepare_request(messages, tools, true)?;
+                if retry.estimated_input >= prepared.estimated_input {
+                    return Err(error);
+                }
+                sink.info("model context overflow; compacting and retrying once");
+                Self::persist_prepared_compression(messages, &retry.compression, sink)?;
+                self.complete_body(&retry.body, sink)
+                    .await
+                    .map_err(ClientError::into_error)
             }
+            Err(error) => Err(error.into_error()),
         }
-        self.complete_body(&prepared.body, sink).await
     }
 
-    async fn complete_body(&self, body: &Value, sink: &dyn EventSink) -> Result<Completion> {
+    fn persist_prepared_compression(
+        messages: &mut Vec<Message>,
+        compression: &crate::compaction::CompressionBatch,
+        sink: &dyn EventSink,
+    ) -> Result<()> {
+        if compression.is_empty() {
+            return Ok(());
+        }
+        let projected = compression.projected(messages)?;
+        if sink.persist_compression(compression)? {
+            *messages = projected;
+        }
+        Ok(())
+    }
+
+    fn can_retry_context_overflow(&self, named_limit: Option<u32>) -> bool {
+        let Some((context_window, max_tokens)) = self.context_window.zip(self.max_tokens) else {
+            return false;
+        };
+        if crate::context_budget::ContextBudget::derive(context_window, max_tokens).is_none() {
+            return false;
+        }
+        named_limit.is_none_or(|limit| limit >= context_window)
+    }
+
+    async fn complete_body(
+        &self,
+        body: &Value,
+        sink: &dyn EventSink,
+    ) -> std::result::Result<Completion, ClientError> {
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             match self.send_once(body, sink).await {
                 Ok(completion) => return Ok(completion),
-                Err(ClientError::Fatal(error)) => return Err(error),
+                Err(error @ ClientError::ContextOverflow { .. }) => return Err(error),
+                Err(ClientError::Fatal(error)) => return Err(ClientError::Fatal(error)),
                 Err(ClientError::Retryable(error)) => {
                     last_error = Some(error);
                     if attempt + 1 < MAX_ATTEMPTS {
@@ -163,15 +207,22 @@ impl ModelClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("model request failed")))
+        Err(ClientError::Retryable(
+            last_error.unwrap_or_else(|| anyhow!("model request failed")),
+        ))
     }
 
     /// Build the provider-specific request and apply its context output cap.
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
-        Ok(self.prepare_request(messages, tools)?.body)
+        Ok(self.prepare_request(messages, tools, false)?.body)
     }
 
-    fn prepare_request(&self, messages: &[Message], tools: &[ToolDef]) -> Result<PreparedRequest> {
+    fn prepare_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        force_compaction: bool,
+    ) -> Result<PreparedRequest> {
         let context_budget =
             self.context_window
                 .zip(self.max_tokens)
@@ -182,11 +233,16 @@ impl ModelClient {
             Some(budget) => {
                 let phase1_result = crate::context_trim::trim_previous_tool_results(
                     messages,
-                    budget.trigger_tokens,
+                    if force_compaction {
+                        0
+                    } else {
+                        budget.trigger_tokens
+                    },
                     budget.target_tokens,
                     |candidate| self.estimated_request_tokens(candidate, tools),
                 );
-                let phase1_triggered = phase1_result.summarized > 0
+                let phase1_triggered = force_compaction
+                    || phase1_result.summarized > 0
                     || phase1_result.estimated_tokens >= budget.trigger_tokens;
                 let phase2_result = if phase1_triggered {
                     crate::context_trim::remove_previous_tool_groups(
@@ -251,7 +307,11 @@ impl ModelClient {
             body
         };
         self.apply_context_budget(&mut body, estimated_input)?;
-        Ok(PreparedRequest { body, compression })
+        Ok(PreparedRequest {
+            body,
+            compression,
+            estimated_input,
+        })
     }
 
     /// Conservatively estimate the semantic history and tools sent by this API style.
@@ -336,12 +396,19 @@ impl ModelClient {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("<failed to read error body: {error}>"));
+            let overflow = context_overflow_details(status, &text);
             let body = truncate(&text, MAX_ERROR_BODY);
             let message = format!(
                 "model request failed with HTTP {}: {}",
                 status.as_u16(),
                 body.trim()
             );
+            if let Some(named_limit) = overflow {
+                return Err(ClientError::ContextOverflow {
+                    error: anyhow!(message),
+                    named_limit,
+                });
+            }
             if is_retryable_status(status) {
                 return Err(ClientError::Retryable(anyhow!(message)));
             }
@@ -477,6 +544,117 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn context_overflow_details(status: StatusCode, text: &str) -> Option<Option<u32>> {
+    if status == StatusCode::PAYLOAD_TOO_LARGE
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        return None;
+    }
+    let payload = serde_json::from_str::<Value>(text).ok();
+    let codes = [
+        payload
+            .as_ref()
+            .and_then(|value| value.pointer("/error/code")),
+        payload
+            .as_ref()
+            .and_then(|value| value.pointer("/error/innererror/code")),
+    ];
+    let codes: Vec<_> = codes
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if codes.iter().any(|code| code == "request_too_large") {
+        return None;
+    }
+    let message = payload
+        .as_ref()
+        .and_then(|value| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or(text);
+    let code_names_overflow = codes.iter().any(|code| {
+        matches!(
+            code.as_str(),
+            "context_length_exceeded" | "model_context_window_exceeded"
+        )
+    });
+    if !code_names_overflow && !text_names_context_overflow(text) {
+        return None;
+    }
+    Some(named_context_limit(message))
+}
+
+fn text_names_context_overflow(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    const NON_OVERFLOW: &[&str] = &[
+        "throttl",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "please wait",
+        "per sec",
+        "per min",
+        "per hour",
+        "per day",
+        "quota",
+    ];
+    if NON_OVERFLOW.iter().any(|phrase| text.contains(phrase)) {
+        return false;
+    }
+    const OVERFLOW: &[&str] = &[
+        "context_length_exceeded",
+        "context window",
+        "maximum context length",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "maximum prompt length is ",
+        "reduce the length of the messages",
+        "exceeds the available context size",
+        "greater than the context length",
+        "exceeded model token limit",
+    ];
+    OVERFLOW.iter().any(|pattern| text.contains(pattern))
+        || text.contains("input token count") && text.contains("exceeds the maximum")
+}
+
+fn named_context_limit(text: &str) -> Option<u32> {
+    let text = text.to_ascii_lowercase();
+    let mut limits = BTreeSet::new();
+    for marker in [
+        "maximum context length is ",
+        " tokens > ",
+        "maximum number of tokens allowed (",
+        "maximum prompt length is ",
+        "available context size (",
+        "n_ctx: ",
+        "exceeded model token limit: ",
+    ] {
+        let mut rest = text.as_str();
+        while let Some(index) = rest.find(marker) {
+            let tail = &rest[index + marker.len()..];
+            let number: String = tail
+                .chars()
+                .take_while(|character| character.is_ascii_digit() || *character == ',')
+                .filter(|character| *character != ',')
+                .collect();
+            if let Ok(limit) = number.parse::<u32>() {
+                if limit > 0 {
+                    limits.insert(limit);
+                }
+            }
+            rest = tail;
+        }
+    }
+    let mut limits = limits.into_iter();
+    match (limits.next(), limits.next()) {
+        (Some(limit), None) => Some(limit),
+        _ => None,
+    }
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -491,7 +669,21 @@ fn truncate(text: &str, limit: usize) -> String {
 #[derive(Debug)]
 enum ClientError {
     Retryable(anyhow::Error),
+    ContextOverflow {
+        error: anyhow::Error,
+        named_limit: Option<u32>,
+    },
     Fatal(anyhow::Error),
+}
+
+impl ClientError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Retryable(error) | Self::ContextOverflow { error, .. } | Self::Fatal(error) => {
+                error
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -723,6 +915,133 @@ mod tests {
         profile.context_window = Some(2_000);
         profile.max_tokens = Some(500);
         ModelClient::from_profile(&profile).unwrap()
+    }
+
+    #[test]
+    fn context_overflow_classification_uses_codes_messages_and_named_limits() {
+        let coded = r#"{"error":{"code":"context_length_exceeded","message":"maximum context length is 4,096 tokens"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, coded),
+            Some(Some(4_096))
+        );
+        let message_only = r#"{"error":{"type":"invalid_request_error","message":"Please reduce the length of the messages."}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, message_only),
+            Some(None)
+        );
+        let long = format!(
+            r#"{{"error":{{"message":"{} maximum context length is 8192 tokens"}}}}"#,
+            "x".repeat(MAX_ERROR_BODY + 100)
+        );
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, &long),
+            Some(Some(8_192))
+        );
+    }
+
+    #[test]
+    fn context_overflow_classification_vetoes_transient_and_payload_failures() {
+        let overflow =
+            r#"{"error":{"code":"context_length_exceeded","message":"maximum context length"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::TOO_MANY_REQUESTS, overflow),
+            None
+        );
+        assert_eq!(
+            context_overflow_details(StatusCode::INTERNAL_SERVER_ERROR, overflow),
+            None
+        );
+        assert_eq!(
+            context_overflow_details(StatusCode::PAYLOAD_TOO_LARGE, overflow),
+            None
+        );
+        let quota = r#"{"error":{"message":"too many tokens per minute quota"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, quota),
+            None
+        );
+        let rate_code = r#"{"error":{"code":"rate_limit_exceeded","message":"Request exceeds the context window"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, rate_code),
+            None
+        );
+        let explicit_overflow = r#"{"error":{"code":"context_length_exceeded","message":"quota exceeded for tokens per minute"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, explicit_overflow),
+            Some(None)
+        );
+        let payload = r#"{"error":{"code":"request_too_large","message":"context window"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, payload),
+            None
+        );
+    }
+
+    #[test]
+    fn overflow_resend_requires_a_usable_matching_context_window() {
+        let mut client = budget_client(ApiStyle::Chat);
+        assert!(client.can_retry_context_overflow(None));
+        assert!(client.can_retry_context_overflow(Some(2_000)));
+        assert!(!client.can_retry_context_overflow(Some(1_999)));
+        client.context_window = None;
+        assert!(!client.can_retry_context_overflow(None));
+    }
+
+    #[test]
+    fn forced_overflow_projection_runs_below_the_normal_trigger() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = vec![
+            Message::user("old turn"),
+            tool_call_message("call_old", "old_tool"),
+            Message::tool("call_old", "old_tool", "x".repeat(200)),
+            Message::user("current turn"),
+        ];
+        let budget = crate::context_budget::ContextBudget::derive(2_000, 500).unwrap();
+        let estimated = client.estimated_request_tokens(&messages, &[]);
+        assert!(estimated > budget.target_tokens);
+        assert!(estimated < budget.trigger_tokens);
+
+        let normal = client.prepare_request(&messages, &[], false).unwrap();
+        let forced = client.prepare_request(&messages, &[], true).unwrap();
+
+        assert_eq!(normal.body["messages"][2]["content"], "x".repeat(200));
+        assert_ne!(forced.body["messages"], normal.body["messages"]);
+        assert!(forced.estimated_input < normal.estimated_input);
+        assert!(!forced.body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["tool_call_id"] == "call_old"));
+    }
+
+    #[test]
+    fn forced_overflow_phase3_can_commit_its_projection() {
+        let mut client = budget_client(ApiStyle::Chat);
+        client.context_window = Some(140_000);
+        client.max_tokens = Some(10_000);
+        let mut messages = vec![
+            Message::user(format!("prior turn {}", "historical detail ".repeat(4_500))),
+            Message::assistant(AssistantMessage::text("prior answer")),
+            Message::user("current request"),
+        ];
+        let normal = client.prepare_request(&messages, &[], false).unwrap();
+        let forced = client.prepare_request(&messages, &[], true).unwrap();
+        assert!(normal.compression.is_empty());
+        assert_eq!(forced.compression.folds.len(), 1);
+        assert!(forced.estimated_input < normal.estimated_input);
+        let sink = PersistSink {
+            committed: true,
+            calls: AtomicUsize::new(0),
+        };
+
+        ModelClient::persist_prepared_compression(&mut messages, &forced.compression, &sink)
+            .unwrap();
+
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(messages.first(), Some(Message::Summary { .. })));
+        assert!(
+            matches!(messages.last(), Some(Message::User { content }) if content == "current request")
+        );
     }
 
     #[test]
@@ -1013,7 +1332,7 @@ mod tests {
         for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
             let client = phase2_client(api_style);
             let messages = phase2_messages(api_style == ApiStyle::Responses);
-            let prepared = client.prepare_request(&messages, &[]).unwrap();
+            let prepared = client.prepare_request(&messages, &[], false).unwrap();
 
             assert!(prepared.compression.is_empty());
         }
@@ -1026,7 +1345,7 @@ mod tests {
             client.retry_base = Duration::from_millis(1);
             let mut messages = phase3_messages(false);
             let original = messages.clone();
-            let prepared = client.prepare_request(&messages, &[]).unwrap();
+            let prepared = client.prepare_request(&messages, &[], false).unwrap();
             let projected = prepared.compression.projected(&messages).unwrap();
             assert!(!prepared.compression.is_empty());
             let sink = PersistSink {
@@ -1064,7 +1383,7 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
 
-        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[], false).unwrap();
         assert_eq!(prepared.compression.folds.len(), 1);
         assert_eq!(prepared.compression.folds[0].compacted_messages, 2);
         let first = prepared.body;
@@ -1114,7 +1433,7 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
 
-        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[], false).unwrap();
         assert_eq!(prepared.compression.folds.len(), 1);
         assert_eq!(prepared.compression.folds[0].compacted_messages, 2);
         let first = prepared.body;
@@ -1203,7 +1522,7 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
 
-        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[], false).unwrap();
         assert!(prepared.compression.is_empty());
         let body = prepared.body;
 
@@ -1252,7 +1571,7 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
 
-        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[], false).unwrap();
         assert!(prepared.compression.is_empty());
         let body = prepared.body;
 

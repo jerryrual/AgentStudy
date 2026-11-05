@@ -1,8 +1,15 @@
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use common::{MockResponse, MockServer, RecordingSink};
+use icode::agent::{Agent, AgentKind, AgentOptions};
 use icode::config::{ApiStyle, ModelProfile};
+use icode::interaction::{AllowAll, NoAsker};
 use icode::model::{AssistantMessage, Message, ModelClient, ToolCall, ToolDef};
+use icode::tools::ToolRegistry;
 use serde_json::json;
 
 fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
@@ -432,4 +439,123 @@ async fn responses_rejects_function_calls_from_incomplete_output() {
         error.to_string().contains("incomplete response"),
         "{error:#}"
     );
+}
+
+#[tokio::test]
+async fn agent_recovers_once_from_responses_context_overflow_with_stateless_summary() {
+    const CURRENT_USER: &str = "Answer the current question exactly.";
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_server = attempts.clone();
+    let server = MockServer::new(move |path, _body| {
+        assert_eq!(path, "/v1/responses");
+        if attempts_for_server.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::json(
+                400,
+                &json!({
+                    "error": {
+                        "message": "This model's maximum context length was exceeded.",
+                        "type": "invalid_request_error",
+                        "param": "input",
+                        "code": "context_length_exceeded"
+                    }
+                })
+                .to_string(),
+            )
+        } else {
+            MockResponse::json(
+                200,
+                &json!({
+                    "id": "resp_recovered",
+                    "status": "completed",
+                    "error": null,
+                    "output": [{
+                        "id": "msg_recovered",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Recovered answer.",
+                            "annotations": []
+                        }]
+                    }],
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 3,
+                        "total_tokens": 83
+                    }
+                })
+                .to_string(),
+            )
+        }
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.context_window = Some(20_000);
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new(
+        Arc::new(client),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        AgentOptions {
+            kind: AgentKind::Qa,
+            cwd: directory.path().to_path_buf(),
+            max_rounds: 2,
+            tool_timeout: Duration::from_secs(5),
+        },
+    );
+    let old_user = format!("old completed text turn: {}", "x".repeat(5_000));
+    let mut messages = vec![
+        Message::user(old_user.clone()),
+        Message::assistant(AssistantMessage::text("old completed answer")),
+        Message::user(CURRENT_USER),
+    ];
+
+    let turn = agent
+        .run(&mut messages, &RecordingSink::default())
+        .await
+        .unwrap();
+
+    assert_eq!(turn.text, "Recovered answer.");
+    assert_eq!(turn.rounds, 1, "the transport retry is one agent round");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(server.request_count(), 2);
+
+    let requests = server.requests();
+    let first_input = requests[0]["input"].as_array().unwrap();
+    assert!(first_input.iter().any(|item| {
+        item.pointer("/content/0/text")
+            .and_then(|text| text.as_str())
+            == Some(old_user.as_str())
+    }));
+    assert!(!first_input.iter().any(|item| {
+        item.pointer("/content/0/text")
+            .and_then(|text| text.as_str())
+            .is_some_and(|text| text.starts_with("[Earlier conversation summary]\n"))
+    }));
+
+    let retry = &requests[1];
+    assert_eq!(retry["store"], false);
+    assert!(retry.get("previous_response_id").is_none());
+    let retry_input = retry["input"].as_array().unwrap();
+    assert!(retry_input.iter().any(|item| {
+        item["role"] == "user"
+            && item
+                .pointer("/content/0/text")
+                .and_then(|text| text.as_str())
+                .is_some_and(|text| {
+                    text.starts_with(
+                        "[Earlier conversation summary]\nUser: old completed text turn:",
+                    )
+                })
+    }));
+    assert!(retry_input.iter().any(|item| {
+        item["role"] == "user"
+            && item
+                .pointer("/content/0/text")
+                .and_then(|text| text.as_str())
+                == Some(CURRENT_USER)
+    }));
 }
