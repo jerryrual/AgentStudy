@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::compaction::{CompressionBatch, CompressionFold};
+use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
 use crate::model::{AssistantMessage, Message, ToolCall};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,12 +61,15 @@ pub enum Record {
     CompressionBatch {
         folds: Vec<CompressionFold>,
     },
+    ContextProjection {
+        projection: ContextProjection,
+    },
 }
 
 impl Record {
     pub fn from_message(message: &Message) -> Option<Self> {
         match message {
-            Message::System { .. } | Message::Summary { .. } => None,
+            Message::System { .. } | Message::Summary { .. } | Message::LastWords { .. } => None,
             Message::User { content } => Some(Self::User {
                 text: content.clone(),
             }),
@@ -161,6 +164,41 @@ impl Session {
         }
         self.append_unlocked(&Record::CompressionBatch {
             folds: batch.folds.clone(),
+        })?;
+        Ok(true)
+    }
+
+    /// Append historical folds and a current-turn replacement as one JSONL record.
+    pub fn append_context_projection(&self, projection: &ContextProjection) -> Result<()> {
+        if projection.is_empty() {
+            anyhow::bail!("cannot append an empty context projection");
+        }
+        self.append_context_projection_if(projection, || true)
+            .and_then(|appended| {
+                appended
+                    .then_some(())
+                    .ok_or_else(|| anyhow::anyhow!("context projection append was declined"))
+            })
+    }
+
+    /// Append a projection only if its owning turn remains active under the append lock.
+    pub(crate) fn append_context_projection_if<F>(
+        &self,
+        projection: &ContextProjection,
+        should_append: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        if !should_append() {
+            return Ok(false);
+        }
+        self.append_unlocked(&Record::ContextProjection {
+            projection: projection.clone(),
         })?;
         Ok(true)
     }
@@ -264,6 +302,15 @@ impl LoadedSession {
                     flush(&mut messages, &mut pending);
                     if let Ok(projected) = CompressionBatch::project_folds(folds, &messages) {
                         messages = projected;
+                    }
+                }
+                Record::ContextProjection { projection } => {
+                    let mut candidate_messages = messages.clone();
+                    let mut candidate_pending = pending.clone();
+                    flush(&mut candidate_messages, &mut candidate_pending);
+                    if let Ok(projected) = projection.projected(&candidate_messages) {
+                        messages = projected;
+                        pending = candidate_pending;
                     }
                 }
                 Record::Meta { .. } | Record::Usage { .. } => {}
@@ -1192,6 +1239,176 @@ mod tests {
         assert_eq!(written.lines().count(), 4, "assistant and both results now");
         assert!(written.contains("call_1"));
         assert!(written.contains("call_2"));
+    }
+
+    #[test]
+    fn context_projection_round_trip_replaces_only_the_latest_tool_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append(&Record::User {
+                text: "prior turn".into(),
+            })
+            .unwrap();
+        session.append(&assistant_record("prior answer")).unwrap();
+        session
+            .append(&Record::User {
+                text: "current task".into(),
+            })
+            .unwrap();
+        session
+            .append(&Record::Assistant {
+                content: Some("inline progress".into()),
+                reasoning: Some("private".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: vec![serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": "{}"
+                })],
+            })
+            .unwrap();
+        session
+            .append(&Record::Tool {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                content: "large result".into(),
+            })
+            .unwrap();
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "## Task\nCurrent task\n## Progress\nRead the file\n## Next\nContinue".into(),
+                compacted_messages: 2,
+            }),
+        };
+
+        session.append_context_projection(&projection).unwrap();
+        let loaded = store.load(session.id()).unwrap();
+
+        assert!(matches!(
+            loaded.records.last(),
+            Some(Record::ContextProjection { projection: stored }) if stored == &projection
+        ));
+        assert_eq!(loaded.messages().len(), 4);
+        assert!(
+            matches!(loaded.messages()[0], Message::User { ref content } if content == "prior turn")
+        );
+        assert!(matches!(loaded.messages()[1], Message::Assistant { .. }));
+        assert!(
+            matches!(loaded.messages()[2], Message::User { ref content } if content == "current task")
+        );
+        assert!(matches!(loaded.messages()[3], Message::LastWords { .. }));
+    }
+
+    #[test]
+    fn corrupt_context_projection_does_not_discard_unknown_history() {
+        let records = vec![
+            Record::User {
+                text: "current task".into(),
+            },
+            Record::Assistant {
+                content: None,
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: Vec::new(),
+            },
+            Record::Tool {
+                call_id: "call_1".into(),
+                name: "grep".into(),
+                content: "result".into(),
+            },
+            Record::ContextProjection {
+                projection: ContextProjection {
+                    historical_folds: Vec::new(),
+                    current_turn: Some(crate::compaction::CurrentTurnFold {
+                        note: "fresh note".into(),
+                        compacted_messages: 1,
+                    }),
+                },
+            },
+        ];
+
+        let messages = loaded(records).messages();
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[1], Message::Assistant { .. }));
+        assert!(matches!(messages[2], Message::Tool { .. }));
+    }
+
+    #[test]
+    fn corrupt_projection_preserves_pending_tool_for_a_later_result() {
+        let records = vec![
+            Record::User {
+                text: "current task".into(),
+            },
+            Record::Assistant {
+                content: None,
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: Vec::new(),
+            },
+            Record::ContextProjection {
+                projection: ContextProjection {
+                    historical_folds: Vec::new(),
+                    current_turn: Some(crate::compaction::CurrentTurnFold {
+                        note: "fresh note".into(),
+                        compacted_messages: 1,
+                    }),
+                },
+            },
+            Record::Tool {
+                call_id: "call_1".into(),
+                name: "grep".into(),
+                content: "real result".into(),
+            },
+        ];
+
+        let messages = loaded(records).messages();
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[2],
+            Message::Tool { content, .. } if content == "real result"
+        ));
+    }
+
+    #[test]
+    fn context_projection_gate_declines_without_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let projection = ContextProjection {
+            historical_folds: vec![CompressionFold {
+                summary: "old".into(),
+                compacted_messages: 2,
+            }],
+            current_turn: None,
+        };
+
+        assert!(!session
+            .append_context_projection_if(&projection, || false)
+            .unwrap());
+        assert!(store
+            .load(session.id())
+            .unwrap()
+            .records
+            .iter()
+            .all(|record| !matches!(record, Record::ContextProjection { .. })));
     }
 
     #[test]
