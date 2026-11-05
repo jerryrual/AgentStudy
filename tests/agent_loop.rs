@@ -7,7 +7,7 @@ use std::time::Duration;
 use common::*;
 use icode::agent::{Agent, AgentKind, AgentOptions};
 use icode::interaction::{AllowAll, ApprovalDecision, DenyAll, NoAsker, ScriptedApprover};
-use icode::model::{Message, ModelClient};
+use icode::model::{AssistantMessage, Message, ModelClient};
 use icode::tools::ToolRegistry;
 
 fn agent_options(cwd: PathBuf, max_rounds: usize) -> AgentOptions {
@@ -31,6 +31,27 @@ fn build_agent(
         approver,
         Arc::new(NoAsker),
         agent_options(cwd.to_path_buf(), 6),
+    )
+}
+
+fn build_context_limited_agent(server: &MockServer, cwd: &std::path::Path) -> Agent {
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(140_000);
+    profile.max_tokens = Some(10_000);
+    let client = ModelClient::from_profile(&profile).unwrap();
+    Agent::new(
+        Arc::new(client),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        agent_options(cwd.to_path_buf(), 6),
+    )
+}
+
+fn context_overflow_response() -> MockResponse {
+    MockResponse::json(
+        400,
+        r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 140000 tokens."}}"#,
     )
 }
 
@@ -241,6 +262,131 @@ async fn retries_transient_failures() {
     assert_eq!(turn.text, "recovered");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(sink.events().iter().any(|event| event.contains("retrying")));
+}
+
+#[tokio::test]
+async fn compacts_and_immediately_retries_one_context_overflow() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_handler = attempts.clone();
+    let server = MockServer::new(move |_path, _body| {
+        if attempts_for_handler.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            context_overflow_response()
+        } else {
+            MockResponse::sse(&[&text_chunk("recovered"), &done_chunk("stop")])
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let agent = build_context_limited_agent(&server, directory.path());
+    let sink = RecordingSink::default();
+    let prior_user = format!(
+        "prior completed turn {}",
+        "historical detail ".repeat(4_500)
+    );
+    let current_user = "keep this current request byte-for-byte";
+    let mut messages = vec![
+        Message::user(prior_user.clone()),
+        Message::assistant(AssistantMessage::text("prior answer")),
+        Message::user(current_user),
+    ];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+
+    assert_eq!(turn.text, "recovered");
+    assert_eq!(turn.rounds, 1, "the retry is part of one model round");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "one failed request and one retry");
+
+    let first_messages = requests[0]["messages"].as_array().unwrap();
+    assert!(first_messages
+        .iter()
+        .any(|message| message["content"] == prior_user));
+    assert!(!first_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("[Earlier conversation summary]"))
+    }));
+
+    let retry_messages = requests[1]["messages"].as_array().unwrap();
+    assert!(retry_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("[Earlier conversation summary]"))
+    }));
+    assert!(!retry_messages
+        .iter()
+        .any(|message| message["content"] == prior_user));
+    assert_eq!(
+        retry_messages
+            .iter()
+            .filter(|message| message["role"] == "user" && message["content"] == current_user)
+            .count(),
+        1,
+        "the current user message is unchanged"
+    );
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| matches!(message, Message::Assistant { message } if message.content.as_deref() == Some("recovered")))
+            .count(),
+        1,
+        "the successful assistant response is appended once"
+    );
+    let events = sink.events();
+    assert!(events
+        .iter()
+        .any(|event| event == "info:model context overflow; compacting and retrying once"));
+    assert!(!events.iter().any(|event| event.contains("retrying in")));
+}
+
+#[tokio::test]
+async fn fails_after_a_second_context_overflow() {
+    let server = MockServer::new(|_path, _body| context_overflow_response());
+    let directory = tempfile::tempdir().unwrap();
+    let agent = build_context_limited_agent(&server, directory.path());
+    let sink = RecordingSink::default();
+    let prior_user = format!(
+        "prior completed turn {}",
+        "historical detail ".repeat(4_500)
+    );
+    let mut messages = vec![
+        Message::user(prior_user),
+        Message::assistant(AssistantMessage::text("prior answer")),
+        Message::user("current request"),
+    ];
+
+    let error = agent.run(&mut messages, &sink).await.unwrap_err();
+
+    assert_eq!(
+        server.request_count(),
+        2,
+        "only one recovery retry is allowed"
+    );
+    assert!(
+        error.to_string().contains("context_length_exceeded"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn does_not_retry_context_overflow_without_a_smaller_projection() {
+    let server = MockServer::new(|_path, _body| context_overflow_response());
+    let directory = tempfile::tempdir().unwrap();
+    let agent = build_context_limited_agent(&server, directory.path());
+    let sink = RecordingSink::default();
+    let mut messages = vec![Message::user("only the current request")];
+
+    let error = agent.run(&mut messages, &sink).await.unwrap_err();
+
+    assert_eq!(server.request_count(), 1);
+    assert!(
+        error.to_string().contains("context_length_exceeded"),
+        "{error}"
+    );
+    assert!(!sink
+        .events()
+        .iter()
+        .any(|event| event.contains("compacting and retrying")));
 }
 
 #[tokio::test]
