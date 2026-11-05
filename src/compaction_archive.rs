@@ -6,6 +6,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +22,7 @@ const RECORD_TERMINATOR: &str = "<!-- end of record -->\n";
 const CATALOG_RELATIVE_PATH: &str = "compactions/dropped/catalog.jsonl";
 const RECORD_ID_ATTEMPTS: usize = 64;
 static RECORD_NONCE: AtomicU64 = AtomicU64::new(0);
+static ARCHIVE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogRecord {
@@ -37,6 +39,35 @@ pub struct CatalogRecord {
 
 fn default_kind() -> String {
     "group".into()
+}
+
+fn catalog_record_from_value(value: &serde_json::Value) -> Option<CatalogRecord> {
+    let record_id = value.get("record_id")?.as_str()?.to_string();
+    let relative_path = value.get("relative_path")?.as_str()?.to_string();
+    let turn = value.get("turn")?.as_u64()?;
+    let round = value.get("round")?.as_u64()?;
+    let tool = value.get("tool")?.as_str()?.to_string();
+    let bytes = value.get("bytes")?.as_u64()?;
+    let created_at = value.get("created_at")?.as_str()?.to_string();
+    if record_id.is_empty() || !safe_record_relative_path(Path::new(&relative_path)) {
+        return None;
+    }
+    let kind = value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("group")
+        .to_string();
+    Some(CatalogRecord {
+        record_id,
+        relative_path,
+        turn,
+        round,
+        tool,
+        bytes,
+        created_at,
+        kind,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -68,15 +99,47 @@ pub struct ArchiveState {
 #[derive(Debug, Clone)]
 pub struct ArchiveStore {
     root: PathBuf,
+    catalog_lock: Arc<Mutex<()>>,
     record_cap: usize,
     round_cap: usize,
     session_quota: u64,
 }
 
+fn archive_lock(root: &Path) -> Arc<Mutex<()>> {
+    let absolute = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(root)
+    };
+    let key = absolute.canonicalize().unwrap_or_else(|_| {
+        absolute
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .and_then(|parent| absolute.file_name().map(|name| parent.join(name)))
+            .unwrap_or(absolute)
+    });
+    let registry = ARCHIVE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 impl ArchiveStore {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let catalog_lock = archive_lock(&root);
         Self {
-            root: root.into(),
+            root,
+            catalog_lock,
             record_cap: PER_RECORD_CAP_BYTES,
             round_cap: PER_ROUND_CAP_BYTES,
             session_quota: PER_SESSION_QUOTA_BYTES,
@@ -85,6 +148,14 @@ impl ArchiveStore {
 
     /// Rebuild derived manifests and return the catalog-authoritative live set.
     pub fn reconcile(&self) -> Result<ArchiveState> {
+        let _guard = self
+            .catalog_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.reconcile_unlocked()
+    }
+
+    fn reconcile_unlocked(&self) -> Result<ArchiveState> {
         match std::fs::symlink_metadata(&self.root) {
             Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
             }
@@ -101,8 +172,8 @@ impl ArchiveStore {
             Ok(true) => {}
             Ok(false) | Err(_) => return Ok(ArchiveState::default()),
         }
-        let mut records = match self.read_live_catalog() {
-            Ok(records) => records,
+        let (mut records, catalog_safe_for_cleanup) = match self.read_live_catalog() {
+            Ok(replay) => replay,
             Err(_) => return Ok(ArchiveState::default()),
         };
         let mut available = HashSet::new();
@@ -124,9 +195,9 @@ impl ArchiveStore {
                 available.insert(record.relative_path.clone());
             }
         }
-        if self.delete_owned_orphans(&records).is_err()
-            || self.rebuild_manifests(&records, &available).is_err()
-        {
+        let cleanup_failed =
+            catalog_safe_for_cleanup && self.delete_owned_orphans(&records).is_err();
+        if cleanup_failed || self.rebuild_manifests(&records).is_err() {
             return Ok(ArchiveState {
                 live_records: records,
                 live_total_bytes: total,
@@ -147,7 +218,11 @@ impl ArchiveStore {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let mut state = self.reconcile()?;
+        let _guard = self
+            .catalog_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.reconcile_unlocked()?;
         if !state.writable {
             return Ok(refusals(records.len(), "storage unavailable"));
         }
@@ -203,7 +278,7 @@ impl ArchiveStore {
                 no_record_reason: None,
             });
         }
-        self.rebuild_manifests(&state.live_records, &state.available_relative_paths)?;
+        self.rebuild_manifests(&state.live_records)?;
         Ok(writes)
     }
 
@@ -294,12 +369,16 @@ impl ArchiveStore {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     sync_directory(path.parent().unwrap_or(&self.root))?;
-                    state.live_total_bytes = state.live_total_bytes.saturating_sub(record.bytes);
-                    state.available_relative_paths.remove(&record.relative_path);
+                    if state.available_relative_paths.remove(&record.relative_path) {
+                        state.live_total_bytes =
+                            state.live_total_bytes.saturating_sub(record.bytes);
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    state.live_total_bytes = state.live_total_bytes.saturating_sub(record.bytes);
-                    state.available_relative_paths.remove(&record.relative_path);
+                    if state.available_relative_paths.remove(&record.relative_path) {
+                        state.live_total_bytes =
+                            state.live_total_bytes.saturating_sub(record.bytes);
+                    }
                 }
                 Err(_) => {
                     self.append_catalog_record(&record)?;
@@ -311,61 +390,65 @@ impl ArchiveStore {
         Ok(true)
     }
 
-    fn read_live_catalog(&self) -> Result<Vec<CatalogRecord>> {
+    fn read_live_catalog(&self) -> Result<(Vec<CatalogRecord>, bool)> {
         let path = self.root.join(CATALOG_RELATIVE_PATH);
         let mut bytes = Vec::new();
         match open_read_nofollow(&path) {
             Ok(mut file) => file.read_to_end(&mut bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), true))
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", path.display()))
             }
         };
-        let mut live = Vec::<CatalogRecord>::new();
+        let mut live = Vec::<Option<CatalogRecord>>::new();
         let mut positions = HashMap::<String, usize>::new();
         let mut paths = HashMap::<String, String>::new();
-        for raw in bytes.split(|byte| *byte == b'\n') {
+        let terminated = bytes.ends_with(b"\n");
+        let segment_count = bytes.split(|byte| *byte == b'\n').count();
+        let mut safe_for_cleanup = true;
+        for (index, raw) in bytes.split(|byte| *byte == b'\n').enumerate() {
             if raw.is_empty() {
                 continue;
             }
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+                if terminated || index + 1 != segment_count {
+                    safe_for_cleanup = false;
+                }
                 continue;
             };
-            let Some(record_id) = value.get("record_id").and_then(|value| value.as_str()) else {
+            let Some(record_id) = value
+                .get("record_id")
+                .and_then(|value| value.as_str())
+                .filter(|record_id| !record_id.is_empty())
+            else {
+                safe_for_cleanup = false;
                 continue;
             };
             if value.get("tombstone").and_then(|value| value.as_bool()) == Some(true) {
                 if let Some(index) = positions.remove(record_id) {
-                    let removed = live.remove(index);
-                    paths.remove(&removed.relative_path);
-                    positions = live
-                        .iter()
-                        .enumerate()
-                        .map(|(index, record)| (record.record_id.clone(), index))
-                        .collect();
+                    if let Some(removed) = live[index].take() {
+                        paths.remove(&removed.relative_path);
+                    }
                 }
                 continue;
             }
             if positions.contains_key(record_id) {
                 continue;
             }
-            let Ok(mut record) = serde_json::from_value::<CatalogRecord>(value) else {
+            let Some(record) = catalog_record_from_value(&value) else {
+                safe_for_cleanup = false;
                 continue;
             };
-            if record.kind.is_empty() {
-                record.kind = default_kind();
-            }
-            if !valid_record_id(&record.record_id)
-                || !safe_record_relative_path(Path::new(&record.relative_path))
-                || paths.contains_key(&record.relative_path)
-            {
+            if paths.contains_key(&record.relative_path) {
                 continue;
             }
             paths.insert(record.relative_path.clone(), record.record_id.clone());
             positions.insert(record.record_id.clone(), live.len());
-            live.push(record);
+            live.push(Some(record));
         }
-        Ok(live)
+        Ok((live.into_iter().flatten().collect(), safe_for_cleanup))
     }
 
     fn append_catalog_record(&self, record: &CatalogRecord) -> Result<()> {
@@ -431,25 +514,38 @@ impl ArchiveStore {
         Ok(false)
     }
 
+    fn owned_turn_directories(&self) -> Result<Vec<PathBuf>> {
+        let mut directories = Vec::new();
+        append_turn_directories(&self.root.join("compactions/dropped"), &mut directories)?;
+        let sub_agents = self.root.join("compactions/sub_agents");
+        let Ok(tools) = std::fs::read_dir(sub_agents) else {
+            return Ok(directories);
+        };
+        for tool in tools {
+            let tool = tool?;
+            let file_type = tool.file_type()?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            for invocation in std::fs::read_dir(tool.path())? {
+                let invocation = invocation?;
+                let file_type = invocation.file_type()?;
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                append_turn_directories(&invocation.path().join("dropped"), &mut directories)?;
+            }
+        }
+        Ok(directories)
+    }
+
     fn delete_owned_orphans(&self, live: &[CatalogRecord]) -> Result<()> {
         let owned: HashSet<_> = live
             .iter()
             .map(|record| record.relative_path.as_str())
             .collect();
-        let dropped = self.root.join("compactions/dropped");
-        let Ok(turns) = std::fs::read_dir(&dropped) else {
-            return Ok(());
-        };
-        for turn in turns {
-            let turn = turn?;
-            let file_type = turn.file_type()?;
-            if !file_type.is_dir()
-                || file_type.is_symlink()
-                || !valid_turn_directory(&turn.file_name().to_string_lossy())
-            {
-                continue;
-            }
-            for entry in std::fs::read_dir(turn.path())? {
+        for turn_path in self.owned_turn_directories()? {
+            for entry in std::fs::read_dir(&turn_path)? {
                 let entry = entry?;
                 if !entry.file_type()?.is_file() || entry.file_name() == "manifest.md" {
                     continue;
@@ -459,31 +555,18 @@ impl ArchiveStore {
                     && !owned.contains(path_to_slashes(&relative).as_str())
                 {
                     std::fs::remove_file(entry.path())?;
-                    sync_directory(&turn.path())?;
+                    sync_directory(&turn_path)?;
                 }
             }
         }
         Ok(())
     }
 
-    fn rebuild_manifests(
-        &self,
-        records: &[CatalogRecord],
-        available: &HashSet<String>,
-    ) -> Result<()> {
+    fn rebuild_manifests(&self, records: &[CatalogRecord]) -> Result<()> {
         let mut by_directory = HashMap::<PathBuf, Vec<&CatalogRecord>>::new();
-        let dropped = self.root.join("compactions/dropped");
-        if let Ok(turns) = std::fs::read_dir(&dropped) {
-            for turn in turns {
-                let turn = turn?;
-                if turn.file_type()?.is_dir()
-                    && !turn.file_type()?.is_symlink()
-                    && valid_turn_directory(&turn.file_name().to_string_lossy())
-                {
-                    let relative = turn.path().strip_prefix(&self.root)?.to_path_buf();
-                    by_directory.entry(relative).or_default();
-                }
-            }
+        for directory in self.owned_turn_directories()? {
+            let relative = directory.strip_prefix(&self.root)?.to_path_buf();
+            by_directory.entry(relative).or_default();
         }
         for record in records {
             let relative = Path::new(&record.relative_path);
@@ -503,9 +586,6 @@ impl ArchiveStore {
             let mut text = String::from("# Dropped context records\n\n");
             let mut count = 0usize;
             for record in entries {
-                if !available.contains(&record.relative_path) {
-                    continue;
-                }
                 let filename = Path::new(&record.relative_path)
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -523,6 +603,23 @@ impl ArchiveStore {
         }
         Ok(())
     }
+}
+
+fn append_turn_directories(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir()
+            && !file_type.is_symlink()
+            && valid_turn_directory(&entry.file_name().to_string_lossy())
+        {
+            output.push(entry.path());
+        }
+    }
+    Ok(())
 }
 
 fn refusals(count: usize, reason: &'static str) -> Vec<ArchiveWrite> {
@@ -593,8 +690,8 @@ fn safe_component(value: &str) -> String {
     let mut output = String::new();
     let mut separator = false;
     for character in value.chars() {
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-            output.push(character.to_ascii_lowercase());
+        if character.is_alphanumeric() || matches!(character, '-' | '_') {
+            output.push(character);
             separator = false;
         } else if !separator && !output.is_empty() {
             output.push('_');
@@ -621,11 +718,22 @@ fn safe_record_relative_path(path: &Path) -> bool {
         return false;
     }
     let components: Vec<_> = path.components().collect();
-    components.len() == 4
+    let main = components.len() == 4
         && components[0].as_os_str() == "compactions"
         && components[1].as_os_str() == "dropped"
         && valid_turn_directory(&components[2].as_os_str().to_string_lossy())
-        && valid_record_filename(&components[3].as_os_str().to_string_lossy())
+        && catalog_record_filename(&components[3].as_os_str().to_string_lossy());
+    let sub_agent = components.len() == 7
+        && components[0].as_os_str() == "compactions"
+        && components[1].as_os_str() == "sub_agents"
+        && components[4].as_os_str() == "dropped"
+        && valid_turn_directory(&components[5].as_os_str().to_string_lossy())
+        && catalog_record_filename(&components[6].as_os_str().to_string_lossy());
+    main || sub_agent
+}
+
+fn catalog_record_filename(value: &str) -> bool {
+    value != "manifest.md" && value.ends_with(".md")
 }
 
 fn valid_turn_directory(value: &str) -> bool {
@@ -651,7 +759,7 @@ fn valid_record_filename(value: &str) -> bool {
                 && !tool.is_empty()
                 && tool
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
         })
 }
 
@@ -842,12 +950,11 @@ mod tests {
     }
 
     fn tiny_store(root: &Path, record_cap: usize, round_cap: usize, quota: u64) -> ArchiveStore {
-        ArchiveStore {
-            root: root.to_path_buf(),
-            record_cap,
-            round_cap,
-            session_quota: quota,
-        }
+        let mut store = ArchiveStore::with_root(root);
+        store.record_cap = record_cap;
+        store.round_cap = round_cap;
+        store.session_quota = quota;
+        store
     }
 
     #[test]
@@ -858,6 +965,33 @@ mod tests {
         assert!(state.writable);
         assert!(state.live_records.is_empty());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn stores_for_one_root_share_a_catalog_transaction_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let first = ArchiveStore::with_root(&root);
+        let second = ArchiveStore::with_root(&root);
+        assert!(Arc::ptr_eq(&first.catalog_lock, &second.catalog_lock));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (store, tool) in [(first, "one"), (second, "two")] {
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .archive_round(&[record(1, 1, 1, tool, "body")])
+                    .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let state = ArchiveStore::with_root(&root).reconcile().unwrap();
+        assert_eq!(state.live_records.len(), 2);
     }
 
     #[test]
@@ -877,6 +1011,22 @@ mod tests {
         let state = store.reconcile().unwrap();
         assert_eq!(state.live_records.len(), 1);
         assert_eq!(state.live_total_bytes, catalog.bytes);
+    }
+
+    #[test]
+    fn record_filename_preserves_unicode_tool_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::with_root(directory.path().join("session"));
+        let write = store
+            .archive_round(&[record(1, 1, 1, "读取Tool", "body")])
+            .unwrap();
+        let filename = Path::new(&write[0].record.as_ref().unwrap().relative_path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(filename.contains("读取Tool"));
+        assert!(filename.len() <= 255);
     }
 
     #[test]
@@ -901,6 +1051,62 @@ mod tests {
     }
 
     #[test]
+    fn tolerant_catalog_replay_preserves_legacy_and_sub_agent_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let main_relative = "compactions/dropped/turn001/001_Bash_1234abcd.md";
+        let sub_relative =
+            "compactions/sub_agents/worker/invoke-1/dropped/turn002/legacy-output.md";
+        for relative in [main_relative, sub_relative] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "record").unwrap();
+        }
+        let catalog = root.join(CATALOG_RELATIVE_PATH);
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        let rows = [
+            serde_json::json!({
+                "record_id": "legacy-id",
+                "relative_path": main_relative,
+                "turn": 1,
+                "round": 2,
+                "tool": "Bash",
+                "bytes": 999,
+                "created_at": "2026-01-02T03:04:05Z",
+                "kind": 7
+            }),
+            serde_json::json!({
+                "record_id": "sub-agent-id",
+                "relative_path": sub_relative,
+                "turn": 2,
+                "round": 1,
+                "tool": "worker",
+                "bytes": 999,
+                "created_at": "2026-01-02T03:04:06Z"
+            }),
+        ];
+        let payload = rows
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(catalog, payload).unwrap();
+
+        let state = ArchiveStore::with_root(&root).reconcile().unwrap();
+
+        assert!(state.writable);
+        assert_eq!(state.live_records.len(), 2);
+        assert_eq!(state.live_records[0].kind, "group");
+        assert_eq!(state.live_total_bytes, 12);
+        assert!(root.join(main_relative).exists());
+        assert!(root.join(sub_relative).exists());
+        assert!(root
+            .join("compactions/sub_agents/worker/invoke-1/dropped/turn002/manifest.md")
+            .is_file());
+    }
+
+    #[test]
     fn missing_cataloged_record_becomes_unavailable() {
         let directory = tempfile::tempdir().unwrap();
         let store = ArchiveStore::with_root(directory.path().join("session"));
@@ -915,11 +1121,11 @@ mod tests {
         assert_eq!(state.live_records.len(), 1);
         assert!(state.available_relative_paths.is_empty());
         assert_eq!(state.live_total_bytes, 0);
-        assert_eq!(
+        let manifest =
             std::fs::read_to_string(store.root.join("compactions/dropped/turn001/manifest.md"))
-                .unwrap(),
-            "# Dropped context records\n\n(No live records.)\n"
-        );
+                .unwrap();
+        assert!(manifest.contains("r1 `bash`"));
+        assert!(manifest.contains(Path::new(relative).file_name().unwrap().to_str().unwrap()));
     }
 
     #[test]
@@ -970,6 +1176,36 @@ mod tests {
     }
 
     #[test]
+    fn quota_does_not_reclaim_catalog_bytes_for_a_missing_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let initial = ArchiveStore::with_root(&root);
+        let writes = initial
+            .archive_round(&[
+                record(1, 1, 1, "missing", &"a".repeat(80)),
+                record(2, 1, 1, "existing", &"b".repeat(80)),
+            ])
+            .unwrap();
+        let missing = writes[0].record.as_ref().unwrap();
+        let existing = writes[1].record.as_ref().unwrap();
+        let existing_path = existing.relative_path.clone();
+        std::fs::remove_file(root.join(&missing.relative_path)).unwrap();
+        let incoming = record(3, 1, 1, "incoming", &"c".repeat(80));
+        let incoming_bytes = incoming.markdown.len() as u64;
+        let quota = existing.bytes + incoming_bytes - 1;
+        let constrained = tiny_store(&root, 1_000, 2_000, quota);
+
+        let result = constrained.archive_round(&[incoming]).unwrap();
+
+        assert!(result[0].record.is_some());
+        assert!(
+            !root.join(existing_path).exists(),
+            "the actual existing record must be evicted after the missing row reclaims zero"
+        );
+        assert!(constrained.reconcile().unwrap().live_total_bytes <= quota);
+    }
+
+    #[test]
     fn quota_evicts_oldest_catalog_record() {
         let directory = tempfile::tempdir().unwrap();
         let store = tiny_store(&directory.path().join("session"), 1_000, 2_000, 220);
@@ -990,6 +1226,26 @@ mod tests {
         let state = store.reconcile().unwrap();
         assert_eq!(state.live_records.len(), 1);
         assert_eq!(state.live_records[0].tool, "new");
+    }
+
+    #[test]
+    fn malformed_complete_catalog_line_preserves_owned_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        let turn = root.join("compactions/dropped/turn001");
+        std::fs::create_dir_all(&turn).unwrap();
+        let record_path = turn.join("001_bash_1234abcd.md");
+        std::fs::write(&record_path, "record").unwrap();
+        std::fs::write(
+            root.join(CATALOG_RELATIVE_PATH),
+            b"{\"record_id\":\"unsupported\"}\n",
+        )
+        .unwrap();
+
+        let state = ArchiveStore::with_root(&root).reconcile().unwrap();
+
+        assert!(state.writable);
+        assert!(record_path.exists());
     }
 
     #[test]
