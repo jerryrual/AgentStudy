@@ -43,6 +43,85 @@ fn weather_tool() -> ToolDef {
 }
 
 #[tokio::test]
+async fn responses_phase_four_generates_last_words_without_tools_or_streaming() {
+    let note_body = "concrete progress detail ".repeat(30);
+    let note = format!("## Task\n{note_body}\n## Progress\n{note_body}\n## Next\n{note_body}");
+    let note_for_server = note.clone();
+    let server = MockServer::new(move |path, body| {
+        assert_eq!(path, "/v1/responses");
+        if body["stream"] == false {
+            assert_eq!(body["store"], false);
+            assert!(body.get("tools").is_none());
+            assert!(body.get("tool_choice").is_none());
+            assert!(body.get("parallel_tool_calls").is_none());
+            assert!(body.get("include").is_none());
+            return MockResponse::json(
+                200,
+                &json!({
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": note_for_server}]
+                    }],
+                    "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+                })
+                .to_string(),
+            );
+        }
+        MockResponse::sse(&[
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"continued"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#,
+        ])
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = responses_profile(&server, true);
+    profile.context_window = Some(30_000);
+    profile.max_tokens = Some(3_000);
+    let agent = Agent::new(
+        Arc::new(ModelClient::from_profile(&profile).unwrap()),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        AgentOptions {
+            kind: AgentKind::Code,
+            cwd: directory.path().to_path_buf(),
+            max_rounds: 6,
+            tool_timeout: Duration::from_secs(10),
+        },
+    );
+    let sink = RecordingSink::default();
+    let mut messages = vec![
+        Message::user("inspect the large result and continue"),
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![ToolCall {
+                id: "call_large".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"large.txt"}"#.into(),
+            }],
+            ..AssistantMessage::default()
+        }),
+        Message::tool("call_large", "read_file", "result ".repeat(2_500)),
+    ];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+
+    assert_eq!(server.request_count(), 2);
+    assert_eq!(turn.rounds, 1);
+    assert_eq!(turn.usage.total_tokens, 25);
+    assert_eq!(sink.projections.lock().unwrap().len(), 1);
+    assert!(matches!(messages[2], Message::LastWords { .. }));
+    let requests = server.requests();
+    assert_eq!(requests[0]["stream"], false);
+    assert_eq!(requests[1]["stream"], true);
+    assert!(requests[1]["input"].as_array().unwrap().iter().any(|item| {
+        item["content"][0]["text"]
+            .as_str()
+            .is_some_and(|content| content.contains("[LAST_WORDS]"))
+    }));
+}
+
+#[tokio::test]
 async fn responses_stream_maps_stateless_history_and_assembles_output() {
     let server = MockServer::new(|path, body| {
         assert_eq!(path, "/v1/responses");

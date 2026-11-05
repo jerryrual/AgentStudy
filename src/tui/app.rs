@@ -12,7 +12,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
-use crate::compaction::{Compaction, CompressionBatch};
+use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -78,6 +78,10 @@ pub(crate) enum UiEvent {
     },
     Usage(Usage),
     MessageAdded(Message),
+    PersistContextProjection {
+        projection: ContextProjection,
+        reply: std::sync::mpsc::Sender<std::result::Result<bool, String>>,
+    },
     Info(String),
     Error(String),
     Approval {
@@ -356,6 +360,16 @@ impl App {
                         }
                     }
                 }
+            }
+            UiEvent::PersistContextProjection { projection, reply } => {
+                let result = persist_context_projection(
+                    &self.session,
+                    &self.recorder,
+                    self.persistence_gate.as_ref(),
+                    self.unsaved_messages,
+                    &projection,
+                );
+                let _ = reply.send(result);
             }
             UiEvent::Info(message) => self.view.push(ViewItem::Info(message)),
             UiEvent::Error(message) => self.view.push(ViewItem::Error(message)),
@@ -1427,6 +1441,30 @@ fn preview_output(output: &str) -> String {
     }
 }
 
+fn persist_context_projection(
+    session: &Session,
+    recorder: &Mutex<RecordBuffer>,
+    persistence_gate: Option<&Arc<AtomicBool>>,
+    unsaved_messages: bool,
+    projection: &ContextProjection,
+) -> std::result::Result<bool, String> {
+    if unsaved_messages {
+        return Ok(false);
+    }
+    let mut recorder = recorder
+        .lock()
+        .map_err(|_| "session recorder lock is poisoned".to_string())?;
+    let appended = session
+        .append_context_projection_if(projection, || {
+            persistence_gate.is_some_and(|gate| gate.load(Ordering::SeqCst))
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    if appended {
+        recorder.reset();
+    }
+    Ok(appended)
+}
+
 struct TuiSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     turn_id: u64,
@@ -1452,6 +1490,41 @@ impl EventSink for TuiSink {
             .map_err(|_| anyhow::anyhow!("session recorder lock is poisoned"))?;
         self.session
             .append_compression_batch_if(batch, || self.persistence_gate.load(Ordering::SeqCst))
+    }
+
+    fn persist_context_projection(&self, projection: &ContextProjection) -> Result<bool> {
+        if !self.persistence_gate.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let (reply, response) = std::sync::mpsc::channel();
+        self.tx
+            .send(UiEvent::Turn {
+                id: self.turn_id,
+                event: Box::new(UiEvent::PersistContextProjection {
+                    projection: projection.clone(),
+                    reply,
+                }),
+            })
+            .map_err(|_| anyhow::anyhow!("TUI event loop closed before projection persistence"))?;
+        loop {
+            match response.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => return result.map_err(anyhow::Error::msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    if !self.persistence_gate.load(Ordering::SeqCst) =>
+                {
+                    return Ok(false);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("TUI projection persistence was cancelled")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if !self.persistence_gate.load(Ordering::SeqCst) =>
+                {
+                    return Ok(false);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     fn text_delta(&self, delta: &str) {
@@ -1668,6 +1741,86 @@ mod tests {
     }
 
     #[test]
+    fn tui_projection_barrier_persists_queued_messages_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let recorder = Arc::new(Mutex::new(RecordBuffer::default()));
+        let gate = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(TuiSink {
+            tx,
+            turn_id: 7,
+            session: session.clone(),
+            recorder: recorder.clone(),
+            persistence_gate: gate.clone(),
+        });
+        let assistant = Message::assistant(crate::model::AssistantMessage {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            ..crate::model::AssistantMessage::default()
+        });
+        sink.message_added(&assistant);
+        sink.message_added(&Message::tool("call_1", "read_file", "large result"));
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 2,
+            }),
+        };
+        let worker = {
+            let sink = sink.clone();
+            let projection = projection.clone();
+            std::thread::spawn(move || sink.persist_context_projection(&projection))
+        };
+
+        for _ in 0..3 {
+            let UiEvent::Turn { id, event } = rx.blocking_recv().expect("queued turn event") else {
+                panic!("expected a turn-scoped event");
+            };
+            assert_eq!(id, 7);
+            match *event {
+                UiEvent::MessageAdded(message) => {
+                    recorder.lock().unwrap().record(&session, &message).unwrap()
+                }
+                UiEvent::PersistContextProjection { projection, reply } => {
+                    let result = persist_context_projection(
+                        &session,
+                        &recorder,
+                        Some(&gate),
+                        false,
+                        &projection,
+                    );
+                    let _ = reply.send(result);
+                }
+                _ => panic!("unexpected queued event"),
+            }
+        }
+        assert!(worker.join().unwrap().unwrap());
+
+        let loaded = store.load(session.id()).unwrap();
+        let projection_index = loaded
+            .records
+            .iter()
+            .position(|record| matches!(record, Record::ContextProjection { .. }))
+            .unwrap();
+        assert!(matches!(
+            loaded.records[projection_index - 1],
+            Record::Tool { .. }
+        ));
+        assert_eq!(projection_index, loaded.records.len() - 1);
+        assert!(matches!(
+            loaded.messages().last(),
+            Some(Message::LastWords { .. })
+        ));
+    }
+
+    #[test]
     fn tui_sink_skips_compression_when_turn_started_unsaved() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_root(directory.path());
@@ -1684,6 +1837,64 @@ mod tests {
         assert!(!sink
             .persist_compression(&CompressionBatch::default())
             .unwrap());
+    }
+
+    #[test]
+    fn tui_sink_declines_projection_after_turn_gate_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = TuiSink {
+            tx,
+            turn_id: 1,
+            session,
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
+            persistence_gate: Arc::new(AtomicBool::new(false)),
+        };
+        let projection = ContextProjection {
+            historical_folds: vec![crate::compaction::CompressionFold {
+                summary: "old".into(),
+                compacted_messages: 2,
+            }],
+            current_turn: None,
+        };
+
+        assert!(!sink.persist_context_projection(&projection).unwrap());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_projection_barrier_declines_when_turn_is_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let gate = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(TuiSink {
+            tx,
+            turn_id: 1,
+            session,
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
+            persistence_gate: gate.clone(),
+        });
+        let projection = ContextProjection {
+            historical_folds: vec![crate::compaction::CompressionFold {
+                summary: "old".into(),
+                compacted_messages: 2,
+            }],
+            current_turn: None,
+        };
+        let worker = {
+            let sink = sink.clone();
+            std::thread::spawn(move || sink.persist_context_projection(&projection))
+        };
+        let queued = rx.blocking_recv().expect("queued projection barrier");
+
+        gate.store(false, Ordering::SeqCst);
+        drop(queued);
+
+        assert!(!worker.join().unwrap().unwrap());
     }
 
     #[test]

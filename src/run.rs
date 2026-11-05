@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
-use crate::compaction::CompressionBatch;
+use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
@@ -62,6 +62,19 @@ impl EventSink for RunSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         recorded.session.append_compression_batch(batch)?;
+        recorded.buffer.reset();
+        Ok(true)
+    }
+
+    fn persist_context_projection(&self, projection: &ContextProjection) -> Result<bool> {
+        if self.has_unsaved_messages() {
+            return Ok(false);
+        }
+        let mut recorded = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recorded.session.append_context_projection(projection)?;
         recorded.buffer.reset();
         Ok(true)
     }
@@ -331,6 +344,51 @@ mod tests {
         assert!(!sink
             .persist_compression(&CompressionBatch::default())
             .unwrap());
+    }
+
+    #[test]
+    fn run_sink_persists_projection_after_buffered_tool_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let sink = RunSink {
+            json: true,
+            recorded: Mutex::new(RecordedSession {
+                session: session.clone(),
+                buffer: RecordBuffer::default(),
+            }),
+            wrote_text: AtomicBool::new(false),
+            save_failed: AtomicBool::new(false),
+        };
+        sink.message_added(&Message::assistant(crate::model::AssistantMessage {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            }],
+            ..crate::model::AssistantMessage::default()
+        }));
+        sink.message_added(&Message::tool("call_1", "grep", "large result"));
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 2,
+            }),
+        };
+
+        assert!(sink.persist_context_projection(&projection).unwrap());
+
+        let loaded = store.load(session.id()).unwrap();
+        assert!(matches!(
+            loaded.records.last(),
+            Some(Record::ContextProjection { .. })
+        ));
+        assert!(matches!(
+            loaded.messages().last(),
+            Some(Message::LastWords { .. })
+        ));
     }
 
     #[test]
