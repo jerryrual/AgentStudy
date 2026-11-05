@@ -11,7 +11,7 @@
 | 流式回答 | SSE 增量解析，逐 token 渲染 | `src/model/sse.rs`、`client.rs` |
 | Markdown 渲染 | 标题、列表、行内代码、粗体、链接、代码块 | `src/markdown.rs` |
 | 模型配置 | 多份 OpenAI 兼容配置，`/model` 切换，环境变量/命令取密钥；可选 `context_window` 派生 token 预算并按估算剩余上下文下调请求输出上限 | `src/config.rs`、`src/model/` |
-| 上下文裁剪（Phase 1） | 请求输入跨过派生触发阈值后，在仅供该次请求使用的投影中，按从旧到新的顺序将已完成轮次的工具结果替换为确定性摘要，使输入向目标预算收缩；当前轮次、JSONL / `/resume` 历史、TUI 历史及手动 `/compact` 输入保持原样 | `src/context_trim.rs`、`src/model/client.rs` |
+| 上下文裁剪（Phase 1 / 2） | 请求输入跨过派生触发阈值后，在仅供该次请求使用的投影中，Phase 1 按从旧到新的顺序将已完成旧轮次的工具结果替换为确定性摘要；仅当仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次。当前轮次、JSONL 中的权威历史及 `/resume` 恢复历史、TUI 历史和手动 `/compact` 历史保持原样 | `src/context_trim.rs`、`src/model/client.rs` |
 | 工具调用 | 多轮工具循环；纯只读工具批次并行执行，结果按调用顺序回填；超长输出截断 | `src/agent/` |
 | 文件读写 | `read_file`、`write_file`、`edit_file`（精确匹配替换） | `src/tools/fs.rs` |
 | 代码搜索 | `grep`（正则）、`glob`、`list_dir`，遵循 .gitignore | `src/tools/search.rs` |
@@ -33,7 +33,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 上下文裁剪的 Phase 2（移除旧工具组）与 Phase 3（压缩文本轮次）、达到预算时自动触发压缩，以及 Last Words；当前只实现 Phase 1 的请求投影，不代表完整的分阶段裁剪，压缩仍仅支持手动 `/compact`，其摘要输入超限时会优先保留最近内容。
+1. 上下文裁剪的 Phase 3（压缩文本轮次）、达到预算时自动触发摘要压缩，以及 Last Words；当前已实现 Phase 1 / 2 的请求投影，但不代表完整的分阶段裁剪，压缩仍仅支持手动 `/compact`，其摘要输入超限时会优先保留最近内容。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 

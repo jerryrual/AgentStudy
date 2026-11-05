@@ -133,13 +133,18 @@ impl ModelClient {
                 });
         let (prepared_messages, estimated_input) = match context_budget {
             Some(budget) => {
-                let trimmed = crate::context_trim::trim_previous_tool_results(
+                let phase1_result = crate::context_trim::trim_previous_tool_results(
                     messages,
                     budget.trigger_tokens,
                     budget.target_tokens,
                     |candidate| self.estimated_request_tokens(candidate, tools),
                 );
-                (trimmed.messages, trimmed.estimated_tokens)
+                let phase2_result = crate::context_trim::remove_previous_tool_groups(
+                    phase1_result,
+                    budget.target_tokens,
+                    |candidate| self.estimated_request_tokens(candidate, tools),
+                );
+                (phase2_result.messages, phase2_result.estimated_tokens)
             }
             None => (
                 std::borrow::Cow::Borrowed(messages),
@@ -626,6 +631,12 @@ mod tests {
         ModelClient::from_profile(&profile).unwrap()
     }
 
+    fn phase1_client(api_style: ApiStyle) -> ModelClient {
+        let mut client = budget_client(api_style);
+        client.context_window = Some(4_000);
+        client
+    }
+
     fn tool_call_message(id: &str, name: &str) -> Message {
         Message::assistant(AssistantMessage {
             tool_calls: vec![ToolCall {
@@ -653,9 +664,204 @@ mod tests {
         ]
     }
 
+    fn phase2_client(api_style: ApiStyle) -> ModelClient {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_style = api_style;
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        profile.context_window = Some(1_000);
+        profile.max_tokens = Some(300);
+        ModelClient::from_profile(&profile).unwrap()
+    }
+
+    fn phase2_messages(native_responses: bool) -> Vec<Message> {
+        let old_calls = vec![
+            ToolCall {
+                id: "call_old_a".to_string(),
+                name: "old_tool_a".to_string(),
+                arguments: r#"{"path":"old-a"}"#.to_string(),
+            },
+            ToolCall {
+                id: "call_old_b".to_string(),
+                name: "old_tool_b".to_string(),
+                arguments: r#"{"path":"old-b"}"#.to_string(),
+            },
+        ];
+        let old_native_items = if native_responses {
+            vec![
+                json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "OLD_NARRATION_MUST_STAY",
+                        "annotations": [],
+                    }],
+                }),
+                json!({
+                    "type": "function_call",
+                    "id": "fc_call_old_a",
+                    "call_id": "call_old_a",
+                    "name": "old_tool_a",
+                    "arguments": r#"{"path":"old-a"}"#,
+                    "status": "completed",
+                }),
+                json!({
+                    "type": "function_call",
+                    "id": "fc_call_old_b",
+                    "call_id": "call_old_b",
+                    "name": "old_tool_b",
+                    "arguments": r#"{"path":"old-b"}"#,
+                    "status": "completed",
+                }),
+            ]
+        } else {
+            Vec::new()
+        };
+        let current_native_items = if native_responses {
+            vec![json!({
+                "type": "function_call",
+                "id": "fc_call_current",
+                "call_id": "call_current",
+                "name": "current_tool",
+                "arguments": "{}",
+                "status": "completed",
+            })]
+        } else {
+            Vec::new()
+        };
+
+        vec![
+            Message::user("old turn"),
+            Message::assistant(AssistantMessage {
+                content: Some("OLD_NARRATION_MUST_STAY".to_string()),
+                tool_calls: old_calls,
+                responses_items: old_native_items,
+                ..AssistantMessage::default()
+            }),
+            Message::tool("call_old_a", "old_tool_a", "OLD_RESULT_A".repeat(300)),
+            Message::tool("call_old_b", "old_tool_b", "OLD_RESULT_B".repeat(300)),
+            Message::user("current turn"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_current".to_string(),
+                    name: "current_tool".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                responses_items: current_native_items,
+                ..AssistantMessage::default()
+            }),
+            Message::tool(
+                "call_current",
+                "current_tool",
+                "CURRENT_RESULT_MUST_STAY_EXACT",
+            ),
+        ]
+    }
+
+    fn phase2_estimates(client: &ModelClient, messages: &[Message]) -> (u32, u32) {
+        let budget = crate::context_budget::ContextBudget::derive(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+        )
+        .unwrap();
+        let phase1 = crate::context_trim::trim_previous_tool_results(
+            messages,
+            budget.trigger_tokens,
+            budget.target_tokens,
+            |candidate| client.estimated_request_tokens(candidate, &[]),
+        );
+        let phase1_tokens = phase1.estimated_tokens;
+        assert!(phase1_tokens > budget.target_tokens);
+        let phase2 = crate::context_trim::remove_previous_tool_groups(
+            phase1,
+            budget.target_tokens,
+            |candidate| client.estimated_request_tokens(candidate, &[]),
+        );
+        assert!(phase2.estimated_tokens < phase1_tokens);
+        assert_eq!(
+            phase2.estimated_tokens,
+            client.estimated_request_tokens(phase2.messages.as_ref(), &[])
+        );
+        (phase1_tokens, phase2.estimated_tokens)
+    }
+
+    #[test]
+    fn request_phase2_removes_old_chat_batch_and_uses_final_projection() {
+        let client = phase2_client(ApiStyle::Chat);
+        let messages = phase2_messages(false);
+        let original = messages.clone();
+        let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
+
+        let body = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(messages, original);
+        let wire = body["messages"].as_array().unwrap();
+        assert!(wire.iter().all(|item| {
+            item["tool_call_id"] != "call_old_a"
+                && item["tool_call_id"] != "call_old_b"
+                && item["tool_calls"].as_array().is_none_or(|calls| {
+                    calls
+                        .iter()
+                        .all(|call| !call["id"].as_str().unwrap().starts_with("call_old"))
+                })
+        }));
+        assert!(wire.iter().any(
+            |item| item["role"] == "assistant" && item["content"] == "OLD_NARRATION_MUST_STAY"
+        ));
+        assert!(wire.iter().any(|item| {
+            item["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|call| call["id"] == "call_current"))
+        }));
+        assert!(wire.iter().any(|item| {
+            item["tool_call_id"] == "call_current"
+                && item["content"] == "CURRENT_RESULT_MUST_STAY_EXACT"
+        }));
+
+        let expected = crate::context_budget::clamp_output_tokens(1_000, 300, final_tokens);
+        let phase1_cap = crate::context_budget::clamp_output_tokens(1_000, 300, phase1_tokens);
+        assert_ne!(expected, phase1_cap);
+        assert_eq!(body["max_tokens"], expected);
+    }
+
+    #[test]
+    fn request_phase2_removes_old_native_responses_batch_and_uses_final_projection() {
+        let client = phase2_client(ApiStyle::Responses);
+        let messages = phase2_messages(true);
+        let original = messages.clone();
+        let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
+
+        let body = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(messages, original);
+        let wire = body["input"].as_array().unwrap();
+        assert!(wire
+            .iter()
+            .all(|item| { item["call_id"] != "call_old_a" && item["call_id"] != "call_old_b" }));
+        assert!(wire.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "assistant"
+                && item["content"][0]["text"] == "OLD_NARRATION_MUST_STAY"
+        }));
+        assert!(wire
+            .iter()
+            .any(|item| { item["type"] == "function_call" && item["call_id"] == "call_current" }));
+        assert!(wire.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "call_current"
+                && item["output"] == "CURRENT_RESULT_MUST_STAY_EXACT"
+        }));
+
+        let expected = crate::context_budget::clamp_output_tokens(1_000, 300, final_tokens);
+        let phase1_cap = crate::context_budget::clamp_output_tokens(1_000, 300, phase1_tokens);
+        assert_ne!(expected, phase1_cap);
+        assert_eq!(body["max_output_tokens"], expected);
+    }
+
     #[test]
     fn request_projection_trims_old_tools_for_chat_without_mutating_history() {
-        let client = budget_client(ApiStyle::Chat);
+        let client = phase1_client(ApiStyle::Chat);
         let messages = projection_messages();
         let original = messages.clone();
 
@@ -697,7 +903,7 @@ mod tests {
 
     #[test]
     fn request_projection_trims_old_tools_for_responses_and_keeps_pairs() {
-        let client = budget_client(ApiStyle::Responses);
+        let client = phase1_client(ApiStyle::Responses);
         let messages = projection_messages();
         let original = messages.clone();
 
@@ -741,7 +947,7 @@ mod tests {
 
     #[test]
     fn responses_projection_preserves_native_function_call_items() {
-        let client = budget_client(ApiStyle::Responses);
+        let client = phase1_client(ApiStyle::Responses);
         let messages = vec![
             Message::user("old turn"),
             Message::assistant(AssistantMessage {
