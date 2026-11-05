@@ -150,7 +150,18 @@ impl ModelClient {
                 } else {
                     phase1_result
                 };
-                (phase2_result.messages, phase2_result.estimated_tokens)
+                let phase3_result =
+                    if phase1_triggered && phase2_result.estimated_tokens > budget.target_tokens {
+                        crate::context_trim::compress_previous_text_turns(
+                            phase2_result,
+                            messages,
+                            budget.target_tokens,
+                            |candidate| self.estimated_request_tokens(candidate, tools),
+                        )
+                    } else {
+                        phase2_result
+                    };
+                (phase3_result.messages, phase3_result.estimated_tokens)
             }
             None => (
                 std::borrow::Cow::Borrowed(messages),
@@ -670,13 +681,118 @@ mod tests {
         ]
     }
 
+    fn phase3_client(api_style: ApiStyle) -> ModelClient {
+        let mut client = budget_client(api_style);
+        client.context_window = Some(4_000);
+        client
+    }
+
+    fn phase3_messages(native_responses: bool) -> Vec<Message> {
+        let old_text = "OLD_FULL_TEXT_MUST_DISAPPEAR".repeat(240);
+        let old_responses_items = if native_responses {
+            vec![json!({
+                "type": "message",
+                "id": "msg_old_native_must_disappear",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": old_text,
+                    "annotations": [],
+                }],
+            })]
+        } else {
+            Vec::new()
+        };
+        let current_responses_items = if native_responses {
+            vec![json!({
+                "type": "function_call",
+                "id": "fc_current_must_stay_exact",
+                "call_id": "call_current_must_stay_exact",
+                "name": "current_tool_must_stay_exact",
+                "arguments": r#"{"value":"CURRENT_ARGUMENT_MUST_STAY_EXACT"}"#,
+                "status": "completed",
+            })]
+        } else {
+            Vec::new()
+        };
+
+        vec![
+            Message::user("OLD_USER_FULL_TEXT_MUST_DISAPPEAR".repeat(40)),
+            Message::assistant(AssistantMessage {
+                content: Some(old_text),
+                responses_items: old_responses_items,
+                ..AssistantMessage::default()
+            }),
+            Message::user("CURRENT_USER_MUST_STAY_EXACT"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_current_must_stay_exact".to_string(),
+                    name: "current_tool_must_stay_exact".to_string(),
+                    arguments: r#"{"value":"CURRENT_ARGUMENT_MUST_STAY_EXACT"}"#.to_string(),
+                }],
+                responses_items: current_responses_items,
+                ..AssistantMessage::default()
+            }),
+            Message::tool(
+                "call_current_must_stay_exact",
+                "current_tool_must_stay_exact",
+                "CURRENT_RESULT_MUST_STAY_EXACT",
+            ),
+        ]
+    }
+
+    fn phase3_estimates(client: &ModelClient, messages: &[Message]) -> (u32, u32, u32) {
+        let budget = crate::context_budget::ContextBudget::derive(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+        )
+        .unwrap();
+        let phase1 = crate::context_trim::trim_previous_tool_results(
+            messages,
+            budget.trigger_tokens,
+            budget.target_tokens,
+            |candidate| client.estimated_request_tokens(candidate, &[]),
+        );
+        let phase1_tokens = phase1.estimated_tokens;
+        assert!(phase1_tokens > budget.target_tokens);
+        let phase2 = crate::context_trim::remove_previous_tool_groups(
+            phase1,
+            budget.target_tokens,
+            |candidate| client.estimated_request_tokens(candidate, &[]),
+        );
+        let phase2_tokens = phase2.estimated_tokens;
+        assert_eq!(phase2_tokens, phase1_tokens);
+        let phase3 = crate::context_trim::compress_previous_text_turns(
+            phase2,
+            messages,
+            budget.target_tokens,
+            |candidate| client.estimated_request_tokens(candidate, &[]),
+        );
+        assert!(phase3.estimated_tokens < phase2_tokens);
+        assert_eq!(
+            phase3.estimated_tokens,
+            client.estimated_request_tokens(phase3.messages.as_ref(), &[])
+        );
+        (phase1_tokens, phase2_tokens, phase3.estimated_tokens)
+    }
+
+    fn assert_one_compressed_marker(wire: &[Value], content_pointer: &str) {
+        let markers: Vec<&str> = wire
+            .iter()
+            .filter_map(|item| item.pointer(content_pointer).and_then(Value::as_str))
+            .filter(|content| content.starts_with("[Compressed context]\nSummary: "))
+            .collect();
+        assert_eq!(markers.len(), 1, "{wire:?}");
+    }
+
     fn phase2_client(api_style: ApiStyle) -> ModelClient {
         let mut profile = ModelProfile::builtin_deepseek();
         profile.api_style = api_style;
         profile.api_key = "test-key".to_string();
         profile.base_url = "http://127.0.0.1:1".to_string();
-        profile.context_window = Some(1_000);
-        profile.max_tokens = Some(300);
+        profile.context_window = Some(3_000);
+        profile.max_tokens = Some(2_200);
         ModelClient::from_profile(&profile).unwrap()
     }
 
@@ -793,6 +909,139 @@ mod tests {
     }
 
     #[test]
+    fn request_phase3_compresses_old_chat_text_and_uses_final_projection() {
+        let client = phase3_client(ApiStyle::Chat);
+        let messages = phase3_messages(false);
+        let original = messages.clone();
+        let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
+
+        let first = client.request_body(&messages, &[]).unwrap();
+        let second = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(messages, original);
+        assert_eq!(phase1_tokens, phase2_tokens);
+        let wire = first["messages"].as_array().unwrap();
+        assert_one_compressed_marker(wire, "/content");
+        let serialized = serde_json::to_string(wire).unwrap();
+        assert!(!serialized.contains(&"OLD_FULL_TEXT_MUST_DISAPPEAR".repeat(240)));
+        assert_eq!(
+            &wire[wire.len() - 3..],
+            &[
+                json!({"role": "user", "content": "CURRENT_USER_MUST_STAY_EXACT"}),
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_current_must_stay_exact",
+                        "type": "function",
+                        "function": {
+                            "name": "current_tool_must_stay_exact",
+                            "arguments": r#"{"value":"CURRENT_ARGUMENT_MUST_STAY_EXACT"}"#,
+                        },
+                    }],
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_current_must_stay_exact",
+                    "content": "CURRENT_RESULT_MUST_STAY_EXACT",
+                }),
+            ]
+        );
+
+        let expected = crate::context_budget::clamp_output_tokens(4_000, 500, final_tokens);
+        let phase2_cap = crate::context_budget::clamp_output_tokens(4_000, 500, phase2_tokens);
+        assert_ne!(expected, phase2_cap);
+        assert_eq!(first["max_tokens"], expected);
+    }
+
+    #[test]
+    fn request_phase3_compresses_old_native_text_and_uses_final_projection() {
+        let client = phase3_client(ApiStyle::Responses);
+        let messages = phase3_messages(true);
+        let original = messages.clone();
+        let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
+
+        let first = client.request_body(&messages, &[]).unwrap();
+        let second = client.request_body(&messages, &[]).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(messages, original);
+        assert_eq!(phase1_tokens, phase2_tokens);
+        let wire = first["input"].as_array().unwrap();
+        assert_one_compressed_marker(wire, "/content/0/text");
+        let summary = wire
+            .iter()
+            .find(|item| {
+                item.pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("[Compressed context]"))
+            })
+            .unwrap();
+        assert_eq!(summary["role"], "assistant");
+        assert_eq!(summary["content"][0]["type"], "input_text");
+        assert!(summary.get("id").is_none());
+        assert!(summary.get("status").is_none());
+        let serialized = serde_json::to_string(wire).unwrap();
+        assert!(!serialized.contains(&"OLD_FULL_TEXT_MUST_DISAPPEAR".repeat(240)));
+        assert!(!serialized.contains("msg_old_native_must_disappear"));
+        assert_eq!(
+            &wire[wire.len() - 3..],
+            &[
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "CURRENT_USER_MUST_STAY_EXACT",
+                    }],
+                }),
+                json!({
+                    "type": "function_call",
+                    "id": "fc_current_must_stay_exact",
+                    "call_id": "call_current_must_stay_exact",
+                    "name": "current_tool_must_stay_exact",
+                    "arguments": r#"{"value":"CURRENT_ARGUMENT_MUST_STAY_EXACT"}"#,
+                    "status": "completed",
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_current_must_stay_exact",
+                    "output": "CURRENT_RESULT_MUST_STAY_EXACT",
+                }),
+            ]
+        );
+
+        let expected = crate::context_budget::clamp_output_tokens(4_000, 500, final_tokens);
+        let phase2_cap = crate::context_budget::clamp_output_tokens(4_000, 500, phase2_tokens);
+        assert_ne!(expected, phase2_cap);
+        assert_eq!(first["max_output_tokens"], expected);
+    }
+
+    #[test]
+    fn request_phase3_does_not_run_below_phase1_trigger() {
+        let client = phase3_client(ApiStyle::Chat);
+        let messages = vec![
+            Message::user("old request ".repeat(10)),
+            Message::assistant(AssistantMessage::text("old completed text ".repeat(20))),
+            Message::user("CURRENT_USER_MUST_STAY_EXACT"),
+        ];
+        let budget = crate::context_budget::ContextBudget::derive(4_000, 500).unwrap();
+        let estimated = client.estimated_request_tokens(&messages, &[]);
+        assert!(estimated < budget.trigger_tokens, "{estimated} >= trigger");
+
+        let body = client.request_body(&messages, &[]).unwrap();
+        let expected: Vec<Value> = messages.iter().map(Message::to_api).collect();
+
+        assert_eq!(body["messages"], Value::Array(expected));
+        assert!(body["messages"].as_array().unwrap().iter().all(|item| {
+            item["content"]
+                .as_str()
+                .is_none_or(|content| !content.starts_with("[Compressed context]"))
+        }));
+    }
+
+    #[test]
     fn request_phase2_removes_old_chat_batch_and_uses_final_projection() {
         let client = phase2_client(ApiStyle::Chat);
         let messages = phase2_messages(false);
@@ -825,8 +1074,16 @@ mod tests {
                 && item["content"] == "CURRENT_RESULT_MUST_STAY_EXACT"
         }));
 
-        let expected = crate::context_budget::clamp_output_tokens(1_000, 300, final_tokens);
-        let phase1_cap = crate::context_budget::clamp_output_tokens(1_000, 300, phase1_tokens);
+        let expected = crate::context_budget::clamp_output_tokens(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+            final_tokens,
+        );
+        let phase1_cap = crate::context_budget::clamp_output_tokens(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+            phase1_tokens,
+        );
         assert_ne!(expected, phase1_cap);
         assert_eq!(body["max_tokens"], expected);
     }
@@ -859,8 +1116,16 @@ mod tests {
                 && item["output"] == "CURRENT_RESULT_MUST_STAY_EXACT"
         }));
 
-        let expected = crate::context_budget::clamp_output_tokens(1_000, 300, final_tokens);
-        let phase1_cap = crate::context_budget::clamp_output_tokens(1_000, 300, phase1_tokens);
+        let expected = crate::context_budget::clamp_output_tokens(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+            final_tokens,
+        );
+        let phase1_cap = crate::context_budget::clamp_output_tokens(
+            client.context_window.unwrap(),
+            client.max_tokens.unwrap(),
+            phase1_tokens,
+        );
         assert_ne!(expected, phase1_cap);
         assert_eq!(body["max_output_tokens"], expected);
     }

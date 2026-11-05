@@ -1,9 +1,9 @@
 //! Deterministic request-only context projections.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::model::{Message, ToolCall};
+use crate::model::{AssistantMessage, Message, ToolCall};
 
 const SUMMARY_PREFIX: &str = "[Tool call: ";
 const SUMMARY_SUFFIX: &str = "]";
@@ -18,6 +18,7 @@ pub(crate) struct TrimResult<'a> {
     pub(crate) messages: Cow<'a, [Message]>,
     pub(crate) summarized: usize,
     pub(crate) removed: usize,
+    pub(crate) compressed: usize,
     pub(crate) estimated_tokens: u32,
 }
 
@@ -42,6 +43,7 @@ where
             messages: projected,
             summarized: 0,
             removed: 0,
+            compressed: 0,
             estimated_tokens: initial,
         };
     }
@@ -53,6 +55,7 @@ where
             messages: projected,
             summarized: 0,
             removed: 0,
+            compressed: 0,
             estimated_tokens: initial,
         };
     };
@@ -107,6 +110,7 @@ where
         messages: projected,
         summarized,
         removed: 0,
+        compressed: 0,
         estimated_tokens,
     }
 }
@@ -153,6 +157,127 @@ where
         }
     }
     projection
+}
+
+/// Replace completed historical turns with deterministic request-only digests.
+pub(crate) fn compress_previous_text_turns<'a, F>(
+    mut projection: TrimResult<'a>,
+    source: &[Message],
+    target_tokens: u32,
+    estimate: F,
+) -> TrimResult<'a>
+where
+    F: FnMut(&[Message]) -> u32,
+{
+    if projection.estimated_tokens <= target_tokens {
+        return projection;
+    }
+
+    let source_users = user_indices(source);
+    let projected_users = user_indices(projection.messages.as_ref());
+    if source_users.len() != projected_users.len() || source_users.len() < 2 {
+        return projection;
+    }
+
+    let summary_boundary = source_users
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(ordinal, index)| {
+            matches!(
+                &source[*index],
+                Message::User { content } if content.starts_with(crate::compaction::SUMMARY_PREFIX)
+            )
+            .then_some(ordinal)
+        });
+    let first_eligible = summary_boundary.map_or(0, |ordinal| ordinal + 1);
+    let mut estimate = estimate;
+    let mut contracted = 0usize;
+
+    for ordinal in first_eligible..source_users.len() - 1 {
+        if projection.estimated_tokens <= target_tokens {
+            break;
+        }
+
+        let source_start = source_users[ordinal];
+        let source_end = source_users[ordinal + 1];
+        let projected_start = projected_users[ordinal] - contracted;
+        let projected_end = projected_users[ordinal + 1] - contracted;
+        if source[source_start..source_end]
+            .iter()
+            .chain(projection.messages[projected_start..projected_end].iter())
+            .any(|message| matches!(message, Message::System { .. }))
+        {
+            continue;
+        }
+
+        let digest = automatic_turn_summary(&source[source_start..source_end]);
+        let replacement = Message::assistant(AssistantMessage::text(format!(
+            "[Compressed context]\nSummary: {digest}"
+        )));
+        let mut candidate = projection.messages.as_ref().to_vec();
+        candidate.splice(projected_start..projected_end, [replacement]);
+        let candidate_tokens = estimate(&candidate);
+        if candidate_tokens >= projection.estimated_tokens {
+            continue;
+        }
+
+        contracted += projected_end - projected_start - 1;
+        projection.messages = Cow::Owned(candidate);
+        projection.compressed += 1;
+        projection.estimated_tokens = candidate_tokens;
+    }
+
+    projection
+}
+
+fn user_indices(messages: &[Message]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| matches!(message, Message::User { .. }).then_some(index))
+        .collect()
+}
+
+fn automatic_turn_summary(turn: &[Message]) -> String {
+    let user_messages: Vec<_> = turn
+        .iter()
+        .filter_map(|message| match message {
+            Message::User { content } if !content.is_empty() => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut parts = Vec::new();
+    if let Some(content) = user_messages.first() {
+        parts.push(format!("User: {}", truncate_chars(content, 100, "...")));
+        if user_messages.len() > 1 {
+            parts.push(format!("(+{} more messages)", user_messages.len() - 1));
+        }
+    }
+
+    let mut tools = BTreeSet::new();
+    for message in turn {
+        if let Message::Assistant { message } = message {
+            tools.extend(message.tool_calls.iter().map(|call| call.name.as_str()));
+            tools.extend(message.responses_items.iter().filter_map(|item| {
+                (item.get("type").and_then(serde_json::Value::as_str) == Some("function_call"))
+                    .then(|| item.get("name")?.as_str())
+                    .flatten()
+            }));
+        }
+    }
+    if !tools.is_empty() {
+        parts.push(format!(
+            "Tools: {}",
+            tools.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    if parts.is_empty() {
+        "Earlier conversation".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 #[derive(Debug)]
@@ -575,6 +700,7 @@ mod tests {
                 messages: Cow::Borrowed(messages),
                 summarized: 0,
                 removed: 0,
+                compressed: 0,
                 estimated_tokens: messages.len() as u32,
             },
             target,
@@ -814,6 +940,7 @@ mod tests {
                 messages: Cow::Borrowed(&messages),
                 summarized: 0,
                 removed: 0,
+                compressed: 0,
                 estimated_tokens: 100,
             },
             10,
@@ -832,6 +959,7 @@ mod tests {
                 messages: Cow::Borrowed(&messages),
                 summarized: 0,
                 removed: 0,
+                compressed: 0,
                 estimated_tokens: 100,
             },
             10,
@@ -840,5 +968,236 @@ mod tests {
         assert_eq!(result.messages, messages);
         assert_eq!(result.removed, 0);
         assert_eq!(result.estimated_tokens, 100);
+    }
+
+    fn phase_three<'a>(messages: &'a [Message], tokens: u32) -> TrimResult<'a> {
+        TrimResult {
+            messages: Cow::Borrowed(messages),
+            summarized: 0,
+            removed: 0,
+            compressed: 0,
+            estimated_tokens: tokens,
+        }
+    }
+
+    #[test]
+    fn phase_three_is_oldest_first_target_safe_and_request_only() {
+        let messages = vec![
+            Message::system("fixed"),
+            Message::user("old one"),
+            Message::assistant(AssistantMessage::text("discarded")),
+            Message::tool("a", "read", "discarded result"),
+            Message::user("old two"),
+            Message::assistant(AssistantMessage::text("also discarded")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let source = messages.clone();
+        let result = compress_previous_text_turns(
+            phase_three(&messages, messages.len() as u32),
+            &messages,
+            (messages.len() - 2) as u32,
+            |candidate| candidate.len() as u32,
+        );
+
+        assert_eq!(result.compressed, 1);
+        assert!(matches!(result.messages, Cow::Owned(_)));
+        assert_eq!(result.messages[0], Message::system("fixed"));
+        assert_eq!(
+            result.messages[1],
+            Message::assistant(AssistantMessage::text(
+                "[Compressed context]\nSummary: User: old one"
+            ))
+        );
+        assert_eq!(
+            &result.messages[result.messages.len() - 2..],
+            &messages[6..]
+        );
+        assert_eq!(messages, source);
+    }
+
+    #[test]
+    fn phase_three_summary_matches_upstream_digest() {
+        let long = "界".repeat(101);
+        let digest = automatic_turn_summary(&[
+            Message::user(format!("  {long}  ")),
+            Message::assistant(AssistantMessage {
+                content: Some("ordinary text omitted".into()),
+                reasoning: Some("reasoning omitted".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "z".into(),
+                        name: "zeta".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "a".into(),
+                        name: "alpha".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                responses_items: vec![
+                    serde_json::json!({"type": "function_call", "name": "beta"}),
+                    serde_json::json!({"type": "function_call", "name": "alpha"}),
+                ],
+            }),
+        ]);
+        assert_eq!(
+            digest,
+            format!("User:   {}...; Tools: alpha, beta, zeta", "界".repeat(98))
+        );
+        assert_eq!(
+            automatic_turn_summary(&[Message::assistant(AssistantMessage::text("ignored"))]),
+            "Earlier conversation"
+        );
+        assert_eq!(
+            automatic_turn_summary(&[Message::user("first"), Message::user("second")]),
+            "User: first; (+1 more messages)"
+        );
+    }
+
+    #[test]
+    fn phase_three_aligns_phase_two_projection_with_canonical_source() {
+        let source = vec![
+            Message::user("inspect"),
+            Message::assistant(AssistantMessage {
+                content: Some("kept narration".into()),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "canonical_tool".into(),
+                    arguments: "{}".into(),
+                }],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("a", "projection_name", "result"),
+            Message::user("current"),
+        ];
+        let phase_two = remove_previous_tool_groups(phase_three(&source, 100), 99, |_| 90);
+        let result = compress_previous_text_turns(phase_two, &source, 50, |candidate| {
+            if candidate.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.starts_with("[Compressed context]")))) { 40 } else { 90 }
+        });
+
+        assert_eq!(result.compressed, 1);
+        assert!(matches!(
+            &result.messages[0],
+            Message::Assistant { message }
+                if message.content.as_deref() == Some("[Compressed context]\nSummary: User: inspect; Tools: canonical_tool")
+        ));
+        assert_eq!(result.messages[1], Message::user("current"));
+    }
+
+    #[test]
+    fn phase_three_skips_nonreducing_and_system_turns() {
+        let source = vec![
+            Message::user("system turn"),
+            Message::system("embedded"),
+            Message::user("nonreducing"),
+            Message::assistant(AssistantMessage::text("one")),
+            Message::user("reducing"),
+            Message::assistant(AssistantMessage::text("two")),
+            Message::user("current"),
+        ];
+        let result = compress_previous_text_turns(
+            phase_three(&source, 100),
+            &source,
+            50,
+            |candidate| {
+                if candidate.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.contains("User: reducing")))) { 40 } else { 100 }
+            },
+        );
+
+        assert_eq!(result.compressed, 1);
+        assert!(result.messages.iter().any(
+            |message| matches!(message, Message::User { content } if content == "nonreducing")
+        ));
+        assert!(result.messages.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.contains("User: reducing")))));
+    }
+
+    #[test]
+    fn phase_three_tracks_indices_across_deletions_skips_and_multiple_commits() {
+        let source = vec![
+            Message::user("tool-only turn"),
+            call("a", "read_file", "{}"),
+            Message::tool("a", "read_file", "result"),
+            Message::user("first text turn"),
+            Message::assistant(AssistantMessage::text("first answer")),
+            Message::user("system-bearing turn"),
+            Message::system("must stay fixed"),
+            Message::assistant(AssistantMessage::text("system answer")),
+            Message::user("second text turn"),
+            Message::assistant(AssistantMessage::text("second answer")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let projection = vec![
+            Message::user("tool-only turn"),
+            Message::user("first text turn"),
+            Message::assistant(AssistantMessage::text("first answer")),
+            Message::user("system-bearing turn"),
+            Message::system("must stay fixed"),
+            Message::assistant(AssistantMessage::text("system answer")),
+            Message::user("second text turn"),
+            Message::assistant(AssistantMessage::text("second answer")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        let source_snapshot = source.clone();
+        let result =
+            compress_previous_text_turns(phase_three(&projection, 10), &source, 8, |candidate| {
+                candidate.len() as u32
+            });
+
+        assert_eq!(result.compressed, 2);
+        assert_eq!(result.estimated_tokens, 8);
+        assert_eq!(
+            result.messages.as_ref(),
+            &[
+                Message::user("tool-only turn"),
+                Message::assistant(AssistantMessage::text(
+                    "[Compressed context]\nSummary: User: first text turn",
+                )),
+                Message::user("system-bearing turn"),
+                Message::system("must stay fixed"),
+                Message::assistant(AssistantMessage::text("system answer")),
+                Message::assistant(AssistantMessage::text(
+                    "[Compressed context]\nSummary: User: second text turn",
+                )),
+                Message::user("current"),
+                Message::assistant(AssistantMessage::text("current answer")),
+            ]
+        );
+        assert_eq!(source, source_snapshot);
+    }
+
+    #[test]
+    fn phase_three_boundary_impossible_and_repeat_are_deterministic() {
+        let source = vec![
+            Message::user("before summary"),
+            Message::assistant(AssistantMessage::text("old")),
+            Message::user(format!("{}manual", crate::compaction::SUMMARY_PREFIX)),
+            Message::assistant(AssistantMessage::text("boundary")),
+            Message::user("after summary"),
+            Message::assistant(AssistantMessage::text("eligible")),
+            Message::user("current"),
+        ];
+        let first =
+            compress_previous_text_turns(phase_three(&source, 100), &source, 0, |candidate| {
+                candidate.len() as u32
+            });
+        assert_eq!(first.compressed, 1);
+        assert!(first.messages.iter().any(
+            |message| matches!(message, Message::User { content } if content == "before summary")
+        ));
+        assert!(first.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with(crate::compaction::SUMMARY_PREFIX))));
+        let repeated = compress_previous_text_turns(first.clone(), &source, 0, |candidate| {
+            candidate.len() as u32
+        });
+        assert_eq!(repeated, first);
+
+        let no_user = vec![Message::system("fixed")];
+        let impossible =
+            compress_previous_text_turns(phase_three(&no_user, 100), &no_user, 0, |_| 100);
+        assert_eq!(impossible.messages.as_ref(), no_user);
+        assert_eq!(impossible.compressed, 0);
     }
 }
