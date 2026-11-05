@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
+use crate::compaction_archive::ArchiveStore;
 use crate::model::{AssistantMessage, Message, ToolCall};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,10 +97,16 @@ impl Record {
 pub struct Session {
     pub meta: SessionMeta,
     path: PathBuf,
+    archive_root: PathBuf,
     append_lock: Arc<Mutex<()>>,
 }
 
 impl Session {
+    /// Directory sibling of the JSONL transcript used for derived archive files.
+    pub fn archive_root(&self) -> &Path {
+        &self.archive_root
+    }
+
     /// Append one record, flushing immediately.
     pub fn append(&self, record: &Record) -> Result<()> {
         let _guard = self
@@ -472,6 +479,7 @@ impl SessionStore {
         let session = Session {
             meta: meta.clone(),
             path: self.path(&id),
+            archive_root: self.archive_root(&id)?,
             append_lock: Arc::new(Mutex::new(())),
         };
         session.append(&Record::Meta { meta })?;
@@ -482,25 +490,30 @@ impl SessionStore {
         self.root.join(format!("{id}.jsonl"))
     }
 
+    /// Resolve a validated session ID to its sibling archive directory.
+    pub fn archive_root(&self, id: &str) -> Result<PathBuf> {
+        validate_session_id(id)?;
+        Ok(self.root.join(id))
+    }
+
     /// Open an existing session for appending.
     pub fn reopen(&self, id: &str) -> Result<Session> {
         let loaded = self.load(id)?;
+        let archive_root = self.archive_root(id)?;
+        ArchiveStore::with_root(&archive_root)
+            .reconcile()
+            .with_context(|| format!("failed to reconcile archive for session {id}"))?;
         Ok(Session {
             meta: loaded.meta,
             path: self.path(id),
+            archive_root,
             append_lock: Arc::new(Mutex::new(())),
         })
     }
 
     /// Load a session by id.
     pub fn load(&self, id: &str) -> Result<LoadedSession> {
-        if id.is_empty()
-            || !id.chars().all(|character| {
-                character.is_ascii_alphanumeric() || character == '-' || character == '_'
-            })
-        {
-            bail!("invalid session id {id:?}");
-        }
+        validate_session_id(id)?;
         load_session_file(&self.path(id), id)
     }
 
@@ -583,6 +596,17 @@ fn preview_text(text: &str) -> String {
         preview = preview.chars().take(80).collect::<String>() + "…";
     }
     preview
+}
+
+fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        bail!("invalid session id {id:?}");
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -685,11 +709,50 @@ mod tests {
     }
 
     #[test]
+    fn archive_root_is_a_directory_sibling_without_migrating_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp/project", "model", "code").unwrap();
+        let jsonl = store.path(session.id());
+        let expected = directory.path().join(session.id());
+
+        assert_eq!(session.archive_root(), expected);
+        assert_eq!(store.archive_root(session.id()).unwrap(), expected);
+        assert!(jsonl.is_file());
+        assert!(!expected.exists(), "archive storage is created lazily");
+
+        let reopened = store.reopen(session.id()).unwrap();
+        assert_eq!(reopened.archive_root(), expected);
+        assert!(jsonl.is_file());
+    }
+
+    #[test]
+    fn reopen_reconciles_archive_without_rewriting_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp/project", "model", "code").unwrap();
+        let jsonl = store.path(session.id());
+        let before = std::fs::read(&jsonl).unwrap();
+        let turn = session.archive_root().join("compactions/dropped/turn001");
+        std::fs::create_dir_all(&turn).unwrap();
+        let orphan = turn.join("001_bash_1234abcd.md");
+        std::fs::write(&orphan, "orphan").unwrap();
+
+        let reopened = store.reopen(session.id()).unwrap();
+
+        assert_eq!(reopened.archive_root(), session.archive_root());
+        assert!(!orphan.exists());
+        assert_eq!(std::fs::read(jsonl).unwrap(), before);
+    }
+
+    #[test]
     fn invalid_ids_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_root(directory.path());
         assert!(store.load("../escape").is_err());
+        assert!(store.archive_root("../escape").is_err());
         assert!(store.load("").is_err());
+        assert!(store.archive_root("").is_err());
     }
 
     #[test]

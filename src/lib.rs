@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod cli;
 pub mod compaction;
+pub mod compaction_archive;
 pub mod config;
 pub mod context_budget;
 pub(crate) mod context_trim;
