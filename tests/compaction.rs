@@ -3,7 +3,7 @@ mod common;
 use icode::compaction;
 use icode::model::{Message, ModelClient};
 
-use common::{mock_profile, MockResponse, MockServer};
+use common::{mock_profile, MockResponse, MockServer, RecordingSink};
 
 #[tokio::test]
 async fn model_compaction_sends_transcript_as_data_and_returns_summary() {
@@ -39,6 +39,59 @@ async fn model_compaction_sends_transcript_as_data_and_returns_summary() {
 
     assert_eq!(result.summary, "Parser fixed; tests pass.");
     assert_eq!(result.usage.total_tokens, 46);
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn model_compaction_trims_old_history_to_recover_from_context_exhaustion() {
+    let server = MockServer::new(|_, body| {
+        let excerpt = body["messages"][1]["content"].as_str().unwrap();
+        assert!(excerpt.contains("Earlier transcript entries omitted"));
+        assert!(excerpt.contains("recent decision"));
+        assert!(!excerpt.contains("obsolete details"));
+        MockResponse::sse(&[
+            r#"{"choices":[{"delta":{"content":"Recent decision retained."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"total_tokens":104}}"#,
+        ])
+    });
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(1_200);
+    profile.max_tokens = Some(128);
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let messages = [
+        Message::user(format!("obsolete details {}", "x".repeat(2_000))),
+        Message::user("recent decision"),
+    ];
+
+    let ordinary_error = client
+        .complete(&messages, &[], &RecordingSink::default())
+        .await
+        .unwrap_err();
+    assert!(ordinary_error.to_string().contains("exhausts"));
+    let result = compaction::compact(&client, &messages).await.unwrap();
+
+    assert_eq!(result.summary, "Recent decision retained.");
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
+async fn model_compaction_truncates_one_oversized_entry_on_utf8_boundaries() {
+    let server = MockServer::new(|_, body| {
+        let excerpt = body["messages"][1]["content"].as_str().unwrap();
+        assert!(excerpt.contains("Earlier transcript entries omitted"));
+        assert!(excerpt.contains("最终决定"));
+        MockResponse::sse(&[
+            r#"{"choices":[{"delta":{"content":"Final decision retained."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"total_tokens":104}}"#,
+        ])
+    });
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(1_200);
+    profile.max_tokens = Some(128);
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let message = Message::user(format!("{}最终决定", "历史内容".repeat(500)));
+
+    let result = compaction::compact(&client, &[message]).await.unwrap();
+
+    assert_eq!(result.summary, "Final decision retained.");
     assert_eq!(server.request_count(), 1);
 }
 

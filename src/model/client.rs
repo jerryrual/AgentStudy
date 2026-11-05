@@ -77,6 +77,15 @@ impl ModelClient {
         &self.endpoint
     }
 
+    /// Check whether messages leave a valid output allowance without sending them.
+    pub(crate) fn validate_request_context(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+    ) -> Result<()> {
+        self.request_body(messages, tools).map(|_| ())
+    }
+
     /// Run one completion, streaming deltas through `sink`.
     ///
     /// Transient failures (HTTP 429/5xx and transport errors) are retried up to
