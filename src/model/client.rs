@@ -580,7 +580,7 @@ fn context_overflow_details(status: StatusCode, text: &str) -> Option<Option<u32
             "context_length_exceeded" | "model_context_window_exceeded"
         )
     });
-    if !code_names_overflow && !text_names_context_overflow(message) {
+    if !code_names_overflow && !text_names_context_overflow(text) {
         return None;
     }
     Some(named_context_limit(message))
@@ -959,6 +959,16 @@ mod tests {
         assert_eq!(
             context_overflow_details(StatusCode::BAD_REQUEST, quota),
             None
+        );
+        let rate_code = r#"{"error":{"code":"rate_limit_exceeded","message":"Request exceeds the context window"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, rate_code),
+            None
+        );
+        let explicit_overflow = r#"{"error":{"code":"context_length_exceeded","message":"quota exceeded for tokens per minute"}}"#;
+        assert_eq!(
+            context_overflow_details(StatusCode::BAD_REQUEST, explicit_overflow),
+            Some(None)
         );
         let payload = r#"{"error":{"code":"request_too_large","message":"context window"}}"#;
         assert_eq!(
