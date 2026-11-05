@@ -376,7 +376,7 @@ mod tests {
             tool_calls: vec![crate::model::ToolCall {
                 id: "call_1".into(),
                 name: "grep".into(),
-                arguments: r#"{\"pattern\":\"private-token\"}"#.into(),
+                arguments: r#"{"pattern":"private-token"}"#.into(),
             }],
             responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
         }));
@@ -397,7 +397,7 @@ mod tests {
                 tool_calls: vec![crate::model::ToolCall {
                     id: "call_1".into(),
                     name: "grep".into(),
-                    arguments: r#"{\"pattern\":\"private-token\"}"#.into(),
+                    arguments: r#"{"pattern":"private-token"}"#.into(),
                 }],
                 responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
             }),
@@ -427,7 +427,7 @@ mod tests {
         for expected in [
             "assistant context",
             "private reasoning",
-            "private-token",
+            "\"pattern\": \"private-token\"",
             "opaque-secret",
             "large result",
             "Group ID: `call_1`",

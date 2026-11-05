@@ -231,19 +231,15 @@ impl Session {
             return Ok(false);
         }
         let loaded = load_session_file(&self.path, self.id())?;
-        let turn = loaded
-            .records
-            .iter()
-            .filter(|record| matches!(record, Record::User { .. }))
-            .count() as u64;
-        if turn == 0 {
-            anyhow::bail!("cannot archive a context projection without a persisted user turn");
-        }
         let current_user = loaded
             .records
             .iter()
             .rposition(|record| matches!(record, Record::User { .. }))
-            .expect("turn count proved a persisted user record exists");
+            .context("cannot archive a context projection without a persisted user turn")?;
+        let turn = loaded.records[..=current_user]
+            .iter()
+            .filter(|record| matches!(record, Record::User { .. }))
+            .count() as u64;
         let round = loaded.records[current_user + 1..]
             .iter()
             .filter(|record| {
