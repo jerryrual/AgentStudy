@@ -978,7 +978,7 @@ mod tests {
                     .is_some_and(|text| text.starts_with("[Compressed context]"))
             })
             .unwrap();
-        assert_eq!(summary["role"], "assistant");
+        assert_eq!(summary["role"], "user");
         assert_eq!(summary["content"][0]["type"], "input_text");
         assert!(summary.get("id").is_none());
         assert!(summary.get("status").is_none());

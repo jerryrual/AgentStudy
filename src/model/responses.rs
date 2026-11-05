@@ -34,7 +34,7 @@ pub(super) fn request_body(
                     input.push(json!({
                         "type": "message",
                         "role": "assistant",
-                        "content": [{"type": "input_text", "text": content}],
+                        "content": [{"type": "output_text", "text": content, "annotations": []}],
                     }));
                 }
                 for call in &message.tool_calls {

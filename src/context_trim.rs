@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::model::{AssistantMessage, Message, ToolCall};
+use crate::model::{Message, ToolCall};
 
 const SUMMARY_PREFIX: &str = "[Tool call: ";
 const SUMMARY_SUFFIX: &str = "]";
@@ -212,9 +212,7 @@ where
         }
 
         let digest = automatic_turn_summary(&source[source_start..source_end]);
-        let replacement = Message::assistant(AssistantMessage::text(format!(
-            "[Compressed context]\nSummary: {digest}"
-        )));
+        let replacement = Message::user(format!("[Compressed context]\nSummary: {digest}"));
         let mut candidate = projection.messages.as_ref().to_vec();
         candidate.splice(projected_start..projected_end, [replacement]);
         let candidate_tokens = estimate(&candidate);
@@ -1005,9 +1003,7 @@ mod tests {
         assert_eq!(result.messages[0], Message::system("fixed"));
         assert_eq!(
             result.messages[1],
-            Message::assistant(AssistantMessage::text(
-                "[Compressed context]\nSummary: User: old one"
-            ))
+            Message::user("[Compressed context]\nSummary: User: old one")
         );
         assert_eq!(
             &result.messages[result.messages.len() - 2..],
@@ -1074,14 +1070,14 @@ mod tests {
         ];
         let phase_two = remove_previous_tool_groups(phase_three(&source, 100), 99, |_| 90);
         let result = compress_previous_text_turns(phase_two, &source, 50, |candidate| {
-            if candidate.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.starts_with("[Compressed context]")))) { 40 } else { 90 }
+            if candidate.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("[Compressed context]"))) { 40 } else { 90 }
         });
 
         assert_eq!(result.compressed, 1);
         assert!(matches!(
             &result.messages[0],
-            Message::Assistant { message }
-                if message.content.as_deref() == Some("[Compressed context]\nSummary: User: inspect; Tools: canonical_tool")
+            Message::User { content }
+                if content == "[Compressed context]\nSummary: User: inspect; Tools: canonical_tool"
         ));
         assert_eq!(result.messages[1], Message::user("current"));
     }
@@ -1102,7 +1098,7 @@ mod tests {
             &source,
             50,
             |candidate| {
-                if candidate.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.contains("User: reducing")))) { 40 } else { 100 }
+                if candidate.iter().any(|message| matches!(message, Message::User { content } if content.contains("User: reducing"))) { 40 } else { 100 }
             },
         );
 
@@ -1110,7 +1106,7 @@ mod tests {
         assert!(result.messages.iter().any(
             |message| matches!(message, Message::User { content } if content == "nonreducing")
         ));
-        assert!(result.messages.iter().any(|message| matches!(message, Message::Assistant { message } if message.content.as_deref().is_some_and(|text| text.contains("User: reducing")))));
+        assert!(result.messages.iter().any(|message| matches!(message, Message::User { content } if content.contains("User: reducing"))));
     }
 
     #[test]
@@ -1153,15 +1149,11 @@ mod tests {
             result.messages.as_ref(),
             &[
                 Message::user("tool-only turn"),
-                Message::assistant(AssistantMessage::text(
-                    "[Compressed context]\nSummary: User: first text turn",
-                )),
+                Message::user("[Compressed context]\nSummary: User: first text turn"),
                 Message::user("system-bearing turn"),
                 Message::system("must stay fixed"),
                 Message::assistant(AssistantMessage::text("system answer")),
-                Message::assistant(AssistantMessage::text(
-                    "[Compressed context]\nSummary: User: second text turn",
-                )),
+                Message::user("[Compressed context]\nSummary: User: second text turn"),
                 Message::user("current"),
                 Message::assistant(AssistantMessage::text("current answer")),
             ]

@@ -80,7 +80,7 @@ async fn responses_stream_maps_stateless_history_and_assembles_output() {
                 {
                     "type": "message",
                     "role": "assistant",
-                    "content": [{"type": "input_text", "text": "I will check."}]
+                    "content": [{"type": "output_text", "text": "I will check.", "annotations": []}]
                 },
                 {
                     "type": "function_call",
