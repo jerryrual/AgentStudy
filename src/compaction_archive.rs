@@ -1112,12 +1112,26 @@ fn civil_from_days(days: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+#[cfg(unix)]
+fn absolute_posix_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
 fn absolute_posix_path(path: &Path) -> String {
     let rendered = path.to_string_lossy().replace('\\', "/");
+    if let Some(unc) = rendered.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
     rendered
         .strip_prefix("//?/")
         .unwrap_or(&rendered)
         .to_string()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn absolute_posix_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn path_to_slashes(path: &Path) -> String {
@@ -1352,6 +1366,45 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("archived 2 records from previous turns"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_pointer_preserves_unix_backslashes_and_reads_the_same_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session\\with-backslash");
+        let store = ArchiveStore::with_root(&root);
+        store
+            .archive_round(&[record(1, 1, 1, "read_file", "one")])
+            .unwrap();
+        let pointer = store.catalog_pointer_text().unwrap().unwrap();
+        let rendered = pointer
+            .strip_prefix(
+                "Earlier context compaction archived 1 record from previous turns; catalog: ",
+            )
+            .unwrap()
+            .strip_suffix(" (contains each record's relative path).")
+            .unwrap();
+        let catalog = root.join(CATALOG_RELATIVE_PATH).canonicalize().unwrap();
+
+        assert_eq!(rendered, catalog.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(rendered).unwrap(),
+            std::fs::read_to_string(catalog).unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_posix_path_preserves_windows_drive_and_unc_roots() {
+        assert_eq!(
+            absolute_posix_path(Path::new(r"\\?\C:\sessions\catalog.jsonl")),
+            "C:/sessions/catalog.jsonl"
+        );
+        assert_eq!(
+            absolute_posix_path(Path::new(r"\\?\UNC\server\share\sessions\catalog.jsonl")),
+            "//server/share/sessions/catalog.jsonl"
+        );
     }
 
     #[test]
