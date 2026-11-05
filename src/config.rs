@@ -96,6 +96,9 @@ pub struct ModelProfile {
     pub api_key: String,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Total model context capacity in tokens, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
     /// Stream responses token-by-token. Enabled by default.
@@ -118,6 +121,7 @@ impl ModelProfile {
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "{{DEEPSEEK_API_KEY}}".to_string(),
             max_tokens: Some(8192),
+            context_window: Some(128_000),
             temperature: Some(0.1),
             stream: true,
         }
@@ -277,6 +281,20 @@ impl Settings {
             }
             if profile.model.trim().is_empty() {
                 bail!("model profile {:?} has an empty model id", profile.name);
+            }
+            if let Some(context_window) = profile.context_window {
+                if context_window == 0 {
+                    bail!("model profile {:?} has a zero context window", profile.name);
+                }
+                if let Some(max_tokens) = profile.max_tokens {
+                    if context_window <= max_tokens {
+                        bail!(
+                            "model profile {:?} context window ({context_window}) must exceed \
+                             max tokens ({max_tokens})",
+                            profile.name
+                        );
+                    }
+                }
             }
         }
         let mut seen = std::collections::HashSet::new();
@@ -522,6 +540,38 @@ mod tests {
         assert_eq!(settings.current_model.as_deref(), Some(DEFAULT_PROFILE));
         assert_eq!(settings.approval_mode, ApprovalMode::Ask);
         assert_eq!(settings.agent, "code");
+        assert_eq!(settings.models[0].context_window, Some(128_000));
+    }
+
+    #[test]
+    fn context_window_is_backward_compatible_and_skipped_when_unknown() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model",
+                "max_tokens": 1024
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(profile.context_window, None);
+
+        let json = serde_json::to_value(profile).unwrap();
+        assert_eq!(json.get("context_window"), None);
+    }
+
+    #[test]
+    fn normalise_rejects_invalid_context_windows() {
+        let mut settings = Settings::default();
+        settings.models[0].context_window = Some(0);
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("zero context window"));
+
+        settings.models[0].context_window = settings.models[0].max_tokens;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("must exceed max tokens"));
+
+        settings.models[0].context_window = Some(8193);
+        settings.normalise().unwrap();
     }
 
     #[test]

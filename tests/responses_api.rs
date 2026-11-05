@@ -14,6 +14,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         base_url: server.base_url(),
         api_key: "test-key".to_string(),
         max_tokens: Some(512),
+        context_window: None,
         temperature: None,
         stream,
     }

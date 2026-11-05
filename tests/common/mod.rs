@@ -182,6 +182,7 @@ pub fn mock_profile(base_url: String) -> icode::config::ModelProfile {
         base_url,
         api_key: "test-key".to_string(),
         max_tokens: None,
+        context_window: None,
         temperature: Some(0.0),
         stream: true,
     }
