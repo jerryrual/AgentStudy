@@ -155,14 +155,12 @@ impl ModelClient {
     fn estimated_request_tokens(&self, messages: &[Message], tools: &[ToolDef]) -> u32 {
         let semantic_messages: Vec<Value> = messages
             .iter()
-            .map(|message| {
-                let mut value = message.to_api();
-                if let Message::Assistant { message } = message {
-                    if !message.responses_items.is_empty() {
-                        value["responses_items"] = Value::Array(message.responses_items.clone());
-                    }
-                }
-                value
+            .map(|message| match message {
+                Message::Assistant { message } if !message.responses_items.is_empty() => json!({
+                    "role": "assistant",
+                    "responses_items": message.responses_items,
+                }),
+                _ => message.to_api(),
             })
             .collect();
         let semantic_tools: Vec<Value> = tools.iter().map(ToolDef::to_api).collect();
@@ -589,6 +587,33 @@ mod tests {
         profile.context_window = Some(2_000);
         profile.max_tokens = Some(500);
         ModelClient::from_profile(&profile).unwrap()
+    }
+
+    #[test]
+    fn request_budget_counts_responses_native_history_once() {
+        let client = budget_client(ApiStyle::Responses);
+        let native_item = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "native"}],
+        });
+        let messages = vec![Message::assistant(AssistantMessage {
+            content: Some("duplicate chat text".repeat(100)),
+            responses_items: vec![native_item.clone()],
+            ..AssistantMessage::default()
+        })];
+        let expected = json!({
+            "messages": [{
+                "role": "assistant",
+                "responses_items": [native_item],
+            }],
+            "tools": [],
+        });
+
+        assert_eq!(
+            client.estimated_request_tokens(&messages, &[]),
+            crate::context_budget::estimate_json_tokens(&expected)
+        );
     }
 
     #[test]
