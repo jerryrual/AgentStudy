@@ -75,6 +75,10 @@ pub enum Message {
     Summary {
         content: String,
     },
+    /// Persisted Phase 4 progress injected with the user role.
+    LastWords {
+        content: String,
+    },
     Assistant {
         message: AssistantMessage,
     },
@@ -104,6 +108,12 @@ impl Message {
         }
     }
 
+    pub(crate) fn last_words(content: impl Into<String>) -> Self {
+        Self::LastWords {
+            content: content.into(),
+        }
+    }
+
     pub fn assistant(message: AssistantMessage) -> Self {
         Self::Assistant { message }
     }
@@ -124,7 +134,9 @@ impl Message {
     pub fn to_api(&self) -> Value {
         match self {
             Message::System { content } => json!({"role": "system", "content": content}),
-            Message::User { content } | Message::Summary { content } => {
+            Message::User { content }
+            | Message::Summary { content }
+            | Message::LastWords { content } => {
                 json!({"role": "user", "content": content})
             }
             Message::Assistant { message } => {
@@ -170,7 +182,8 @@ impl Message {
         let text = match self {
             Message::System { content }
             | Message::User { content }
-            | Message::Summary { content } => content.clone(),
+            | Message::Summary { content }
+            | Message::LastWords { content } => content.clone(),
             Message::Assistant { message } => message.content.clone().unwrap_or_default(),
             Message::Tool { content, .. } => content.clone(),
         };

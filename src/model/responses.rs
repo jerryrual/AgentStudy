@@ -22,7 +22,8 @@ pub(super) fn request_body(
         match message {
             Message::System { content }
             | Message::User { content }
-            | Message::Summary { content } => input.push(json!({
+            | Message::Summary { content }
+            | Message::LastWords { content } => input.push(json!({
                 "type": "message",
                 "role": if matches!(message, Message::System { .. }) { "system" } else { "user" },
                 "content": [{"type": "input_text", "text": content}],
@@ -385,8 +386,33 @@ fn value_str<'a>(value: &'a Value, field: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_json, ResponsesAccumulator};
+    use super::{decode_json, request_body, ResponsesAccumulator};
     use crate::agent::NullSink;
+    use crate::model::Message;
+
+    #[test]
+    fn maps_last_words_as_stateless_user_context() {
+        let body = request_body(
+            &[
+                Message::user("task"),
+                Message::last_words("[LAST_WORDS] progress"),
+            ],
+            &[],
+            "model",
+            false,
+            None,
+            Some(128),
+            false,
+        );
+
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "[LAST_WORDS] progress"
+        );
+        assert_eq!(body["store"], false);
+        assert!(body.get("previous_response_id").is_none());
+    }
 
     #[test]
     fn accumulates_function_call_argument_deltas_before_completion() {

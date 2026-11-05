@@ -1407,7 +1407,8 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
             }
             crate::session::Record::Meta { .. }
             | crate::session::Record::Usage { .. }
-            | crate::session::Record::CompressionBatch { .. } => {}
+            | crate::session::Record::CompressionBatch { .. }
+            | crate::session::Record::ContextProjection { .. } => {}
         }
     }
     view
