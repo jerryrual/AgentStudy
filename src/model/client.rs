@@ -175,13 +175,21 @@ impl ModelClient {
         tools: &[ToolDef],
         sink: &dyn EventSink,
     ) -> Result<PersistentCompletion> {
-        let prepared = self.prepare_request(messages, tools, false)?;
+        let archive_pointer = Self::request_archive_pointer(tools, sink);
+        let prepared =
+            self.prepare_persistent_request(messages, tools, false, archive_pointer.as_deref())?;
         let mut auxiliary_usage = Usage::default();
         let mut phase_four_attempted = false;
         if self.phase_four_needed(&prepared, messages) {
             phase_four_attempted = true;
             match self
-                .prepare_phase_four_retry(messages, tools, &prepared, sink)
+                .prepare_phase_four_retry(
+                    messages,
+                    tools,
+                    &prepared,
+                    archive_pointer.as_deref(),
+                    sink,
+                )
                 .await
             {
                 Ok((retry, phase_four_usage)) => {
@@ -211,10 +219,21 @@ impl ModelClient {
             Err(ClientError::ContextOverflow { error, named_limit })
                 if self.can_retry_context_overflow(named_limit) =>
             {
-                let retry = self.prepare_request(messages, tools, true)?;
+                let retry = self.prepare_persistent_request(
+                    messages,
+                    tools,
+                    true,
+                    archive_pointer.as_deref(),
+                )?;
                 if !phase_four_attempted && Self::phase_four_eligible(messages) {
                     match self
-                        .prepare_phase_four_retry(messages, tools, &retry, sink)
+                        .prepare_phase_four_retry(
+                            messages,
+                            tools,
+                            &retry,
+                            archive_pointer.as_deref(),
+                            sink,
+                        )
                         .await
                     {
                         Ok((phase_four, phase_four_usage)) => {
@@ -256,6 +275,14 @@ impl ModelClient {
         }
     }
 
+    fn request_archive_pointer(tools: &[ToolDef], sink: &dyn EventSink) -> Option<String> {
+        tools
+            .iter()
+            .any(|tool| tool.name == "read_file")
+            .then(|| sink.archive_pointer())
+            .flatten()
+    }
+
     fn phase_four_needed(&self, prepared: &PreparedRequest, messages: &[Message]) -> bool {
         prepared.compaction_triggered
             && prepared
@@ -280,6 +307,7 @@ impl ModelClient {
         messages: &mut Vec<Message>,
         tools: &[ToolDef],
         prepared: &PreparedRequest,
+        archive_pointer: Option<&str>,
         sink: &dyn EventSink,
     ) -> std::result::Result<(PreparedRequest, Usage), PhaseFourPrepareError> {
         let historical = prepared
@@ -306,7 +334,7 @@ impl ModelClient {
             .projected(messages)
             .map_err(PhaseFourPrepareError::Fatal)?;
         let retry = self
-            .prepare_request(&projected, tools, false)
+            .prepare_persistent_request(&projected, tools, false, archive_pointer)
             .map_err(|error| {
                 PhaseFourPrepareError::Skipped(PhaseFourSkipped {
                     error,
@@ -403,6 +431,21 @@ impl ModelClient {
     /// Build the provider-specific request and apply its context output cap.
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
         Ok(self.prepare_request(messages, tools, false)?.body)
+    }
+
+    fn prepare_persistent_request(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        force_compaction: bool,
+        archive_pointer: Option<&str>,
+    ) -> Result<PreparedRequest> {
+        let Some(pointer) = archive_pointer.filter(|pointer| !pointer.trim().is_empty()) else {
+            return self.prepare_request(messages, tools, force_compaction);
+        };
+        let mut enriched = messages.to_vec();
+        enriched.push(crate::compaction::archive_pointer_message(pointer));
+        self.prepare_request(&enriched, tools, force_compaction)
     }
 
     fn prepare_request(
@@ -1347,6 +1390,14 @@ mod tests {
     struct NullSink;
     impl EventSink for NullSink {}
 
+    struct ArchivePointerSink;
+
+    impl EventSink for ArchivePointerSink {
+        fn archive_pointer(&self) -> Option<String> {
+            Some("catalog pointer".into())
+        }
+    }
+
     struct PersistSink {
         committed: bool,
         calls: AtomicUsize,
@@ -1395,6 +1446,44 @@ mod tests {
         profile.context_window = Some(2_000);
         profile.max_tokens = Some(500);
         ModelClient::from_profile(&profile).unwrap()
+    }
+
+    #[test]
+    fn archive_pointer_requires_the_read_file_tool() {
+        let tool = |name: &str| ToolDef {
+            name: name.into(),
+            description: String::new(),
+            parameters: json!({}),
+        };
+
+        assert_eq!(
+            ModelClient::request_archive_pointer(&[tool("grep")], &ArchivePointerSink),
+            None
+        );
+        assert_eq!(
+            ModelClient::request_archive_pointer(&[tool("read_file")], &ArchivePointerSink),
+            Some("catalog pointer".into())
+        );
+    }
+
+    #[test]
+    fn persistent_requests_budget_and_send_the_archive_pointer() {
+        let messages = vec![Message::system("system"), Message::user("task")];
+        let pointer = "Earlier context compaction archived 2 records from previous turns; catalog: /tmp/session/compactions/dropped/catalog.jsonl (contains each record's relative path).";
+
+        for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
+            let client = budget_client(api_style);
+            let plain = client.prepare_request(&messages, &[], false).unwrap();
+            let enriched = client
+                .prepare_persistent_request(&messages, &[], false, Some(pointer))
+                .unwrap();
+
+            assert!(enriched.estimated_input > plain.estimated_input);
+            let body = enriched.body.to_string();
+            assert!(body.contains("Earlier context compaction archived 2 records"));
+            assert!(body.contains("/tmp/session/compactions/dropped/catalog.jsonl"));
+            assert!(body.contains("<system-reminder>"));
+        }
     }
 
     #[test]

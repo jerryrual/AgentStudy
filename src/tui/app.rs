@@ -839,6 +839,7 @@ impl App {
             session: self.session.clone(),
             recorder: self.recorder.clone(),
             persistence_gate,
+            archive_pointer: Mutex::new(None),
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -1478,6 +1479,7 @@ struct TuiSink {
     session: Session,
     recorder: Arc<Mutex<RecordBuffer>>,
     persistence_gate: Arc<AtomicBool>,
+    archive_pointer: Mutex<Option<String>>,
 }
 
 impl TuiSink {
@@ -1490,6 +1492,21 @@ impl TuiSink {
 }
 
 impl EventSink for TuiSink {
+    fn turn_started(&self) {
+        let pointer = self.session.archive_catalog_pointer().ok().flatten();
+        *self
+            .archive_pointer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = pointer;
+    }
+
+    fn archive_pointer(&self) -> Option<String> {
+        self.archive_pointer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
         let _recorder = self
             .recorder
@@ -1716,6 +1733,7 @@ mod tests {
             session: session.clone(),
             recorder: recorder.clone(),
             persistence_gate: Arc::new(AtomicBool::new(true)),
+            archive_pointer: Mutex::new(None),
         };
 
         assert!(sink
@@ -1767,6 +1785,7 @@ mod tests {
             session: session.clone(),
             recorder: recorder.clone(),
             persistence_gate: gate.clone(),
+            archive_pointer: Mutex::new(None),
         });
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -1864,6 +1883,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
+            archive_pointer: Mutex::new(None),
         };
 
         assert!(!sink
@@ -1883,6 +1903,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
+            archive_pointer: Mutex::new(None),
         };
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {
@@ -1909,6 +1930,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
+            archive_pointer: Mutex::new(None),
         });
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {

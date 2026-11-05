@@ -15,6 +15,11 @@ pub trait EventSink: Send + Sync {
     /// A new user turn started.
     fn turn_started(&self) {}
 
+    /// The stable previous-turn archive pointer captured when this turn started.
+    fn archive_pointer(&self) -> Option<String> {
+        None
+    }
+
     /// A chunk of assistant text arrived.
     fn text_delta(&self, _delta: &str) {}
 
