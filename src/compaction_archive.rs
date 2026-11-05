@@ -157,8 +157,7 @@ impl ArchiveStore {
 
     fn reconcile_unlocked(&self) -> Result<ArchiveState> {
         match std::fs::symlink_metadata(&self.root) {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            }
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata_is_link_like(&metadata) => {}
             Ok(_) => return Ok(ArchiveState::default()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ArchiveState {
@@ -495,7 +494,7 @@ impl ArchiveStore {
     fn path_has_symlink(&self, relative: &Path) -> Result<bool> {
         let mut current = self.root.clone();
         if let Ok(metadata) = std::fs::symlink_metadata(&current) {
-            if metadata.file_type().is_symlink() {
+            if metadata_is_link_like(&metadata) {
                 return Ok(true);
             }
         }
@@ -505,7 +504,7 @@ impl ArchiveStore {
             };
             current.push(component);
             match std::fs::symlink_metadata(&current) {
-                Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+                Ok(metadata) if metadata_is_link_like(&metadata) => return Ok(true),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 Err(error) => return Err(error.into()),
@@ -514,26 +513,66 @@ impl ArchiveStore {
         Ok(false)
     }
 
+    fn append_turn_directories(
+        &self,
+        relative_root: &Path,
+        output: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        if self.path_has_symlink(relative_root)? {
+            bail!("unsafe archive turn root {}", relative_root.display());
+        }
+        let root = self.root.join(relative_root);
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry?;
+            let relative = entry.path().strip_prefix(&self.root)?.to_path_buf();
+            if self.path_has_symlink(&relative)? {
+                bail!("unsafe archive turn directory {}", relative.display());
+            }
+            if entry.file_type()?.is_dir()
+                && valid_turn_directory(&entry.file_name().to_string_lossy())
+            {
+                output.push(entry.path());
+            }
+        }
+        Ok(())
+    }
+
     fn owned_turn_directories(&self) -> Result<Vec<PathBuf>> {
         let mut directories = Vec::new();
-        append_turn_directories(&self.root.join("compactions/dropped"), &mut directories)?;
-        let sub_agents = self.root.join("compactions/sub_agents");
+        self.append_turn_directories(Path::new("compactions/dropped"), &mut directories)?;
+        let sub_agents_relative = Path::new("compactions/sub_agents");
+        if self.path_has_symlink(sub_agents_relative)? {
+            bail!("unsafe sub-agent archive root");
+        }
+        let sub_agents = self.root.join(sub_agents_relative);
         let Ok(tools) = std::fs::read_dir(sub_agents) else {
             return Ok(directories);
         };
         for tool in tools {
             let tool = tool?;
-            let file_type = tool.file_type()?;
-            if !file_type.is_dir() || file_type.is_symlink() {
+            let tool_relative = tool.path().strip_prefix(&self.root)?.to_path_buf();
+            if self.path_has_symlink(&tool_relative)? {
+                bail!("unsafe sub-agent tool archive directory");
+            }
+            if !tool.file_type()?.is_dir() {
                 continue;
             }
             for invocation in std::fs::read_dir(tool.path())? {
                 let invocation = invocation?;
-                let file_type = invocation.file_type()?;
-                if !file_type.is_dir() || file_type.is_symlink() {
+                let invocation_relative = invocation.path().strip_prefix(&self.root)?.to_path_buf();
+                if self.path_has_symlink(&invocation_relative)? {
+                    bail!("unsafe sub-agent invocation archive directory");
+                }
+                if !invocation.file_type()?.is_dir() {
                     continue;
                 }
-                append_turn_directories(&invocation.path().join("dropped"), &mut directories)?;
+                self.append_turn_directories(
+                    &invocation_relative.join("dropped"),
+                    &mut directories,
+                )?;
             }
         }
         Ok(directories)
@@ -603,23 +642,6 @@ impl ArchiveStore {
         }
         Ok(())
     }
-}
-
-fn append_turn_directories(root: &Path, output: &mut Vec<PathBuf>) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir()
-            && !file_type.is_symlink()
-            && valid_turn_directory(&entry.file_name().to_string_lossy())
-        {
-            output.push(entry.path());
-        }
-    }
-    Ok(())
 }
 
 fn refusals(count: usize, reason: &'static str) -> Vec<ArchiveWrite> {
@@ -826,9 +848,26 @@ fn path_to_slashes(path: &Path) -> String {
         .join("/")
 }
 
+#[cfg(unix)]
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 fn safe_existing_directory(path: &Path) -> Result<bool> {
     let metadata = std::fs::symlink_metadata(path)?;
-    Ok(metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+    Ok(metadata.file_type().is_dir() && !metadata_is_link_like(&metadata))
 }
 
 #[cfg(unix)]
@@ -922,13 +961,43 @@ fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 
+#[cfg(not(windows))]
+fn replace_path(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(windows)]
+fn replace_path(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    let backup = destination.with_extension("bak");
+    let _ = std::fs::remove_file(&backup);
+    let had_destination = match std::fs::rename(destination, &backup) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    match std::fs::rename(temporary, destination) {
+        Ok(()) => {
+            if had_destination {
+                let _ = std::fs::remove_file(backup);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if had_destination {
+                let _ = std::fs::rename(backup, destination);
+            }
+            Err(error)
+        }
+    }
+}
+
 fn replace_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let _ = std::fs::remove_file(&temporary);
     let mut file = open_new_private(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
+    replace_path(&temporary, path)?;
     sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
     Ok(())
 }
@@ -1289,6 +1358,32 @@ mod tests {
             .unwrap();
         assert_eq!(writes[0].no_record_reason, Some("storage unavailable"));
         assert!(outside.join("keep.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_sub_agent_root_disables_storage_without_external_mutation() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("session");
+        std::fs::create_dir_all(root.join("compactions")).unwrap();
+        let outside_turn = directory
+            .path()
+            .join("outside/worker/invoke/dropped/turn001");
+        std::fs::create_dir_all(&outside_turn).unwrap();
+        let outside_record = outside_turn.join("001_bash_1234abcd.md");
+        std::fs::write(&outside_record, "keep").unwrap();
+        symlink(
+            directory.path().join("outside"),
+            root.join("compactions/sub_agents"),
+        )
+        .unwrap();
+
+        let state = ArchiveStore::with_root(&root).reconcile().unwrap();
+
+        assert!(!state.writable);
+        assert!(outside_record.exists());
+        assert!(!outside_turn.join("manifest.md").exists());
     }
 
     #[cfg(unix)]
