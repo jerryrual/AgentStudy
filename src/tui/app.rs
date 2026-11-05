@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
-use crate::compaction::Compaction;
+use crate::compaction::{Compaction, ForcedCompressionPlan};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -57,7 +57,7 @@ pub enum Modal {
 }
 
 /// Events sent from the agent task and the interaction handlers.
-pub enum UiEvent {
+pub(crate) enum UiEvent {
     Turn {
         id: u64,
         event: Box<UiEvent>,
@@ -87,7 +87,11 @@ pub enum UiEvent {
         question: String,
         reply: oneshot::Sender<String>,
     },
-    TurnFinished(std::result::Result<TurnResult, String>, Vec<Message>),
+    TurnFinished(
+        std::result::Result<TurnResult, String>,
+        Vec<Message>,
+        Option<ForcedCompressionPlan>,
+    ),
     CompactionFinished {
         result: std::result::Result<Compaction, String>,
         duration: Duration,
@@ -217,7 +221,8 @@ impl App {
     }
 
     /// Send an event into the app (used by tests).
-    pub fn push_event(&self, event: UiEvent) {
+    #[cfg(test)]
+    pub(crate) fn push_event(&self, event: UiEvent) {
         let _ = self.events_tx.send(event);
     }
 
@@ -349,7 +354,7 @@ impl App {
                     "Type your answer and press Enter.".to_string(),
                 ));
             }
-            UiEvent::TurnFinished(result, messages) => {
+            UiEvent::TurnFinished(result, messages, forced_compression) => {
                 self.messages = messages;
                 self.running = false;
                 self.turn_started = None;
@@ -361,6 +366,23 @@ impl App {
                 match result {
                     Ok(turn) => {
                         self.elapsed = turn.duration;
+                        if !self.unsaved_messages {
+                            if let Some(plan) = forced_compression {
+                                let record = Record::Compaction {
+                                    summary: plan.summary.clone(),
+                                    compacted_messages: Some(plan.compacted_messages),
+                                };
+                                match self.session.append(&record) {
+                                    Ok(()) => {
+                                        self.messages = plan.projected(&self.messages);
+                                        self.recorder.reset();
+                                    }
+                                    Err(error) => self.view.push(ViewItem::Error(format!(
+                                        "failed to save automatic compaction: {error:#}"
+                                    ))),
+                                }
+                            }
+                        }
                         if turn.tool_calls > 0 {
                             self.view.push(ViewItem::Info(format!(
                                 "Done in {:.1}s · {} tool call(s) · {} model calls",
@@ -381,6 +403,7 @@ impl App {
                     Ok(compaction) => {
                         let record = Record::Compaction {
                             summary: compaction.summary.clone(),
+                            compacted_messages: None,
                         };
                         if let Err(error) = self.session.append(&record) {
                             self.view.push(ViewItem::Error(format!(
@@ -741,7 +764,7 @@ impl App {
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
-            let result = async {
+            let completed = async {
                 let client = Arc::new(
                     tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
                         .await
@@ -756,15 +779,22 @@ impl App {
                     tool_timeout: Duration::from_secs(120),
                 };
                 let agent = Agent::new(client, tools, approver, asker, options);
-                agent.run(&mut messages, sink.as_ref()).await
+                let turn = agent.run(&mut messages, sink.as_ref()).await?;
+                let forced_compression = if agent.should_force_compression(&turn) {
+                    crate::compaction::plan_forced_compression(&messages)
+                } else {
+                    None
+                };
+                Ok::<_, anyhow::Error>((turn, forced_compression))
             }
             .await;
+            let (result, forced_compression) = match completed {
+                Ok((turn, plan)) => (Ok(turn), plan),
+                Err(error) => (Err(format!("{error:#}")), None),
+            };
             let _ = tx.send(UiEvent::Turn {
                 id: turn_id,
-                event: Box::new(UiEvent::TurnFinished(
-                    result.map_err(|error| format!("{error:#}")),
-                    messages,
-                )),
+                event: Box::new(UiEvent::TurnFinished(result, messages, forced_compression)),
             });
         });
         self.cancel_handle = Some(task);
@@ -1286,7 +1316,13 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
                 duration: None,
                 output: preview_output(content),
             }),
-            crate::session::Record::Compaction { summary } => {
+            crate::session::Record::Compaction {
+                summary,
+                compacted_messages,
+            } => {
+                if compacted_messages.is_some() {
+                    continue;
+                }
                 view.clear();
                 view.push(ViewItem::Info(
                     "Compressed earlier conversation into this summary:".to_string(),
@@ -1450,6 +1486,34 @@ impl Asker for TuiAsker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_compaction_records_do_not_change_the_visible_transcript() {
+        let records = vec![
+            Record::User {
+                text: "old request".to_string(),
+            },
+            Record::Compaction {
+                summary: "automatic summary".to_string(),
+                compacted_messages: Some(1),
+            },
+            Record::Assistant {
+                content: Some("latest answer".to_string()),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                responses_items: Vec::new(),
+            },
+        ];
+
+        let view = view_from_records(&records);
+
+        assert_eq!(view.len(), 2);
+        assert!(matches!(&view[0], ViewItem::User(text) if text == "old request"));
+        assert!(matches!(
+            &view[1],
+            ViewItem::Assistant { text, .. } if text == "latest answer"
+        ));
+    }
 
     #[test]
     fn clipping_uses_display_width_and_popup_width() {

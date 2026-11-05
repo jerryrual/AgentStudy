@@ -53,13 +53,15 @@ pub enum Record {
     },
     Compaction {
         summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted_messages: Option<usize>,
     },
 }
 
 impl Record {
     pub fn from_message(message: &Message) -> Option<Self> {
         match message {
-            Message::System { .. } => None,
+            Message::System { .. } | Message::Summary { .. } => None,
             Message::User { content } => Some(Self::User {
                 text: content.clone(),
             }),
@@ -174,11 +176,32 @@ impl LoadedSession {
                         messages.push(Message::tool(call_id, name, content));
                     }
                 }
-                Record::Compaction { summary } => {
-                    pending.clear();
-                    messages.clear();
-                    messages.push(crate::compaction::summary_message(summary));
-                }
+                Record::Compaction {
+                    summary,
+                    compacted_messages,
+                } => match compacted_messages {
+                    None => {
+                        pending.clear();
+                        messages.clear();
+                        messages.push(crate::compaction::summary_message(summary));
+                    }
+                    Some(count) => {
+                        flush(&mut messages, &mut pending);
+                        let range_start = messages
+                            .iter()
+                            .rposition(|message| matches!(message, Message::Summary { .. }))
+                            .map_or(0, |position| position + 1);
+                        let available = messages.len() - range_start;
+                        // A corrupt persisted count must not discard an unknown tail.
+                        if *count == 0 || *count > available {
+                            continue;
+                        }
+                        messages.splice(
+                            range_start..range_start + *count,
+                            std::iter::once(crate::compaction::summary_message(summary)),
+                        );
+                    }
+                },
                 Record::Meta { .. } | Record::Usage { .. } => {}
             }
         }
@@ -440,6 +463,28 @@ fn next_id(created_ms: u64) -> String {
 mod tests {
     use super::*;
 
+    fn loaded(records: Vec<Record>) -> LoadedSession {
+        LoadedSession {
+            meta: SessionMeta {
+                id: "test".into(),
+                created_ms: 0,
+                cwd: "/tmp".into(),
+                model: "model".into(),
+                agent: "code".into(),
+            },
+            records,
+        }
+    }
+
+    fn assistant_record(content: &str) -> Record {
+        Record::Assistant {
+            content: Some(content.into()),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            responses_items: Vec::new(),
+        }
+    }
+
     #[test]
     fn round_trip_session() {
         let directory = tempfile::tempdir().unwrap();
@@ -569,6 +614,7 @@ mod tests {
         session
             .append(&Record::Compaction {
                 summary: "Changed src/main.rs and tests pass.".into(),
+                compacted_messages: None,
             })
             .unwrap();
         session.append_message(&Message::user("continue")).unwrap();
@@ -577,9 +623,223 @@ mod tests {
         assert_eq!(messages.len(), 2, "{messages:?}");
         assert!(matches!(
             &messages[0],
-            Message::User { content } if content.contains("Changed src/main.rs")
+            Message::Summary { content } if content.contains("Changed src/main.rs")
         ));
         assert_eq!(messages[1], Message::user("continue"));
+    }
+
+    #[test]
+    fn old_compaction_json_keeps_manual_reset_semantics() {
+        let record: Record =
+            serde_json::from_str(r#"{"type":"compaction","summary":"legacy summary"}"#).unwrap();
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("compacted_messages"));
+
+        let messages = loaded(vec![
+            Record::User {
+                text: "discard me".into(),
+            },
+            record,
+            Record::User {
+                text: "keep me".into(),
+            },
+        ])
+        .messages();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[0],
+            Message::Summary { content }
+                if content == "[Earlier conversation summary]\nlegacy summary"
+        ));
+        assert_eq!(messages[1], Message::user("keep me"));
+    }
+
+    #[test]
+    fn persisted_prefix_fold_preserves_a_later_turn() {
+        let messages = loaded(vec![
+            Record::User {
+                text: "old request".into(),
+            },
+            assistant_record("old answer"),
+            Record::User {
+                text: "later request".into(),
+            },
+            assistant_record("later answer"),
+            Record::Compaction {
+                summary: "folded old turn".into(),
+                compacted_messages: Some(2),
+            },
+        ])
+        .messages();
+
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(matches!(
+            &messages[0],
+            Message::Summary { content } if content.ends_with("folded old turn")
+        ));
+        assert_eq!(messages[1], Message::user("later request"));
+        assert!(matches!(
+            &messages[2],
+            Message::Assistant { message }
+                if message.content.as_deref() == Some("later answer")
+        ));
+    }
+
+    #[test]
+    fn stacked_prefix_folds_preserve_summaries_and_current_tail() {
+        let messages = loaded(vec![
+            Record::User {
+                text: "first request".into(),
+            },
+            assistant_record("first answer"),
+            Record::Compaction {
+                summary: "first summary".into(),
+                compacted_messages: Some(2),
+            },
+            Record::User {
+                text: "second request".into(),
+            },
+            assistant_record("second answer"),
+            Record::User {
+                text: "current request".into(),
+            },
+            assistant_record("current answer"),
+            Record::Compaction {
+                summary: "second summary".into(),
+                compacted_messages: Some(2),
+            },
+        ])
+        .messages();
+
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert!(matches!(
+            &messages[0],
+            Message::Summary { content } if content.ends_with("first summary")
+        ));
+        assert!(matches!(
+            &messages[1],
+            Message::Summary { content } if content.ends_with("second summary")
+        ));
+        assert_eq!(messages[2], Message::user("current request"));
+        assert!(matches!(
+            &messages[3],
+            Message::Assistant { message }
+                if message.content.as_deref() == Some("current answer")
+        ));
+    }
+
+    #[test]
+    fn stacked_prefix_folds_ignore_user_text_that_spoofs_the_summary_prefix() {
+        let prefixed_user = format!("{}literal user task", crate::compaction::SUMMARY_PREFIX);
+        let messages = loaded(vec![
+            Record::User {
+                text: prefixed_user,
+            },
+            assistant_record("first answer"),
+            Record::User {
+                text: "second request".into(),
+            },
+            assistant_record("second answer"),
+            Record::Compaction {
+                summary: "first structural summary".into(),
+                compacted_messages: Some(2),
+            },
+            Record::User {
+                text: "current request".into(),
+            },
+            assistant_record("current answer"),
+            Record::Compaction {
+                summary: "second structural summary".into(),
+                compacted_messages: Some(2),
+            },
+        ])
+        .messages();
+
+        assert_eq!(
+            messages,
+            vec![
+                crate::compaction::summary_message("first structural summary"),
+                crate::compaction::summary_message("second structural summary"),
+                Message::user("current request"),
+                Message::assistant(AssistantMessage::text("current answer")),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_fold_flushes_pending_tool_state_before_splicing() {
+        let messages = loaded(vec![
+            Record::Assistant {
+                content: Some("calling".into()),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: Vec::new(),
+            },
+            Record::Compaction {
+                summary: "interrupted turn folded".into(),
+                compacted_messages: Some(2),
+            },
+            Record::Tool {
+                call_id: "call_1".into(),
+                name: "bash".into(),
+                content: "late result".into(),
+            },
+            Record::User {
+                text: "next request".into(),
+            },
+        ])
+        .messages();
+
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(matches!(
+            &messages[0],
+            Message::Summary { content } if content.ends_with("interrupted turn folded")
+        ));
+        assert_eq!(messages[1], Message::user("next request"));
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            Message::Assistant { message } if !message.tool_calls.is_empty()
+        )));
+        assert!(!messages
+            .iter()
+            .any(|message| matches!(message, Message::Tool { .. })));
+    }
+
+    #[test]
+    fn corrupt_prefix_count_preserves_history_and_raw_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("keep one")).unwrap();
+        session.append_message(&Message::user("keep two")).unwrap();
+        session
+            .append(&Record::Compaction {
+                summary: "must not replace history".into(),
+                compacted_messages: Some(usize::MAX),
+            })
+            .unwrap();
+
+        let path = store.path(session.id());
+        let raw_before = std::fs::read_to_string(&path).unwrap();
+        let loaded = store.load(session.id()).unwrap();
+        let messages = loaded.messages();
+        let raw_after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            messages,
+            vec![Message::user("keep one"), Message::user("keep two")]
+        );
+        assert_eq!(
+            raw_after, raw_before,
+            "replay must never rewrite the transcript"
+        );
+        assert_eq!(loaded.records.len(), 4, "all append-only records remain");
+        assert!(raw_after.contains(&format!(r#""compacted_messages":{}"#, usize::MAX)));
     }
 
     #[test]

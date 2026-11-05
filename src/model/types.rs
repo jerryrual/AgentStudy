@@ -71,6 +71,10 @@ pub enum Message {
     User {
         content: String,
     },
+    /// Persisted compaction context sent to providers with the user role.
+    Summary {
+        content: String,
+    },
     Assistant {
         message: AssistantMessage,
     },
@@ -90,6 +94,12 @@ impl Message {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
+            content: content.into(),
+        }
+    }
+
+    pub(crate) fn summary(content: impl Into<String>) -> Self {
+        Self::Summary {
             content: content.into(),
         }
     }
@@ -114,7 +124,9 @@ impl Message {
     pub fn to_api(&self) -> Value {
         match self {
             Message::System { content } => json!({"role": "system", "content": content}),
-            Message::User { content } => json!({"role": "user", "content": content}),
+            Message::User { content } | Message::Summary { content } => {
+                json!({"role": "user", "content": content})
+            }
             Message::Assistant { message } => {
                 let mut value = json!({"role": "assistant"});
                 value["content"] = match &message.content {
@@ -156,7 +168,9 @@ impl Message {
     /// Short single-line rendering used by transcripts and tests.
     pub fn preview(&self) -> String {
         let text = match self {
-            Message::System { content } | Message::User { content } => content.clone(),
+            Message::System { content }
+            | Message::User { content }
+            | Message::Summary { content } => content.clone(),
             Message::Assistant { message } => message.content.clone().unwrap_or_default(),
             Message::Tool { content, .. } => content.clone(),
         };

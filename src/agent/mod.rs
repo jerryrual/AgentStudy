@@ -56,6 +56,7 @@ impl AgentKind {
 pub struct TurnResult {
     pub text: String,
     pub usage: Usage,
+    pub(crate) latest_usage: Usage,
     pub tool_calls: usize,
     pub rounds: usize,
     pub duration: Duration,
@@ -144,6 +145,10 @@ impl Agent {
         self.options.kind
     }
 
+    pub(crate) fn should_force_compression(&self, result: &TurnResult) -> bool {
+        self.client.should_force_compression(result.latest_usage)
+    }
+
     /// The system prompt for this agent, anchored at the working directory.
     pub fn system_prompt(&self) -> String {
         let base = match self.options.kind {
@@ -220,6 +225,7 @@ impl Agent {
                 .client
                 .complete(messages, &self.visible_specs(), sink)
                 .await?;
+            let latest_usage = completion.usage;
             usage.add(completion.usage);
             sink.usage(&completion.usage);
 
@@ -244,6 +250,7 @@ impl Agent {
                 let result = TurnResult {
                     text: text.unwrap_or_default(),
                     usage,
+                    latest_usage,
                     tool_calls,
                     rounds,
                     duration: started.elapsed(),
@@ -632,6 +639,42 @@ mod tests {
 
         assert!(prompt.contains("# Auto-loaded memory"));
         assert!(prompt.contains("## File: AGENTS.md\n\nUse cargo clippy."));
+    }
+
+    #[test]
+    fn forced_compression_uses_latest_call_instead_of_aggregate_usage() {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        profile.context_window = Some(2_000);
+        profile.max_tokens = Some(500);
+        let force_tokens = crate::context_budget::ContextBudget::derive(2_000, 500)
+            .unwrap()
+            .force_tokens;
+        let agent = Agent::new(
+            Arc::new(ModelClient::from_profile(&profile).unwrap()),
+            Arc::new(ToolRegistry::with_tools(Vec::new())),
+            Arc::new(AllowAll),
+            Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, "/tmp"),
+        );
+        let mut result = TurnResult {
+            usage: Usage {
+                prompt_tokens: u64::from(force_tokens) + 10_000,
+                completion_tokens: 20,
+                total_tokens: u64::from(force_tokens) + 10_020,
+            },
+            latest_usage: Usage {
+                prompt_tokens: u64::from(force_tokens),
+                completion_tokens: 10,
+                total_tokens: u64::from(force_tokens) + 10,
+            },
+            ..TurnResult::default()
+        };
+
+        assert!(!agent.should_force_compression(&result));
+        result.latest_usage.prompt_tokens += 1;
+        assert!(agent.should_force_compression(&result));
     }
 
     #[test]

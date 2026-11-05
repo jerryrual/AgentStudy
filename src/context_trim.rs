@@ -179,18 +179,15 @@ where
         return projection;
     }
 
-    let summary_boundary = source_users
+    let summary_boundary = source
         .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(ordinal, index)| {
-            matches!(
-                &source[*index],
-                Message::User { content } if content.starts_with(crate::compaction::SUMMARY_PREFIX)
-            )
-            .then_some(ordinal)
-        });
-    let first_eligible = summary_boundary.map_or(0, |ordinal| ordinal + 1);
+        .rposition(|message| matches!(message, Message::Summary { .. }));
+    let first_eligible = summary_boundary.map_or(0, |boundary| {
+        source_users
+            .iter()
+            .position(|index| *index > boundary)
+            .unwrap_or(source_users.len())
+    });
     let mut estimate = estimate;
     let mut contracted = 0usize;
 
@@ -237,7 +234,7 @@ fn user_indices(messages: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-fn automatic_turn_summary(turn: &[Message]) -> String {
+pub(crate) fn automatic_turn_summary(turn: &[Message]) -> String {
     let user_messages: Vec<_> = turn
         .iter()
         .filter_map(|message| match message {
@@ -1166,7 +1163,7 @@ mod tests {
         let source = vec![
             Message::user("before summary"),
             Message::assistant(AssistantMessage::text("old")),
-            Message::user(format!("{}manual", crate::compaction::SUMMARY_PREFIX)),
+            crate::compaction::summary_message("manual"),
             Message::assistant(AssistantMessage::text("boundary")),
             Message::user("after summary"),
             Message::assistant(AssistantMessage::text("eligible")),
@@ -1180,7 +1177,10 @@ mod tests {
         assert!(first.messages.iter().any(
             |message| matches!(message, Message::User { content } if content == "before summary")
         ));
-        assert!(first.messages.iter().any(|message| matches!(message, Message::User { content } if content.starts_with(crate::compaction::SUMMARY_PREFIX))));
+        assert!(first
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Summary { .. })));
         let repeated = compress_previous_text_turns(first.clone(), &source, 0, |candidate| {
             candidate.len() as u32
         });
