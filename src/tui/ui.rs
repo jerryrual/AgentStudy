@@ -735,6 +735,73 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_reload_failure_blocks_turn_until_history_recovers() {
+        use crate::compaction::{CompressionBatch, CompressionFold};
+        use crate::model::{AssistantMessage, Message};
+
+        let mut app = test_app();
+        let source = vec![
+            Message::user("old request"),
+            Message::assistant(AssistantMessage::text("old answer")),
+            Message::user("current request"),
+        ];
+        for message in &source {
+            app.session.append_message(message).unwrap();
+        }
+        let batch = CompressionBatch {
+            folds: vec![CompressionFold {
+                summary: "old request and answer".to_string(),
+                compacted_messages: 2,
+            }],
+        };
+        app.session.append_compression_batch(&batch).unwrap();
+        let expected = batch.projected(&source).unwrap();
+        let path = app.store.path(app.session.id());
+        let valid_session = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{not valid json}\n").unwrap();
+        app.messages = source.clone();
+        app.running = true;
+
+        app.cancel();
+
+        assert!(app.requires_session_reload);
+        assert_eq!(app.messages, source);
+        let broken_len = std::fs::metadata(&path).unwrap().len();
+        app.input = "next request".to_string();
+        app.submit();
+        assert_eq!(app.input, "next request");
+        assert!(!app.running);
+        assert!(app.requires_session_reload);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), broken_len);
+        assert!(!app
+            .view
+            .iter()
+            .any(|item| matches!(item, ViewItem::User(text) if text == "next request")));
+
+        std::fs::write(&path, valid_session).unwrap();
+        app.submit();
+
+        let mut expected_with_next = expected;
+        expected_with_next.push(Message::user("next request"));
+        assert!(!app.requires_session_reload);
+        assert!(app.running);
+        assert_eq!(app.input, "");
+        assert_eq!(app.messages, expected_with_next);
+        assert_eq!(
+            app.store.load(app.session.id()).unwrap().messages(),
+            expected_with_next
+        );
+        assert_eq!(
+            app.history
+                .iter()
+                .filter(|entry| entry.as_str() == "next request")
+                .count(),
+            1
+        );
+        app.cancel();
+    }
+
+    #[test]
     fn compaction_uses_persisted_messages_after_cancelled_turn() {
         use crate::model::{AssistantMessage, Message};
 

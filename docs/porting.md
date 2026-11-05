@@ -19,7 +19,7 @@
 | 审批 | ask / auto / deny，写操作与 Shell 需确认 | `src/interaction.rs` |
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
-| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；请求时 Phase 3 以原子折叠批次持久化，轮次后 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部 | `src/session.rs`、`src/compaction.rs` |
+| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；请求时 Phase 3 以原子折叠批次持久化，轮次后 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部；TUI 取消后若暂时无法重载权威会话历史，会阻止新的模型轮次，直到重载成功或切换会话 | `src/session.rs`、`src/compaction.rs`、`src/tui/app.rs` |
 | 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |

@@ -125,6 +125,7 @@ pub struct App {
     pub session: Session,
     recorder: Arc<Mutex<RecordBuffer>>,
     pub(crate) unsaved_messages: bool,
+    pub(crate) requires_session_reload: bool,
     pub messages: Vec<Message>,
     pub view: Vec<ViewItem>,
     pub input: String,
@@ -191,6 +192,7 @@ impl App {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             unsaved_messages: false,
+            requires_session_reload: false,
             messages,
             view,
             input: String::new(),
@@ -727,11 +729,31 @@ impl App {
 
     // ----- turn lifecycle -------------------------------------------------
 
+    fn reload_session_before_turn(&mut self) -> bool {
+        if !self.requires_session_reload {
+            return true;
+        }
+        match self.session.load_messages() {
+            Ok(messages) => {
+                self.messages = messages;
+                self.reset_recorder();
+                self.requires_session_reload = false;
+                true
+            }
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "cannot start a new turn until the session reloads: {error:#}"
+                )));
+                false
+            }
+        }
+    }
+
     pub fn submit(&mut self) {
-        let raw = std::mem::take(&mut self.input);
+        let submitted = std::mem::take(&mut self.input);
         self.cursor = 0;
         self.history_index = None;
-        let raw = raw.trim().to_string();
+        let raw = submitted.trim().to_string();
         if raw.is_empty() {
             return;
         }
@@ -748,6 +770,12 @@ impl App {
             self.view.push(ViewItem::Info(
                 "A turn is already running; wait for it or press Esc to cancel.".to_string(),
             ));
+            return;
+        }
+        if !self.reload_session_before_turn() {
+            self.history.pop();
+            self.input = submitted;
+            self.cursor = self.char_len();
             return;
         }
         let message_text = self.expand_mentions(&raw);
@@ -837,10 +865,12 @@ impl App {
             handle.abort();
         }
         if !self.unsaved_messages {
+            self.requires_session_reload = true;
             match self.session.load_messages() {
                 Ok(messages) => {
                     self.messages = messages;
                     self.reset_recorder();
+                    self.requires_session_reload = false;
                 }
                 Err(error) => self.view.push(ViewItem::Error(format!(
                     "failed to reload session after cancellation: {error:#}"
@@ -1150,6 +1180,7 @@ impl App {
                             };
                             self.reset_recorder();
                             self.unsaved_messages = false;
+                            self.requires_session_reload = false;
                             self.view.push(ViewItem::Info(format!(
                                 "Resumed session {} ({}).",
                                 loaded.meta.id, loaded.meta.cwd
@@ -1202,6 +1233,7 @@ impl App {
                 self.session = session;
                 self.reset_recorder();
                 self.unsaved_messages = false;
+                self.requires_session_reload = false;
             }
             Err(error) => self.view.push(ViewItem::Error(format!(
                 "failed to create session: {error:#}"
