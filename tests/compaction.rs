@@ -43,15 +43,28 @@ async fn model_compaction_sends_transcript_as_data_and_returns_summary() {
 }
 
 #[tokio::test]
-async fn model_compaction_trims_old_history_to_recover_from_context_exhaustion() {
+async fn phase_three_recovers_requests_without_changing_manual_compaction_input() {
     let server = MockServer::new(|_, body| {
-        let excerpt = body["messages"][1]["content"].as_str().unwrap();
-        assert!(excerpt.contains("Earlier transcript entries omitted"));
-        assert!(excerpt.contains("recent decision"));
-        assert!(!excerpt.contains("obsolete details"));
-        MockResponse::sse(&[
-            r#"{"choices":[{"delta":{"content":"Recent decision retained."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"total_tokens":104}}"#,
-        ])
+        let messages = body["messages"].as_array().unwrap();
+        if messages[0]["role"] == "system" {
+            let excerpt = messages[1]["content"].as_str().unwrap();
+            assert!(excerpt.contains("Earlier transcript entries omitted"));
+            assert!(excerpt.contains("recent decision"));
+            assert!(!excerpt.contains("obsolete details"));
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"content":"Recent decision retained."},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":4,"total_tokens":104}}"#,
+            ])
+        } else {
+            assert_eq!(messages.len(), 2);
+            assert!(messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[Compressed context]\nSummary: User: obsolete details"));
+            assert_eq!(messages[1]["content"], "recent decision");
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"content":"Projection recovered."},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":3,"total_tokens":83}}"#,
+            ])
+        }
     });
     let mut profile = mock_profile(server.base_url());
     profile.context_window = Some(1_200);
@@ -62,15 +75,18 @@ async fn model_compaction_trims_old_history_to_recover_from_context_exhaustion()
         Message::user("recent decision"),
     ];
 
-    let ordinary_error = client
+    let ordinary = client
         .complete(&messages, &[], &RecordingSink::default())
         .await
-        .unwrap_err();
-    assert!(ordinary_error.to_string().contains("exhausts"));
+        .unwrap();
+    assert_eq!(
+        ordinary.message.content.as_deref(),
+        Some("Projection recovered.")
+    );
     let result = compaction::compact(&client, &messages).await.unwrap();
 
     assert_eq!(result.summary, "Recent decision retained.");
-    assert_eq!(server.request_count(), 1);
+    assert_eq!(server.request_count(), 2);
 }
 
 #[tokio::test]
