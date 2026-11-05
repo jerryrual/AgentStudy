@@ -114,6 +114,7 @@ impl ModelClient {
         Err(last_error.unwrap_or_else(|| anyhow!("model request failed")))
     }
 
+    /// Build the provider-specific request and apply its context output cap.
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
         let mut body = if self.api_style == ApiStyle::Responses {
             super::responses::request_body(
@@ -152,14 +153,20 @@ impl ModelClient {
         Ok(body)
     }
 
+    /// Conservatively estimate the semantic history and tools sent by this API style.
     fn estimated_request_tokens(&self, messages: &[Message], tools: &[ToolDef]) -> u32 {
         let semantic_messages: Vec<Value> = messages
             .iter()
             .map(|message| match message {
-                Message::Assistant { message } if !message.responses_items.is_empty() => json!({
-                    "role": "assistant",
-                    "responses_items": message.responses_items,
-                }),
+                Message::Assistant { message }
+                    if self.api_style == ApiStyle::Responses
+                        && !message.responses_items.is_empty() =>
+                {
+                    json!({
+                        "role": "assistant",
+                        "responses_items": message.responses_items,
+                    })
+                }
                 _ => message.to_api(),
             })
             .collect();
@@ -170,6 +177,7 @@ impl ModelClient {
         }))
     }
 
+    /// Clamp the request output limit or reject a request with no valid output room.
     fn apply_context_budget(&self, body: &mut Value, estimated_input: u32) -> Result<()> {
         let (Some(context_window), Some(configured_output)) =
             (self.context_window, self.max_tokens)
@@ -607,6 +615,25 @@ mod tests {
                 "role": "assistant",
                 "responses_items": [native_item],
             }],
+            "tools": [],
+        });
+
+        assert_eq!(
+            client.estimated_request_tokens(&messages, &[]),
+            crate::context_budget::estimate_json_tokens(&expected)
+        );
+    }
+
+    #[test]
+    fn request_budget_uses_chat_history_after_model_switch() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = vec![Message::assistant(AssistantMessage {
+            content: Some("actual chat content".repeat(100)),
+            responses_items: vec![json!({"type": "message", "content": "small"})],
+            ..AssistantMessage::default()
+        })];
+        let expected = json!({
+            "messages": [messages[0].to_api()],
             "tools": [],
         });
 
