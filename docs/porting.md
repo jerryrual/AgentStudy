@@ -19,7 +19,8 @@
 | 审批 | ask / auto / deny，写操作与 Shell 需确认 | `src/interaction.rs` |
 | 计划清单 | `todo_write` | `src/tools/misc.rs` |
 | 提问 | `ask_user`（TUI 中等待回答） | `src/tools/misc.rs` |
-| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；请求时 Phase 3 以原子折叠批次持久化，轮次后 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部；Phase 4 用单条 `ContextProjection` 同时保存历史折叠与经严格边界校验的当前轮次 Last Words 替换，TUI 以 FIFO 屏障保证同轮消息先落盘；TUI 取消后若暂时无法重载权威会话历史，会阻止新的模型轮次，直到重载成功或切换会话 | `src/session.rs`、`src/compaction.rs`、`src/tui/app.rs` |
+| 会话 | JSONL 追加写入、列举、继续；`/compact` 生成并持久化完整续写摘要；请求时 Phase 3 以原子折叠批次持久化，轮次后 force 折叠以边界计数检查点持久化，并在 `/resume` 时保留未折叠尾部；Phase 4 用单条 `ContextProjection` 同时保存历史折叠与经严格边界校验的当前轮次 Last Words 替换，TUI 以 FIFO 屏障保证同轮消息先落盘；每个平铺的 `<id>.jsonl` 旁保留稳定的 `<id>/` 归档根，resume 时在不改写 JSONL 的前提下 reconciliation；TUI 取消后若暂时无法重载权威会话历史，会阻止新的模型轮次，直到重载成功或切换会话 | `src/session.rs`、`src/compaction.rs`、`src/tui/app.rs` |
+| Phase 4 归档存储基础 | 已实现上游目录/文件名约束、完整未脱敏 Markdown payload 接口、2 MiB 单记录与 64 MiB 单轮上限、256 MiB 会话配额与最旧记录淘汰、owner-only exclusive 写入、append-only `catalog.jsonl`/tombstone、可重建 `manifest.md`、严格 UTF-8 中段截断，以及 path/symlink containment；该层尚未接入当前轮次投影 | `src/compaction_archive.rs` |
 | 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
@@ -33,7 +34,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 压缩记录检索与完整 Phase 4 归档/限额。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。尚未移植上游的 dropped-call spill 文件、可检索 catalog/manifest、side-call 累计配额与完整持久化 breaker；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。
+1. 压缩记录检索与完整 Phase 4 归档接线。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。dropped-record 存储基础已经实现安全路径、catalog/tombstone、manifest reconciliation 和 2/64/256 MiB 限额；尚需把完整工具参数/结果/assistant reasoning 序列化为每组一条记录，在 Run/TUI FIFO 屏障内先归档再提交投影，并注入当轮 manifest 与此前 catalog 绝对路径。side-call 累计配额与完整持久化 breaker 也尚未移植；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 
