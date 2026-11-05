@@ -15,6 +15,7 @@ pub mod cli;
 pub mod compaction;
 pub mod config;
 pub mod context_budget;
+pub(crate) mod context_trim;
 pub mod interaction;
 pub mod markdown;
 pub mod memory;
