@@ -131,21 +131,24 @@ impl ModelClient {
                 .and_then(|(context_window, max_tokens)| {
                     crate::context_budget::ContextBudget::derive(context_window, max_tokens)
                 });
-        let prepared_messages = match context_budget {
+        let (prepared_messages, estimated_input) = match context_budget {
             Some(budget) => {
-                crate::context_trim::trim_previous_tool_results(
+                let trimmed = crate::context_trim::trim_previous_tool_results(
                     messages,
                     budget.trigger_tokens,
                     budget.target_tokens,
                     |candidate| self.estimated_request_tokens(candidate, tools),
-                )
-                .messages
+                );
+                (trimmed.messages, trimmed.estimated_tokens)
             }
-            None => messages.to_vec(),
+            None => (
+                std::borrow::Cow::Borrowed(messages),
+                self.estimated_request_tokens(messages, tools),
+            ),
         };
         let mut body = if self.api_style == ApiStyle::Responses {
             super::responses::request_body(
-                &prepared_messages,
+                prepared_messages.as_ref(),
                 tools,
                 &self.model,
                 self.stream,
@@ -175,7 +178,6 @@ impl ModelClient {
             }
             body
         };
-        let estimated_input = self.estimated_request_tokens(&prepared_messages, tools);
         self.apply_context_budget(&mut body, estimated_input)?;
         Ok(body)
     }

@@ -1,5 +1,6 @@
 //! Deterministic request-only context projections.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::model::{Message, ToolCall};
@@ -13,28 +14,28 @@ const SUMMARY_TRUNCATION_MARKER: &str = "... [truncated]";
 
 /// Result of projecting old tool results for one model request.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrimResult {
-    pub(crate) messages: Vec<Message>,
+pub(crate) struct TrimResult<'a> {
+    pub(crate) messages: Cow<'a, [Message]>,
     pub(crate) summarized: usize,
     pub(crate) estimated_tokens: u32,
 }
 
 /// Summarize completed-turn tool results oldest-first until `target_tokens`.
 ///
-/// The returned messages are an owned request projection. The source history is
-/// never mutated, and the current turn (starting at the last user message) is
-/// deliberately ineligible.
-pub(crate) fn trim_previous_tool_results<F>(
-    messages: &[Message],
+/// The returned request projection borrows unchanged history and owns only a
+/// modified clone. The source history is never mutated, and the current turn
+/// (starting at the last user message) is deliberately ineligible.
+pub(crate) fn trim_previous_tool_results<'a, F>(
+    messages: &'a [Message],
     trigger_tokens: u32,
     target_tokens: u32,
     mut estimate: F,
-) -> TrimResult
+) -> TrimResult<'a>
 where
     F: FnMut(&[Message]) -> u32,
 {
     let initial = estimate(messages);
-    let mut projected = messages.to_vec();
+    let mut projected = Cow::Borrowed(messages);
     if initial < trigger_tokens {
         return TrimResult {
             messages: projected,
@@ -77,28 +78,23 @@ where
                 _ => None,
             })
             .collect();
-        let original_chars: usize = replacements
-            .iter()
-            .map(|(index, _)| match &projected[*index] {
-                Message::Tool { content, .. } => content.chars().count(),
-                _ => 0,
-            })
-            .sum();
-        let replacement_chars: usize = replacements
-            .iter()
-            .map(|(_, summary)| summary.chars().count())
-            .sum();
-        if replacements.is_empty() || replacement_chars >= original_chars {
+        if replacements.is_empty() {
             continue;
         }
-        for (index, summary) in replacements {
-            let Message::Tool { content, .. } = &mut projected[index] else {
+        let mut candidate = projected.as_ref().to_vec();
+        for (index, summary) in &replacements {
+            let Message::Tool { content, .. } = &mut candidate[*index] else {
                 unreachable!("replacement candidates are tool messages")
             };
-            *content = summary;
-            summarized += 1;
+            *content = summary.clone();
         }
-        estimated_tokens = estimate(&projected);
+        let candidate_tokens = estimate(&candidate);
+        if candidate_tokens >= estimated_tokens {
+            continue;
+        }
+        projected = Cow::Owned(candidate);
+        summarized += replacements.len();
+        estimated_tokens = candidate_tokens;
         if estimated_tokens <= target_tokens {
             break;
         }
@@ -384,6 +380,31 @@ mod tests {
         };
         assert!(content.contains("...") && content.contains("1000 chars"));
         assert!(content.chars().count() <= SUMMARY_TOTAL_MAX);
+    }
+
+    #[test]
+    fn skips_a_group_when_its_serialized_request_estimate_grows() {
+        let messages = vec![
+            Message::user("old"),
+            call(
+                "a",
+                "read_file",
+                &format!(r#"{{"path":"{}"}}"#, "路".repeat(250)),
+            ),
+            Message::tool("a", "read_file", "a".repeat(500)),
+            Message::user("current"),
+        ];
+        let estimate = |candidate: &[Message]| {
+            let wire = serde_json::Value::Array(candidate.iter().map(Message::to_api).collect());
+            crate::context_budget::estimate_json_tokens(&wire)
+        };
+        let before = estimate(&messages);
+
+        let result = trim_previous_tool_results(&messages, before, 0, estimate);
+
+        assert_eq!(result.messages.as_ref(), messages);
+        assert_eq!(result.summarized, 0);
+        assert_eq!(result.estimated_tokens, before);
     }
 
     #[test]
