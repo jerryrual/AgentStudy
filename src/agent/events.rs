@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::compaction::CompressionBatch;
 use crate::model::{Message, Usage};
 
 use super::TurnResult;
@@ -32,6 +33,14 @@ pub trait EventSink: Send + Sync {
         _summary: &str,
         _output: &str,
     ) {
+    }
+
+    /// Persist an atomic compression batch before its projection is sent to the provider.
+    ///
+    /// Returns `true` when the batch was durably checkpointed. The synchronous
+    /// contract intentionally makes persistence complete before the request proceeds.
+    fn persist_compression(&self, _batch: &CompressionBatch) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     /// A message was appended to the conversation (used for persistence).

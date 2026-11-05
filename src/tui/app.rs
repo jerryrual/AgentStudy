@@ -11,7 +11,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
-use crate::compaction::Compaction;
+use crate::compaction::{Compaction, CompressionBatch};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -767,6 +767,8 @@ impl App {
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
             turn_id,
+            session: self.session.clone(),
+            persistence_enabled: !self.unsaved_messages,
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -808,6 +810,17 @@ impl App {
         }
         if let Some(handle) = self.cancel_handle.take() {
             handle.abort();
+        }
+        if !self.unsaved_messages {
+            match self.session.load_messages() {
+                Ok(messages) => {
+                    self.messages = messages;
+                    self.recorder.reset();
+                }
+                Err(error) => self.view.push(ViewItem::Error(format!(
+                    "failed to reload session after cancellation: {error:#}"
+                ))),
+            }
         }
         if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
             let _ = reply.send(ApprovalDecision::Deny);
@@ -1335,7 +1348,9 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
                     streaming: false,
                 });
             }
-            crate::session::Record::Meta { .. } | crate::session::Record::Usage { .. } => {}
+            crate::session::Record::Meta { .. }
+            | crate::session::Record::Usage { .. }
+            | crate::session::Record::CompressionBatch { .. } => {}
         }
     }
     view
@@ -1357,6 +1372,8 @@ fn preview_output(output: &str) -> String {
 struct TuiSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     turn_id: u64,
+    session: Session,
+    persistence_enabled: bool,
 }
 
 impl TuiSink {
@@ -1369,6 +1386,14 @@ impl TuiSink {
 }
 
 impl EventSink for TuiSink {
+    fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
+        if !self.persistence_enabled {
+            return Ok(false);
+        }
+        self.session.append_compression_batch(batch)?;
+        Ok(true)
+    }
+
     fn text_delta(&self, delta: &str) {
         self.send(UiEvent::TextDelta(delta.to_string()));
     }
@@ -1515,6 +1540,24 @@ mod tests {
             &view[1],
             ViewItem::Assistant { text, .. } if text == "latest answer"
         ));
+    }
+
+    #[test]
+    fn tui_sink_skips_compression_when_turn_started_unsaved() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = TuiSink {
+            tx,
+            turn_id: 1,
+            session,
+            persistence_enabled: false,
+        };
+
+        assert!(!sink
+            .persist_compression(&CompressionBatch::default())
+            .unwrap());
     }
 
     #[test]

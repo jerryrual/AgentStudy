@@ -702,6 +702,39 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_reloads_committed_request_compression() {
+        use crate::compaction::{CompressionBatch, CompressionFold};
+        use crate::model::{AssistantMessage, Message};
+
+        let mut app = test_app();
+        let source = vec![
+            Message::user("old request"),
+            Message::assistant(AssistantMessage::text("old answer")),
+            Message::user("current request"),
+        ];
+        for message in &source {
+            app.session.append_message(message).unwrap();
+        }
+        let batch = CompressionBatch {
+            folds: vec![CompressionFold {
+                summary: "old request and answer".to_string(),
+                compacted_messages: 2,
+            }],
+        };
+        app.session.append_compression_batch(&batch).unwrap();
+        let expected = batch.projected(&source).unwrap();
+        app.messages = source;
+        app.running = true;
+        let visible_items = app.view.len();
+
+        app.cancel();
+
+        assert_eq!(app.messages, expected);
+        assert_eq!(app.view.len(), visible_items + 1);
+        assert!(matches!(app.view.last(), Some(ViewItem::Info(text)) if text == "Cancelled."));
+    }
+
+    #[test]
     fn compaction_uses_persisted_messages_after_cancelled_turn() {
         use crate::model::{AssistantMessage, Message};
 

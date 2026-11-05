@@ -223,7 +223,7 @@ impl Agent {
 
             let completion = self
                 .client
-                .complete(messages, &self.visible_specs(), sink)
+                .complete_persistent(messages, &self.visible_specs(), sink)
                 .await?;
             let latest_usage = completion.usage;
             usage.add(completion.usage);

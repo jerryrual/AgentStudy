@@ -6,11 +6,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::compaction::{CompressionBatch, CompressionFold};
 use crate::model::{AssistantMessage, Message, ToolCall};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,9 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compacted_messages: Option<usize>,
     },
+    CompressionBatch {
+        folds: Vec<CompressionFold>,
+    },
 }
 
 impl Record {
@@ -88,11 +93,20 @@ impl Record {
 pub struct Session {
     pub meta: SessionMeta,
     path: PathBuf,
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl Session {
     /// Append one record, flushing immediately.
     pub fn append(&self, record: &Record) -> Result<()> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        self.append_unlocked(record)
+    }
+
+    fn append_unlocked(&self, record: &Record) -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -102,6 +116,22 @@ impl Session {
         writeln!(file, "{line}")
             .with_context(|| format!("failed to write session {}", self.path.display()))?;
         Ok(())
+    }
+
+    /// Append a compression batch as one atomic JSONL record.
+    pub fn append_compression_batch(&self, batch: &CompressionBatch) -> Result<()> {
+        self.append(&Record::CompressionBatch {
+            folds: batch.folds.clone(),
+        })
+    }
+
+    /// Reload this session after all append work from cloned handles completes.
+    pub fn load_messages(&self) -> Result<Vec<Message>> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        Ok(load_session_file(&self.path, self.id())?.messages())
     }
 
     /// Append a conversation message, skipping system prompts.
@@ -187,36 +217,51 @@ impl LoadedSession {
                     }
                     Some(count) => {
                         flush(&mut messages, &mut pending);
-                        let summary_end = messages
-                            .iter()
-                            .rposition(|message| matches!(message, Message::Summary { .. }))
-                            .map_or(0, |position| position + 1);
-                        let Some(range_start) =
-                            messages.iter().enumerate().skip(summary_end).find_map(
-                                |(position, message)| {
-                                    matches!(message, Message::User { .. }).then_some(position)
-                                },
-                            )
-                        else {
-                            continue;
-                        };
-                        let available = messages.len() - range_start;
-                        // A corrupt persisted count must not discard an unknown tail.
-                        if *count == 0 || *count > available {
-                            continue;
-                        }
-                        messages.splice(
-                            range_start..range_start + *count,
-                            std::iter::once(crate::compaction::summary_message(summary)),
-                        );
+                        apply_compression_fold(&mut messages, summary, *count);
                     }
                 },
+                Record::CompressionBatch { folds } => {
+                    flush(&mut messages, &mut pending);
+                    let batch = CompressionBatch {
+                        folds: folds.clone(),
+                    };
+                    if let Ok(projected) = batch.projected(&messages) {
+                        messages = projected;
+                    }
+                }
                 Record::Meta { .. } | Record::Usage { .. } => {}
             }
         }
         flush(&mut messages, &mut pending);
         messages
     }
+}
+
+fn apply_compression_fold(messages: &mut Vec<Message>, summary: &str, count: usize) {
+    let summary_end = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::Summary { .. }))
+        .map_or(0, |position| position + 1);
+    let Some(range_start) =
+        messages
+            .iter()
+            .enumerate()
+            .skip(summary_end)
+            .find_map(|(position, message)| {
+                matches!(message, Message::User { .. }).then_some(position)
+            })
+    else {
+        return;
+    };
+    let available = messages.len() - range_start;
+    // A corrupt persisted count must not discard an unknown tail.
+    if count == 0 || count > available {
+        return;
+    }
+    messages.splice(
+        range_start..range_start + count,
+        std::iter::once(crate::compaction::summary_message(summary)),
+    );
 }
 
 /// Buffers a tool-calling assistant message until all of its tool results have
@@ -343,6 +388,7 @@ impl SessionStore {
         let session = Session {
             meta: meta.clone(),
             path: self.path(&id),
+            append_lock: Arc::new(Mutex::new(())),
         };
         session.append(&Record::Meta { meta })?;
         Ok(session)
@@ -358,6 +404,7 @@ impl SessionStore {
         Ok(Session {
             meta: loaded.meta,
             path: self.path(id),
+            append_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -370,30 +417,7 @@ impl SessionStore {
         {
             bail!("invalid session id {id:?}");
         }
-        let path = self.path(id);
-        let file =
-            std::fs::File::open(&path).with_context(|| format!("session {id:?} was not found"))?;
-        let reader = BufReader::new(file);
-        let mut meta: Option<SessionMeta> = None;
-        let mut records = Vec::new();
-        for (index, line) in reader.lines().enumerate() {
-            let line = line.with_context(|| format!("failed to read session {id:?}"))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: Record = serde_json::from_str(&line).with_context(|| {
-                format!("invalid record on line {} of session {id:?}", index + 1)
-            })?;
-            if index == 0 {
-                match &record {
-                    Record::Meta { meta: first } => meta = Some(first.clone()),
-                    _ => bail!("session {id:?} does not start with metadata"),
-                }
-            }
-            records.push(record);
-        }
-        let meta = meta.with_context(|| format!("session {id:?} is empty"))?;
-        Ok(LoadedSession { meta, records })
+        load_session_file(&self.path(id), id)
     }
 
     /// List sessions, newest first.
@@ -442,6 +466,31 @@ impl SessionStore {
     pub fn latest(&self) -> Result<Option<String>> {
         Ok(self.list()?.into_iter().next().map(|summary| summary.id))
     }
+}
+
+fn load_session_file(path: &Path, id: &str) -> Result<LoadedSession> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("session {id:?} was not found"))?;
+    let reader = BufReader::new(file);
+    let mut meta: Option<SessionMeta> = None;
+    let mut records = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed to read session {id:?}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: Record = serde_json::from_str(&line)
+            .with_context(|| format!("invalid record on line {} of session {id:?}", index + 1))?;
+        if index == 0 {
+            match &record {
+                Record::Meta { meta: first } => meta = Some(first.clone()),
+                _ => bail!("session {id:?} does not start with metadata"),
+            }
+        }
+        records.push(record);
+    }
+    let meta = meta.with_context(|| format!("session {id:?} is empty"))?;
+    Ok(LoadedSession { meta, records })
 }
 
 fn preview_text(text: &str) -> String {
@@ -883,6 +932,149 @@ mod tests {
         );
         assert_eq!(loaded.records.len(), 4, "all append-only records remain");
         assert!(raw_after.contains(&format!(r#""compacted_messages":{}"#, usize::MAX)));
+    }
+
+    #[test]
+    fn compression_batch_round_trips_as_one_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let batch = CompressionBatch {
+            folds: vec![CompressionFold {
+                summary: "folded".into(),
+                compacted_messages: 2,
+            }],
+        };
+        session.append_compression_batch(&batch).unwrap();
+
+        let raw = std::fs::read_to_string(store.path(session.id())).unwrap();
+        assert_eq!(raw.lines().count(), 2);
+        let record: Record = serde_json::from_str(raw.lines().nth(1).unwrap()).unwrap();
+        assert!(matches!(record, Record::CompressionBatch { folds } if folds == batch.folds));
+    }
+
+    #[test]
+    fn compression_batch_replays_sequential_folds_after_leading_messages() {
+        let messages = loaded(vec![
+            assistant_record("leading"),
+            Record::User {
+                text: "first".into(),
+            },
+            assistant_record("first answer"),
+            Record::User {
+                text: "second".into(),
+            },
+            assistant_record("second answer"),
+            Record::User {
+                text: "current".into(),
+            },
+            assistant_record("current answer"),
+            Record::CompressionBatch {
+                folds: vec![
+                    CompressionFold {
+                        summary: "first summary".into(),
+                        compacted_messages: 2,
+                    },
+                    CompressionFold {
+                        summary: "second summary".into(),
+                        compacted_messages: 2,
+                    },
+                ],
+            },
+        ])
+        .messages();
+
+        assert_eq!(
+            messages,
+            vec![
+                Message::assistant(AssistantMessage::text("leading")),
+                crate::compaction::summary_message("first summary"),
+                crate::compaction::summary_message("second summary"),
+                Message::user("current"),
+                Message::assistant(AssistantMessage::text("current answer")),
+            ]
+        );
+    }
+
+    #[test]
+    fn corrupt_first_batch_fold_preserves_the_entire_history() {
+        let expected = vec![
+            Message::user("first"),
+            Message::assistant(AssistantMessage::text("first answer")),
+            Message::user("current"),
+            Message::assistant(AssistantMessage::text("current answer")),
+        ];
+        for count in [0, usize::MAX] {
+            let messages = loaded(vec![
+                Record::User {
+                    text: "first".into(),
+                },
+                assistant_record("first answer"),
+                Record::User {
+                    text: "current".into(),
+                },
+                assistant_record("current answer"),
+                Record::CompressionBatch {
+                    folds: vec![
+                        CompressionFold {
+                            summary: "bad".into(),
+                            compacted_messages: count,
+                        },
+                        CompressionFold {
+                            summary: "must not apply".into(),
+                            compacted_messages: 2,
+                        },
+                    ],
+                },
+            ])
+            .messages();
+            assert_eq!(messages, expected, "count {count}");
+        }
+
+        let missing_user = loaded(vec![
+            assistant_record("leading"),
+            Record::CompressionBatch {
+                folds: vec![CompressionFold {
+                    summary: "bad".into(),
+                    compacted_messages: 1,
+                }],
+            },
+        ])
+        .messages();
+        assert_eq!(
+            missing_user,
+            vec![Message::assistant(AssistantMessage::text("leading"))]
+        );
+    }
+
+    #[test]
+    fn cloned_sessions_serialize_concurrent_appends() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let workers: Vec<_> = (0..6)
+            .map(|worker| {
+                let session = session.clone();
+                std::thread::spawn(move || {
+                    for item in 0..20 {
+                        session
+                            .append_compression_batch(&CompressionBatch {
+                                folds: vec![CompressionFold {
+                                    summary: format!("{worker}:{item}:{}", "x".repeat(8_192)),
+                                    compacted_messages: 1,
+                                }],
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(store.load(session.id()).unwrap().records.len(), 121);
+        assert!(session.load_messages().unwrap().is_empty());
     }
 
     #[test]

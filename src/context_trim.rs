@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use crate::compaction::{summary_message, CompressionBatch, CompressionFold};
 use crate::model::{Message, ToolCall};
 
 const SUMMARY_PREFIX: &str = "[Tool call: ";
@@ -19,6 +20,7 @@ pub(crate) struct TrimResult<'a> {
     pub(crate) summarized: usize,
     pub(crate) removed: usize,
     pub(crate) compressed: usize,
+    pub(crate) compression: CompressionBatch,
     pub(crate) estimated_tokens: u32,
 }
 
@@ -44,6 +46,7 @@ where
             summarized: 0,
             removed: 0,
             compressed: 0,
+            compression: CompressionBatch::default(),
             estimated_tokens: initial,
         };
     }
@@ -56,6 +59,7 @@ where
             summarized: 0,
             removed: 0,
             compressed: 0,
+            compression: CompressionBatch::default(),
             estimated_tokens: initial,
         };
     };
@@ -111,6 +115,7 @@ where
         summarized,
         removed: 0,
         compressed: 0,
+        compression: CompressionBatch::default(),
         estimated_tokens,
     }
 }
@@ -189,7 +194,6 @@ where
             .unwrap_or(source_users.len())
     });
     let mut estimate = estimate;
-    let mut contracted = 0usize;
 
     for ordinal in first_eligible..source_users.len() - 1 {
         if projection.estimated_tokens <= target_tokens {
@@ -198,28 +202,46 @@ where
 
         let source_start = source_users[ordinal];
         let source_end = source_users[ordinal + 1];
-        let projected_start = projected_users[ordinal] - contracted;
-        let projected_end = projected_users[ordinal + 1] - contracted;
+        let projected_boundary = projection
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Summary { .. }));
+        let mut projected_users = projection
+            .messages
+            .iter()
+            .enumerate()
+            .skip(projected_boundary.map_or(0, |index| index + 1))
+            .filter_map(|(index, message)| {
+                matches!(message, Message::User { .. }).then_some(index)
+            });
+        let (Some(projected_start), Some(projected_end)) =
+            (projected_users.next(), projected_users.next())
+        else {
+            break;
+        };
         if source[source_start..source_end]
             .iter()
             .chain(projection.messages[projected_start..projected_end].iter())
-            .any(|message| matches!(message, Message::System { .. }))
+            .any(|message| matches!(message, Message::System { .. } | Message::Summary { .. }))
         {
-            continue;
+            break;
         }
 
-        let digest = automatic_turn_summary(&source[source_start..source_end]);
-        let replacement = Message::user(format!("[Compressed context]\nSummary: {digest}"));
+        let summary = automatic_turn_summary(&source[source_start..source_end]);
+        let fold = CompressionFold {
+            summary: summary.clone(),
+            compacted_messages: source_end - source_start,
+        };
         let mut candidate = projection.messages.as_ref().to_vec();
-        candidate.splice(projected_start..projected_end, [replacement]);
+        candidate.splice(projected_start..projected_end, [summary_message(&summary)]);
         let candidate_tokens = estimate(&candidate);
         if candidate_tokens >= projection.estimated_tokens {
-            continue;
+            break;
         }
 
-        contracted += projected_end - projected_start - 1;
         projection.messages = Cow::Owned(candidate);
         projection.compressed += 1;
+        projection.compression.folds.push(fold);
         projection.estimated_tokens = candidate_tokens;
     }
 
@@ -696,6 +718,7 @@ mod tests {
                 summarized: 0,
                 removed: 0,
                 compressed: 0,
+                compression: CompressionBatch::default(),
                 estimated_tokens: messages.len() as u32,
             },
             target,
@@ -936,6 +959,7 @@ mod tests {
                 summarized: 0,
                 removed: 0,
                 compressed: 0,
+                compression: CompressionBatch::default(),
                 estimated_tokens: 100,
             },
             10,
@@ -955,6 +979,7 @@ mod tests {
                 summarized: 0,
                 removed: 0,
                 compressed: 0,
+                compression: CompressionBatch::default(),
                 estimated_tokens: 100,
             },
             10,
@@ -971,6 +996,7 @@ mod tests {
             summarized: 0,
             removed: 0,
             compressed: 0,
+            compression: CompressionBatch::default(),
             estimated_tokens: tokens,
         }
     }
@@ -998,10 +1024,7 @@ mod tests {
         assert_eq!(result.compressed, 1);
         assert!(matches!(result.messages, Cow::Owned(_)));
         assert_eq!(result.messages[0], Message::system("fixed"));
-        assert_eq!(
-            result.messages[1],
-            Message::user("[Compressed context]\nSummary: User: old one")
-        );
+        assert_eq!(result.messages[1], summary_message("User: old one"));
         assert_eq!(
             &result.messages[result.messages.len() - 2..],
             &messages[6..]
@@ -1067,14 +1090,14 @@ mod tests {
         ];
         let phase_two = remove_previous_tool_groups(phase_three(&source, 100), 99, |_| 90);
         let result = compress_previous_text_turns(phase_two, &source, 50, |candidate| {
-            if candidate.iter().any(|message| matches!(message, Message::User { content } if content.starts_with("[Compressed context]"))) { 40 } else { 90 }
+            if candidate.iter().any(|message| matches!(message, Message::Summary { content } if content.contains("User: inspect"))) { 40 } else { 90 }
         });
 
         assert_eq!(result.compressed, 1);
         assert!(matches!(
             &result.messages[0],
-            Message::User { content }
-                if content == "[Compressed context]\nSummary: User: inspect; Tools: canonical_tool"
+            Message::Summary { content }
+                if content == "[Earlier conversation summary]\nUser: inspect; Tools: canonical_tool"
         ));
         assert_eq!(result.messages[1], Message::user("current"));
     }
@@ -1099,11 +1122,9 @@ mod tests {
             },
         );
 
-        assert_eq!(result.compressed, 1);
-        assert!(result.messages.iter().any(
-            |message| matches!(message, Message::User { content } if content == "nonreducing")
-        ));
-        assert!(result.messages.iter().any(|message| matches!(message, Message::User { content } if content.contains("User: reducing"))));
+        assert_eq!(result.compressed, 0);
+        assert!(result.compression.is_empty());
+        assert_eq!(result.messages.as_ref(), source);
     }
 
     #[test]
@@ -1137,20 +1158,38 @@ mod tests {
         let source_snapshot = source.clone();
         let result =
             compress_previous_text_turns(phase_three(&projection, 10), &source, 8, |candidate| {
-                candidate.len() as u32
+                let summaries = candidate
+                    .iter()
+                    .filter(|message| matches!(message, Message::Summary { .. }))
+                    .count();
+                (candidate.len() - summaries) as u32
             });
 
         assert_eq!(result.compressed, 2);
-        assert_eq!(result.estimated_tokens, 8);
+        assert_eq!(result.estimated_tokens, 7);
+        assert_eq!(
+            result.compression.folds,
+            vec![
+                CompressionFold {
+                    summary: "User: tool-only turn; Tools: read_file".into(),
+                    compacted_messages: 3,
+                },
+                CompressionFold {
+                    summary: "User: first text turn".into(),
+                    compacted_messages: 2,
+                },
+            ]
+        );
         assert_eq!(
             result.messages.as_ref(),
             &[
-                Message::user("tool-only turn"),
-                Message::user("[Compressed context]\nSummary: User: first text turn"),
+                summary_message("User: tool-only turn; Tools: read_file"),
+                summary_message("User: first text turn"),
                 Message::user("system-bearing turn"),
                 Message::system("must stay fixed"),
                 Message::assistant(AssistantMessage::text("system answer")),
-                Message::user("[Compressed context]\nSummary: User: second text turn"),
+                Message::user("second text turn"),
+                Message::assistant(AssistantMessage::text("second answer")),
                 Message::user("current"),
                 Message::assistant(AssistantMessage::text("current answer")),
             ]
