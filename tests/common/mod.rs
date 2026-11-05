@@ -204,6 +204,7 @@ pub fn tool_context(cwd: &std::path::Path) -> icode::tools::ToolContext {
 #[derive(Default)]
 pub struct RecordingSink {
     pub events: Mutex<Vec<String>>,
+    pub projections: Mutex<Vec<icode::compaction::ContextProjection>>,
 }
 
 impl RecordingSink {
@@ -217,6 +218,14 @@ impl RecordingSink {
 }
 
 impl icode::agent::EventSink for RecordingSink {
+    fn persist_context_projection(
+        &self,
+        projection: &icode::compaction::ContextProjection,
+    ) -> anyhow::Result<bool> {
+        self.projections.lock().unwrap().push(projection.clone());
+        Ok(true)
+    }
+
     fn text_delta(&self, delta: &str) {
         self.push(format!("text:{delta}"));
     }

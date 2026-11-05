@@ -221,10 +221,14 @@ impl Agent {
             }
             rounds += 1;
 
-            let completion = self
+            let persistent = self
                 .client
                 .complete_persistent(messages, &self.visible_specs(), sink)
                 .await?;
+            if persistent.auxiliary_usage != Usage::default() {
+                usage.add(persistent.auxiliary_usage);
+            }
+            let completion = persistent.completion;
             let latest_usage = completion.usage;
             usage.add(completion.usage);
             sink.usage(&completion.usage);

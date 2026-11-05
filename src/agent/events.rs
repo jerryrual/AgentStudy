@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::compaction::CompressionBatch;
+use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::model::{Message, Usage};
 
 use super::TurnResult;
@@ -40,6 +40,14 @@ pub trait EventSink: Send + Sync {
     /// Returns `true` when the batch was durably checkpointed. The synchronous
     /// contract intentionally makes persistence complete before the request proceeds.
     fn persist_compression(&self, _batch: &CompressionBatch) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Persist one context projection before its replacement is sent to the provider.
+    ///
+    /// A `true` result guarantees earlier messages from the same turn were
+    /// persisted first and the projection is durably ordered after them.
+    fn persist_context_projection(&self, _projection: &ContextProjection) -> anyhow::Result<bool> {
         Ok(false)
     }
 
