@@ -335,7 +335,7 @@ impl ModelClient {
         projected: Vec<Message>,
         sink: &dyn EventSink,
     ) -> Result<()> {
-        if !sink.persist_context_projection(projection)? {
+        if !sink.persist_context_projection(messages, projection)? {
             anyhow::bail!("Last Words projection was not persisted for the active turn");
         }
         *messages = projected;
@@ -1380,6 +1380,7 @@ mod tests {
     impl EventSink for ProjectionSink {
         fn persist_context_projection(
             &self,
+            _source: &[Message],
             _projection: &crate::compaction::ContextProjection,
         ) -> anyhow::Result<bool> {
             self.outcome.map_err(anyhow::Error::msg)

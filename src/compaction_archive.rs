@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::compaction::ContextProjection;
+use crate::model::{AssistantMessage, Message, ToolCall};
+
 /// Maximum bytes stored for one Markdown record.
 pub const PER_RECORD_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// Maximum bytes written by one Phase 4 round.
@@ -78,7 +81,11 @@ pub struct ArchiveRecord {
     pub tool: String,
     pub created_at: String,
     pub kind: String,
-    /// Complete, unredacted Markdown body; storage adds the record terminator if absent.
+    /// Stable group identifier, normally the first provider call ID.
+    pub group_id: String,
+    /// Session identifier included in the human-readable record header.
+    pub session_id: String,
+    /// Complete, unredacted Markdown body; storage adds metadata and the terminator.
     pub markdown: String,
 }
 
@@ -212,6 +219,35 @@ impl ArchiveStore {
         })
     }
 
+    /// Serialize and archive every raw current-turn tool group replaced by a projection.
+    pub fn archive_context_projection(
+        &self,
+        session_id: &str,
+        turn: u64,
+        round: u64,
+        source: &[Message],
+        projection: &ContextProjection,
+    ) -> Result<Vec<CatalogRecord>> {
+        let records = projection_archive_records(session_id, turn, round, source, projection)?;
+        let _guard = self
+            .catalog_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.preflight_projection_batch_unlocked(&records)?;
+        let writes = self.archive_round_unlocked(&records)?;
+        let mut archived = Vec::with_capacity(writes.len());
+        for write in writes {
+            let Some(record) = write.record else {
+                bail!(
+                    "context projection archive refused: {}",
+                    write.no_record_reason.unwrap_or("unknown reason")
+                );
+            };
+            archived.push(record);
+        }
+        Ok(archived)
+    }
+
     /// Persist a batch in input order. Policy refusals are returned per record.
     pub fn archive_round(&self, records: &[ArchiveRecord]) -> Result<Vec<ArchiveWrite>> {
         if records.is_empty() {
@@ -221,6 +257,34 @@ impl ArchiveStore {
             .catalog_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.archive_round_unlocked(records)
+    }
+
+    fn preflight_projection_batch_unlocked(&self, records: &[ArchiveRecord]) -> Result<()> {
+        let state = self.reconcile_unlocked()?;
+        if !state.writable {
+            bail!("context projection archive storage is unavailable");
+        }
+        let mut total = 0usize;
+        for record in records {
+            let bytes = render_record_payload(record, "00000000", self.record_cap).len();
+            if bytes as u64 > self.session_quota {
+                bail!("context projection archive exceeds the session quota");
+            }
+            total = total
+                .checked_add(bytes)
+                .context("context projection archive size overflow")?;
+            if total > self.round_cap {
+                bail!("context projection archive exceeds the round cap");
+            }
+        }
+        if total as u64 > self.session_quota {
+            bail!("context projection archive batch exceeds the session quota");
+        }
+        Ok(())
+    }
+
+    fn archive_round_unlocked(&self, records: &[ArchiveRecord]) -> Result<Vec<ArchiveWrite>> {
         let mut state = self.reconcile_unlocked()?;
         if !state.writable {
             return Ok(refusals(records.len(), "storage unavailable"));
@@ -235,14 +299,7 @@ impl ArchiveStore {
                 writes.push(refusal("round cap"));
                 continue;
             }
-            let mut rendered = input.markdown.as_bytes().to_vec();
-            if !rendered.ends_with(RECORD_TERMINATOR.as_bytes()) {
-                if !rendered.ends_with(b"\n") {
-                    rendered.push(b'\n');
-                }
-                rendered.extend_from_slice(RECORD_TERMINATOR.as_bytes());
-            }
-            let payload = cap_record_bytes(&rendered, self.record_cap);
+            let payload = render_record_payload(input, "00000000", self.record_cap);
             if round_bytes.saturating_add(payload.len()) > self.round_cap {
                 round_refused = true;
                 writes.push(refusal("round cap"));
@@ -256,16 +313,19 @@ impl ArchiveStore {
                 writes.push(refusal("quota"));
                 continue;
             }
-            let Some((record, path)) = self.write_record(input, &payload, &state.live_records)?
-            else {
+            let Some((record, path)) = self.write_record(input, &state.live_records)? else {
                 writes.push(refusal("record ID exhaustion"));
                 continue;
             };
+            if record.bytes != payload.len() as u64 {
+                let _ = std::fs::remove_file(&path);
+                bail!("archive record size changed after ID allocation");
+            }
             if let Err(error) = self.append_catalog_record(&record) {
                 let _ = std::fs::remove_file(&path);
                 return Err(error);
             }
-            round_bytes += payload.len();
+            round_bytes += record.bytes as usize;
             state.live_total_bytes += record.bytes;
             state
                 .available_relative_paths
@@ -294,7 +354,6 @@ impl ArchiveStore {
     fn write_record(
         &self,
         input: &ArchiveRecord,
-        payload: &[u8],
         live: &[CatalogRecord],
     ) -> Result<Option<(CatalogRecord, PathBuf)>> {
         let relative_dir = PathBuf::from(format!("compactions/dropped/turn{:03}", input.turn));
@@ -312,6 +371,7 @@ impl ArchiveStore {
             if existing_ids.contains(record_id.as_str()) {
                 continue;
             }
+            let payload = render_record_payload(input, &record_id, self.record_cap);
             let filename = build_record_filename(input.sequence, &input.tool, &record_id);
             let relative_path = relative_dir.join(filename);
             let path = self.root.join(&relative_path);
@@ -323,7 +383,7 @@ impl ArchiveStore {
                         .with_context(|| format!("failed to create {}", path.display()))
                 }
             };
-            if let Err(error) = file.write_all(payload).and_then(|_| file.sync_all()) {
+            if let Err(error) = file.write_all(&payload).and_then(|_| file.sync_all()) {
                 drop(file);
                 let _ = std::fs::remove_file(&path);
                 return Err(error).with_context(|| format!("failed to write {}", path.display()));
@@ -642,6 +702,185 @@ impl ArchiveStore {
         }
         Ok(())
     }
+}
+
+fn projection_archive_records(
+    session_id: &str,
+    turn: u64,
+    round: u64,
+    source: &[Message],
+    projection: &ContextProjection,
+) -> Result<Vec<ArchiveRecord>> {
+    let fold = projection
+        .current_turn
+        .as_ref()
+        .context("context projection has no current-turn fold to archive")?;
+    let user = source
+        .iter()
+        .rposition(|message| matches!(message, Message::User { .. }))
+        .context("context projection archive has no current user turn")?;
+    let tail = &source[user + 1..];
+    if fold.compacted_messages == 0 || fold.compacted_messages != tail.len() {
+        bail!("context projection archive does not match the complete current tail");
+    }
+
+    let created_at = unix_timestamp();
+    let mut records = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < tail.len() {
+        let Message::Assistant { message } = &tail[cursor] else {
+            cursor += 1;
+            continue;
+        };
+        if message.tool_calls.is_empty() {
+            cursor += 1;
+            continue;
+        }
+        let end = tail[cursor + 1..]
+            .iter()
+            .position(|candidate| {
+                matches!(candidate, Message::Assistant { message } if !message.tool_calls.is_empty())
+            })
+            .map_or(tail.len(), |offset| cursor + 1 + offset);
+        let group = &tail[cursor..end];
+        let sequence = records.len() as u64 + 1;
+        records.push(ArchiveRecord {
+            turn,
+            round,
+            sequence,
+            tool: message
+                .tool_calls
+                .first()
+                .map(|call| call.name.clone())
+                .unwrap_or_else(|| "assistant".into()),
+            created_at: created_at.clone(),
+            kind: default_kind(),
+            group_id: message
+                .tool_calls
+                .first()
+                .map(|call| call.id.clone())
+                .unwrap_or_else(|| format!("turn-{turn}-round-{round}-group-{sequence}")),
+            session_id: session_id.to_string(),
+            markdown: render_tool_group(message, group),
+        });
+        cursor = end;
+    }
+    if records.is_empty() {
+        bail!("context projection archive contains no tool-call groups");
+    }
+    Ok(records)
+}
+
+fn render_tool_group(assistant: &AssistantMessage, group: &[Message]) -> String {
+    let mut output = String::new();
+    let mut context = Vec::new();
+    if let Some(content) = assistant
+        .content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+    {
+        context.push(content.to_string());
+    }
+    if let Some(reasoning) = assistant
+        .reasoning
+        .as_deref()
+        .filter(|reasoning| !reasoning.is_empty())
+    {
+        context.push(format!("[reasoning]\n{reasoning}"));
+    }
+    if !context.is_empty() {
+        output.push_str("## Assistant context\n\n");
+        output.push_str(&context.join("\n"));
+        output.push_str("\n\n");
+    }
+    if !assistant.responses_items.is_empty() {
+        output.push_str("## Native response items\n\n```json\n");
+        output.push_str(
+            &serde_json::to_string_pretty(&assistant.responses_items)
+                .unwrap_or_else(|_| "[]".into()),
+        );
+        output.push_str("\n```\n\n");
+    }
+
+    let results: Vec<_> = group
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool {
+                call_id,
+                name,
+                content,
+            } => Some((call_id, name, content)),
+            _ => None,
+        })
+        .collect();
+    let mut matched = HashSet::new();
+    for call in &assistant.tool_calls {
+        output.push_str(&render_tool_call(call, &results, &mut matched));
+    }
+    for (index, (call_id, name, content)) in results.iter().enumerate() {
+        if matched.contains(&index) {
+            continue;
+        }
+        output.push_str("## Additional group content\n\n");
+        output.push_str(&format!(
+            "### Unmatched tool result: {name}\n\nCall ID: `{call_id}`\n\n{content}\n\n"
+        ));
+    }
+    output
+}
+
+fn render_tool_call(
+    call: &ToolCall,
+    results: &[(&String, &String, &String)],
+    matched: &mut HashSet<usize>,
+) -> String {
+    let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| call.arguments.clone());
+    let result = results
+        .iter()
+        .enumerate()
+        .find(|(index, (call_id, _, _))| !matched.contains(index) && call_id.as_str() == call.id)
+        .map(|(index, (_, _, content))| {
+            matched.insert(index);
+            content.as_str()
+        });
+    format!(
+        "## Call: {}\n\n### Arguments (as requested)\n```json\n{}\n```\n\nOutcome: `unknown`\n\n## Result\n\n{}\n\n",
+        call.name,
+        arguments,
+        result.unwrap_or("(missing result)")
+    )
+}
+
+fn render_record_payload(input: &ArchiveRecord, record_id: &str, cap: usize) -> Vec<u8> {
+    if input.group_id.is_empty() && input.session_id.is_empty() {
+        let mut rendered = input.markdown.as_bytes().to_vec();
+        if !rendered.ends_with(RECORD_TERMINATOR.as_bytes()) {
+            if !rendered.ends_with(b"\n") {
+                rendered.push(b'\n');
+            }
+            rendered.extend_from_slice(RECORD_TERMINATOR.as_bytes());
+        }
+        return cap_record_bytes(&rendered, cap);
+    }
+
+    let body = input
+        .markdown
+        .strip_suffix(RECORD_TERMINATOR)
+        .unwrap_or(&input.markdown)
+        .trim_end_matches('\n');
+    let rendered = format!(
+        "# Dropped context record\n\n- Record ID: `{record_id}`\n- Group ID: `{}`\n- Turn: {}\n- Round: {}\n- Timestamp: {}\n- Session ID: `{}`\n\n{body}\n{}",
+        input.group_id,
+        input.turn,
+        input.round,
+        input.created_at,
+        input.session_id,
+        RECORD_TERMINATOR,
+    );
+    cap_record_bytes(rendered.as_bytes(), cap)
 }
 
 fn refusals(count: usize, reason: &'static str) -> Vec<ArchiveWrite> {
@@ -1022,6 +1261,8 @@ mod tests {
             tool: tool.into(),
             created_at: "2026-01-02T03:04:05Z".into(),
             kind: "group".into(),
+            group_id: String::new(),
+            session_id: String::new(),
             markdown: format!("# Dropped context record\n\n{body}\n{RECORD_TERMINATOR}"),
         }
     }
@@ -1088,6 +1329,167 @@ mod tests {
         let state = store.reconcile().unwrap();
         assert_eq!(state.live_records.len(), 1);
         assert_eq!(state.live_total_bytes, catalog.bytes);
+    }
+
+    #[test]
+    fn projection_archive_groups_parallel_calls_and_skips_prior_last_words() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::with_root(directory.path().join("session"));
+        let source = vec![
+            Message::user("task"),
+            Message::last_words("old progress should not be archived"),
+            Message::assistant(AssistantMessage {
+                content: Some("assistant context".into()),
+                reasoning: Some("full reasoning".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_a".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{\"path\":\"secret-a\"}"#.into(),
+                    },
+                    ToolCall {
+                        id: "call_b".into(),
+                        name: "grep".into(),
+                        arguments: r#"{\"pattern\":\"secret-b\"}"#.into(),
+                    },
+                ],
+                responses_items: vec![serde_json::json!({"encrypted": "native-secret"})],
+            }),
+            Message::tool("call_a", "read_file", "result-a"),
+            Message::tool("call_b", "grep", "result-b"),
+        ];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 4,
+            }),
+        };
+
+        let records = store
+            .archive_context_projection("session-id", 3, 2, &source, &projection)
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool, "read_file");
+        let archived = std::fs::read_to_string(store.root.join(&records[0].relative_path)).unwrap();
+        for expected in [
+            "Group ID: `call_a`",
+            "Turn: 3",
+            "Round: 2",
+            "Session ID: `session-id`",
+            "assistant context",
+            "full reasoning",
+            "secret-a",
+            "secret-b",
+            "native-secret",
+            "result-a",
+            "result-b",
+        ] {
+            assert!(
+                archived.contains(expected),
+                "missing archive detail: {expected}"
+            );
+        }
+        assert!(!archived.contains("old progress should not be archived"));
+        assert!(archived.ends_with(RECORD_TERMINATOR));
+    }
+
+    #[test]
+    fn projection_archive_writes_one_record_per_sequential_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::with_root(directory.path().join("session"));
+        let call = |id: &str, name: &str| {
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: "{}".into(),
+                }],
+                ..AssistantMessage::default()
+            })
+        };
+        let source = vec![
+            Message::user("task"),
+            call("call_a", "read_file"),
+            Message::tool("call_a", "read_file", "first"),
+            call("call_b", "grep"),
+            Message::tool("call_b", "grep", "second"),
+        ];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 4,
+            }),
+        };
+
+        let records = store
+            .archive_context_projection("session-id", 1, 1, &source, &projection)
+            .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tool, "read_file");
+        assert_eq!(records[1].tool, "grep");
+        assert!(records[0].relative_path.contains("001_read_file_"));
+        assert!(records[1].relative_path.contains("002_grep_"));
+    }
+
+    #[test]
+    fn projection_archive_preflights_the_whole_batch_before_mutation() {
+        let source = vec![
+            Message::user("task"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("call_a", "read_file", "first"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_b".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                }],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("call_b", "grep", "second"),
+        ];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 4,
+            }),
+        };
+
+        let round_directory = tempfile::tempdir().unwrap();
+        let round_root = round_directory.path().join("session");
+        let round_store = tiny_store(&round_root, 1_000, 400, 10_000);
+        assert!(round_store
+            .archive_context_projection("session-id", 1, 1, &source, &projection)
+            .is_err());
+        assert!(
+            !round_root.exists(),
+            "preflight must not create partial records"
+        );
+
+        let quota_directory = tempfile::tempdir().unwrap();
+        let quota_root = quota_directory.path().join("session");
+        let quota_store = tiny_store(&quota_root, 1_000, 10_000, 400);
+        let seeded = quota_store
+            .archive_round(&[record(1, 1, 1, "old", "old record")])
+            .unwrap();
+        let old = seeded[0].record.as_ref().unwrap().clone();
+        assert!(quota_store
+            .archive_context_projection("session-id", 2, 1, &source, &projection)
+            .is_err());
+        let state = quota_store.reconcile().unwrap();
+        assert_eq!(state.live_records, vec![old.clone()]);
+        assert!(quota_root.join(old.relative_path).exists());
     }
 
     #[test]
