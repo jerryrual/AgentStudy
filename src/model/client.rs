@@ -139,11 +139,17 @@ impl ModelClient {
                     budget.target_tokens,
                     |candidate| self.estimated_request_tokens(candidate, tools),
                 );
-                let phase2_result = crate::context_trim::remove_previous_tool_groups(
-                    phase1_result,
-                    budget.target_tokens,
-                    |candidate| self.estimated_request_tokens(candidate, tools),
-                );
+                let phase1_triggered = phase1_result.summarized > 0
+                    || phase1_result.estimated_tokens >= budget.trigger_tokens;
+                let phase2_result = if phase1_triggered {
+                    crate::context_trim::remove_previous_tool_groups(
+                        phase1_result,
+                        budget.target_tokens,
+                        |candidate| self.estimated_request_tokens(candidate, tools),
+                    )
+                } else {
+                    phase1_result
+                };
                 (phase2_result.messages, phase2_result.estimated_tokens)
             }
             None => (
@@ -857,6 +863,33 @@ mod tests {
         let phase1_cap = crate::context_budget::clamp_output_tokens(1_000, 300, phase1_tokens);
         assert_ne!(expected, phase1_cap);
         assert_eq!(body["max_output_tokens"], expected);
+    }
+
+    #[test]
+    fn request_phase2_does_not_run_below_the_trigger() {
+        let client = budget_client(ApiStyle::Chat);
+        let messages = vec![
+            Message::user("old turn"),
+            tool_call_message("call_old", "old_tool"),
+            Message::tool("call_old", "old_tool", "x".repeat(200)),
+            Message::user("current turn"),
+        ];
+        let budget = crate::context_budget::ContextBudget::derive(2_000, 500).unwrap();
+        let estimated = client.estimated_request_tokens(&messages, &[]);
+        assert!(estimated > budget.target_tokens, "{estimated} <= target");
+        assert!(estimated < budget.trigger_tokens, "{estimated} >= trigger");
+
+        let body = client.request_body(&messages, &[]).unwrap();
+        let wire = body["messages"].as_array().unwrap();
+
+        assert!(wire.iter().any(|item| {
+            item["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|call| call["id"] == "call_old"))
+        }));
+        assert!(wire.iter().any(|item| {
+            item["tool_call_id"] == "call_old" && item["content"] == "x".repeat(200)
+        }));
     }
 
     #[test]
