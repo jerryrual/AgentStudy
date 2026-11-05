@@ -33,6 +33,11 @@ pub struct ModelClient {
     retry_base: Duration,
 }
 
+struct PreparedRequest {
+    body: Value,
+    compression: crate::compaction::CompressionBatch,
+}
+
 impl ModelClient {
     /// Build a client for a profile, resolving the API key.
     pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
@@ -115,9 +120,30 @@ impl ModelClient {
         sink: &dyn EventSink,
     ) -> Result<Completion> {
         let body = self.request_body(messages, tools)?;
+        self.complete_body(&body, sink).await
+    }
+
+    /// Complete an agent request with atomic Phase 3 persistence metadata.
+    pub(crate) async fn complete_persistent(
+        &self,
+        messages: &mut Vec<Message>,
+        tools: &[ToolDef],
+        sink: &dyn EventSink,
+    ) -> Result<Completion> {
+        let prepared = self.prepare_request(messages, tools)?;
+        if !prepared.compression.is_empty() {
+            let projected = prepared.compression.projected(messages)?;
+            if sink.persist_compression(&prepared.compression)? {
+                *messages = projected;
+            }
+        }
+        self.complete_body(&prepared.body, sink).await
+    }
+
+    async fn complete_body(&self, body: &Value, sink: &dyn EventSink) -> Result<Completion> {
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match self.send_once(&body, sink).await {
+            match self.send_once(body, sink).await {
                 Ok(completion) => return Ok(completion),
                 Err(ClientError::Fatal(error)) => return Err(error),
                 Err(ClientError::Retryable(error)) => {
@@ -142,13 +168,17 @@ impl ModelClient {
 
     /// Build the provider-specific request and apply its context output cap.
     fn request_body(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
+        Ok(self.prepare_request(messages, tools)?.body)
+    }
+
+    fn prepare_request(&self, messages: &[Message], tools: &[ToolDef]) -> Result<PreparedRequest> {
         let context_budget =
             self.context_window
                 .zip(self.max_tokens)
                 .and_then(|(context_window, max_tokens)| {
                     crate::context_budget::ContextBudget::derive(context_window, max_tokens)
                 });
-        let (prepared_messages, estimated_input) = match context_budget {
+        let (prepared_messages, estimated_input, compression) = match context_budget {
             Some(budget) => {
                 let phase1_result = crate::context_trim::trim_previous_tool_results(
                     messages,
@@ -178,11 +208,14 @@ impl ModelClient {
                     } else {
                         phase2_result
                     };
-                (phase3_result.messages, phase3_result.estimated_tokens)
+                let estimated_tokens = phase3_result.estimated_tokens;
+                let compression = phase3_result.compression;
+                (phase3_result.messages, estimated_tokens, compression)
             }
             None => (
                 std::borrow::Cow::Borrowed(messages),
                 self.estimated_request_tokens(messages, tools),
+                crate::compaction::CompressionBatch::default(),
             ),
         };
         let mut body = if self.api_style == ApiStyle::Responses {
@@ -218,7 +251,7 @@ impl ModelClient {
             body
         };
         self.apply_context_budget(&mut body, estimated_input)?;
-        Ok(body)
+        Ok(PreparedRequest { body, compression })
     }
 
     /// Conservatively estimate the semantic history and tools sent by this API style.
@@ -651,9 +684,36 @@ struct ResponseFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct NullSink;
     impl EventSink for NullSink {}
+
+    struct PersistSink {
+        committed: bool,
+        calls: AtomicUsize,
+    }
+
+    impl EventSink for PersistSink {
+        fn persist_compression(
+            &self,
+            _batch: &crate::compaction::CompressionBatch,
+        ) -> anyhow::Result<bool> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.committed)
+        }
+    }
+
+    struct FailingPersistSink;
+
+    impl EventSink for FailingPersistSink {
+        fn persist_compression(
+            &self,
+            _batch: &crate::compaction::CompressionBatch,
+        ) -> anyhow::Result<bool> {
+            anyhow::bail!("checkpoint write failed before provider")
+        }
+    }
 
     fn budget_client(api_style: ApiStyle) -> ModelClient {
         let mut profile = ModelProfile::builtin_deepseek();
@@ -821,7 +881,7 @@ mod tests {
         let markers: Vec<&str> = wire
             .iter()
             .filter_map(|item| item.pointer(content_pointer).and_then(Value::as_str))
-            .filter(|content| content.starts_with("[Compressed context]\nSummary: "))
+            .filter(|content| content.starts_with(crate::compaction::SUMMARY_PREFIX))
             .collect();
         assert_eq!(markers.len(), 1, "{wire:?}");
     }
@@ -949,13 +1009,65 @@ mod tests {
     }
 
     #[test]
+    fn request_phase1_and_phase2_do_not_emit_persistent_folds() {
+        for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
+            let client = phase2_client(api_style);
+            let messages = phase2_messages(api_style == ApiStyle::Responses);
+            let prepared = client.prepare_request(&messages, &[]).unwrap();
+
+            assert!(prepared.compression.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_phase3_commits_before_provider_failure() {
+        for committed in [false, true] {
+            let mut client = phase3_client(ApiStyle::Chat);
+            client.retry_base = Duration::from_millis(1);
+            let mut messages = phase3_messages(false);
+            let original = messages.clone();
+            let prepared = client.prepare_request(&messages, &[]).unwrap();
+            let projected = prepared.compression.projected(&messages).unwrap();
+            assert!(!prepared.compression.is_empty());
+            let sink = PersistSink {
+                committed,
+                calls: AtomicUsize::new(0),
+            };
+
+            let result = client.complete_persistent(&mut messages, &[], &sink).await;
+
+            assert!(result.is_err());
+            assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(messages, if committed { projected } else { original });
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_phase3_aborts_before_provider_on_checkpoint_error() {
+        let client = phase3_client(ApiStyle::Chat);
+        let mut messages = phase3_messages(false);
+        let original = messages.clone();
+
+        let error = client
+            .complete_persistent(&mut messages, &[], &FailingPersistSink)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "checkpoint write failed before provider");
+        assert_eq!(messages, original);
+    }
+
+    #[test]
     fn request_phase3_compresses_old_chat_text_and_uses_final_projection() {
         let client = phase3_client(ApiStyle::Chat);
         let messages = phase3_messages(false);
         let original = messages.clone();
         let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
 
-        let first = client.request_body(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        assert_eq!(prepared.compression.folds.len(), 1);
+        assert_eq!(prepared.compression.folds[0].compacted_messages, 2);
+        let first = prepared.body;
         let second = client.request_body(&messages, &[]).unwrap();
 
         assert_eq!(first, second);
@@ -1002,7 +1114,10 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, phase2_tokens, final_tokens) = phase3_estimates(&client, &messages);
 
-        let first = client.request_body(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        assert_eq!(prepared.compression.folds.len(), 1);
+        assert_eq!(prepared.compression.folds[0].compacted_messages, 2);
+        let first = prepared.body;
         let second = client.request_body(&messages, &[]).unwrap();
 
         assert_eq!(first, second);
@@ -1015,7 +1130,7 @@ mod tests {
             .find(|item| {
                 item.pointer("/content/0/text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| text.starts_with("[Compressed context]"))
+                    .is_some_and(|text| text.starts_with(crate::compaction::SUMMARY_PREFIX))
             })
             .unwrap();
         assert_eq!(summary["role"], "user");
@@ -1077,7 +1192,7 @@ mod tests {
         assert!(body["messages"].as_array().unwrap().iter().all(|item| {
             item["content"]
                 .as_str()
-                .is_none_or(|content| !content.starts_with("[Compressed context]"))
+                .is_none_or(|content| !content.starts_with(crate::compaction::SUMMARY_PREFIX))
         }));
     }
 
@@ -1088,7 +1203,9 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
 
-        let body = client.request_body(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        assert!(prepared.compression.is_empty());
+        let body = prepared.body;
 
         assert_eq!(messages, original);
         let wire = body["messages"].as_array().unwrap();
@@ -1135,7 +1252,9 @@ mod tests {
         let original = messages.clone();
         let (phase1_tokens, final_tokens) = phase2_estimates(&client, &messages);
 
-        let body = client.request_body(&messages, &[]).unwrap();
+        let prepared = client.prepare_request(&messages, &[]).unwrap();
+        assert!(prepared.compression.is_empty());
+        let body = prepared.body;
 
         assert_eq!(messages, original);
         let wire = body["input"].as_array().unwrap();

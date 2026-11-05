@@ -1,7 +1,8 @@
 //! TUI state and event handling.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -11,7 +12,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
-use crate::compaction::Compaction;
+use crate::compaction::{Compaction, CompressionBatch};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
@@ -122,7 +123,7 @@ pub struct App {
     pub theme: Theme,
     pub store: SessionStore,
     pub session: Session,
-    recorder: RecordBuffer,
+    recorder: Arc<Mutex<RecordBuffer>>,
     pub(crate) unsaved_messages: bool,
     pub messages: Vec<Message>,
     pub view: Vec<ViewItem>,
@@ -144,6 +145,7 @@ pub struct App {
     events: mpsc::UnboundedReceiver<UiEvent>,
     events_tx: mpsc::UnboundedSender<UiEvent>,
     cancel_handle: Option<tokio::task::JoinHandle<()>>,
+    persistence_gate: Option<Arc<AtomicBool>>,
     pub approver: Arc<dyn Approver>,
     pub asker: Arc<dyn Asker>,
     pub tools: Arc<ToolRegistry>,
@@ -187,7 +189,7 @@ impl App {
             theme: options.theme,
             store: options.store,
             session,
-            recorder: RecordBuffer::default(),
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             unsaved_messages: false,
             messages,
             view,
@@ -209,6 +211,7 @@ impl App {
             events,
             events_tx,
             cancel_handle: None,
+            persistence_gate: None,
             approver,
             asker,
             tools: Arc::new(ToolRegistry::builtin()),
@@ -220,6 +223,21 @@ impl App {
     #[cfg(test)]
     pub(crate) fn push_event(&self, event: UiEvent) {
         let _ = self.events_tx.send(event);
+    }
+
+    fn record_message(&self, message: &Message) -> Result<()> {
+        let mut recorder = self
+            .recorder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session recorder lock is poisoned"))?;
+        recorder.record(&self.session, message)
+    }
+
+    fn reset_recorder(&self) {
+        self.recorder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset();
     }
 
     #[cfg(test)]
@@ -316,7 +334,7 @@ impl App {
             }
             UiEvent::Usage(usage) => self.tokens.add(usage),
             UiEvent::MessageAdded(message) => {
-                if let Err(error) = self.recorder.record(&self.session, &message) {
+                if let Err(error) = self.record_message(&message) {
                     self.unsaved_messages = true;
                     self.view.push(ViewItem::Error(format!(
                         "failed to save session: {error:#}"
@@ -351,6 +369,7 @@ impl App {
                 ));
             }
             UiEvent::TurnFinished(result, messages, force_compression) => {
+                self.persistence_gate = None;
                 self.messages = messages;
                 self.running = false;
                 self.turn_started = None;
@@ -376,7 +395,7 @@ impl App {
                                         match self.session.append(&record) {
                                             Ok(()) => {
                                                 self.messages = plan.projected(&persisted_messages);
-                                                self.recorder.reset();
+                                                self.reset_recorder();
                                             }
                                             Err(error) => self.view.push(ViewItem::Error(format!(
                                                 "failed to save automatic compaction: {error:#}"
@@ -419,7 +438,7 @@ impl App {
                         }
                         self.messages =
                             vec![crate::compaction::summary_message(&compaction.summary)];
-                        self.recorder.reset();
+                        self.reset_recorder();
                         self.unsaved_messages = false;
                         self.tokens.add(compaction.usage);
                         let usage_error = self
@@ -764,9 +783,14 @@ impl App {
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
+        let persistence_gate = Arc::new(AtomicBool::new(!self.unsaved_messages));
+        self.persistence_gate = Some(persistence_gate.clone());
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
             turn_id,
+            session: self.session.clone(),
+            recorder: self.recorder.clone(),
+            persistence_gate,
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -806,8 +830,22 @@ impl App {
         if !self.running {
             return;
         }
+        if let Some(gate) = self.persistence_gate.take() {
+            gate.store(false, Ordering::SeqCst);
+        }
         if let Some(handle) = self.cancel_handle.take() {
             handle.abort();
+        }
+        if !self.unsaved_messages {
+            match self.session.load_messages() {
+                Ok(messages) => {
+                    self.messages = messages;
+                    self.reset_recorder();
+                }
+                Err(error) => self.view.push(ViewItem::Error(format!(
+                    "failed to reload session after cancellation: {error:#}"
+                ))),
+            }
         }
         if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
             let _ = reply.send(ApprovalDecision::Deny);
@@ -1110,7 +1148,7 @@ impl App {
                                     return;
                                 }
                             };
-                            self.recorder.reset();
+                            self.reset_recorder();
                             self.unsaved_messages = false;
                             self.view.push(ViewItem::Info(format!(
                                 "Resumed session {} ({}).",
@@ -1162,7 +1200,7 @@ impl App {
         ) {
             Ok(session) => {
                 self.session = session;
-                self.recorder.reset();
+                self.reset_recorder();
                 self.unsaved_messages = false;
             }
             Err(error) => self.view.push(ViewItem::Error(format!(
@@ -1335,7 +1373,9 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
                     streaming: false,
                 });
             }
-            crate::session::Record::Meta { .. } | crate::session::Record::Usage { .. } => {}
+            crate::session::Record::Meta { .. }
+            | crate::session::Record::Usage { .. }
+            | crate::session::Record::CompressionBatch { .. } => {}
         }
     }
     view
@@ -1357,6 +1397,9 @@ fn preview_output(output: &str) -> String {
 struct TuiSink {
     tx: mpsc::UnboundedSender<UiEvent>,
     turn_id: u64,
+    session: Session,
+    recorder: Arc<Mutex<RecordBuffer>>,
+    persistence_gate: Arc<AtomicBool>,
 }
 
 impl TuiSink {
@@ -1369,6 +1412,15 @@ impl TuiSink {
 }
 
 impl EventSink for TuiSink {
+    fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
+        let _recorder = self
+            .recorder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session recorder lock is poisoned"))?;
+        self.session
+            .append_compression_batch_if(batch, || self.persistence_gate.load(Ordering::SeqCst))
+    }
+
     fn text_delta(&self, delta: &str) {
         self.send(UiEvent::TextDelta(delta.to_string()));
     }
@@ -1515,6 +1567,90 @@ mod tests {
             &view[1],
             ViewItem::Assistant { text, .. } if text == "latest answer"
         ));
+    }
+
+    #[test]
+    fn tui_sink_orders_compression_before_a_buffered_tool_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("old")).unwrap();
+        session
+            .append_message(&Message::assistant(crate::model::AssistantMessage::text(
+                "old answer",
+            )))
+            .unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let recorder = Arc::new(Mutex::new(RecordBuffer::default()));
+        let pending = Message::assistant(crate::model::AssistantMessage {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            ..crate::model::AssistantMessage::default()
+        });
+        recorder.lock().unwrap().record(&session, &pending).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = TuiSink {
+            tx,
+            turn_id: 1,
+            session: session.clone(),
+            recorder: recorder.clone(),
+            persistence_gate: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert!(sink
+            .persist_compression(&CompressionBatch {
+                folds: vec![crate::compaction::CompressionFold {
+                    summary: "old summary".into(),
+                    compacted_messages: 2,
+                }],
+            })
+            .unwrap());
+        recorder
+            .lock()
+            .unwrap()
+            .record(
+                &session,
+                &Message::tool("call_1", "read_file", "real result"),
+            )
+            .unwrap();
+
+        let loaded = store.load(session.id()).unwrap();
+        let batch_index = loaded
+            .records
+            .iter()
+            .position(|record| matches!(record, Record::CompressionBatch { .. }))
+            .unwrap();
+        let tool_assistant_index = loaded
+            .records
+            .iter()
+            .rposition(|record| matches!(record, Record::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
+            .unwrap();
+        assert!(batch_index < tool_assistant_index);
+        assert!(loaded.messages().iter().any(
+            |message| matches!(message, Message::Tool { content, .. } if content == "real result")
+        ));
+    }
+
+    #[test]
+    fn tui_sink_skips_compression_when_turn_started_unsaved() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = TuiSink {
+            tx,
+            turn_id: 1,
+            session,
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
+            persistence_gate: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(!sink
+            .persist_compression(&CompressionBatch::default())
+            .unwrap());
     }
 
     #[test]

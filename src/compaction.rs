@@ -1,6 +1,7 @@
 //! Model-assisted conversation compaction.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::agent::EventSink;
 use crate::model::{Message, ModelClient, Usage};
@@ -18,6 +19,71 @@ const TRUNCATION_MARKER: &str = "[Earlier transcript entries omitted to fit the 
 pub struct Compaction {
     pub summary: String,
     pub usage: Usage,
+}
+
+/// Persistence metadata for one deterministic historical-turn fold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompressionFold {
+    pub summary: String,
+    pub compacted_messages: usize,
+}
+
+/// Ordered Phase 3 folds committed as one persistence operation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompressionBatch {
+    pub folds: Vec<CompressionFold>,
+}
+
+impl CompressionBatch {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.folds.is_empty()
+    }
+
+    /// Project every fold in persistence order without changing `source`.
+    pub(crate) fn projected(&self, source: &[Message]) -> Result<Vec<Message>> {
+        Self::project_folds(&self.folds, source)
+    }
+
+    /// Project a borrowed fold sequence without cloning its summary payloads.
+    pub(crate) fn project_folds(
+        folds: &[CompressionFold],
+        source: &[Message],
+    ) -> Result<Vec<Message>> {
+        let mut projected = source.to_vec();
+        Self::apply_folds(folds, &mut projected)?;
+        Ok(projected)
+    }
+
+    fn apply_folds(folds: &[CompressionFold], messages: &mut Vec<Message>) -> Result<()> {
+        for fold in folds {
+            let boundary = messages
+                .iter()
+                .rposition(|message| matches!(message, Message::Summary { .. }));
+            let start = messages
+                .iter()
+                .enumerate()
+                .skip(boundary.map_or(0, |index| index + 1))
+                .find_map(|(index, message)| {
+                    matches!(message, Message::User { .. }).then_some(index)
+                })
+                .context("compression fold has no eligible user turn")?;
+            let end = start
+                .checked_add(fold.compacted_messages)
+                .context("compression fold message count overflowed")?;
+            if fold.compacted_messages == 0 || end >= messages.len() {
+                bail!("compression fold does not describe a completed historical turn");
+            }
+            if !matches!(messages[end], Message::User { .. })
+                || messages[start..end].iter().any(|message| {
+                    matches!(message, Message::System { .. } | Message::Summary { .. })
+                })
+            {
+                bail!("compression fold crosses a structural or turn boundary");
+            }
+            messages.splice(start..end, [summary_message(&fold.summary)]);
+        }
+        Ok(())
+    }
 }
 
 /// A deterministic replacement for one completed historical user turn.

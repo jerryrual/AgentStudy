@@ -59,7 +59,7 @@ async fn phase_three_recovers_requests_without_changing_manual_compaction_input(
             assert!(messages[0]["content"]
                 .as_str()
                 .unwrap()
-                .starts_with("[Compressed context]\nSummary: User: obsolete details"));
+                .starts_with("[Earlier conversation summary]\nUser: obsolete details"));
             assert_eq!(messages[1]["content"], "recent decision");
             MockResponse::sse(&[
                 r#"{"choices":[{"delta":{"content":"Projection recovered."},"finish_reason":"stop"}],"usage":{"prompt_tokens":80,"completion_tokens":3,"total_tokens":83}}"#,

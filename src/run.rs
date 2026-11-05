@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
+use crate::compaction::CompressionBatch;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
@@ -52,6 +53,19 @@ impl RunSink {
 }
 
 impl EventSink for RunSink {
+    fn persist_compression(&self, batch: &CompressionBatch) -> Result<bool> {
+        if self.has_unsaved_messages() {
+            return Ok(false);
+        }
+        let mut recorded = self
+            .recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        recorded.session.append_compression_batch(batch)?;
+        recorded.buffer.reset();
+        Ok(true)
+    }
+
     fn text_delta(&self, delta: &str) {
         if self.json {
             return;
@@ -314,5 +328,29 @@ mod tests {
         )));
 
         assert!(sink.has_unsaved_messages());
+        assert!(!sink
+            .persist_compression(&CompressionBatch::default())
+            .unwrap());
+    }
+
+    #[test]
+    fn run_sink_returns_error_when_compression_append_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        std::fs::remove_dir_all(directory.path()).unwrap();
+        let sink = RunSink {
+            json: true,
+            recorded: Mutex::new(RecordedSession {
+                session,
+                buffer: RecordBuffer::default(),
+            }),
+            wrote_text: AtomicBool::new(false),
+            save_failed: AtomicBool::new(false),
+        };
+
+        assert!(sink
+            .persist_compression(&CompressionBatch::default())
+            .is_err());
     }
 }
