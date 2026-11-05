@@ -413,7 +413,9 @@ async fn stale_last_words_never_drops_new_current_tool_history() {
     let old_note = format!("## Task\n{note_body}\n## Progress\n{note_body}\n## Next\n{note_body}");
     let stale = old_note.replace("##", "###").replace("detail ", "detail  ");
     let server = MockServer::new(move |_path, body| {
-        assert_eq!(body["stream"], false);
+        if body["stream"] == true {
+            return MockResponse::sse(&[&text_chunk("continued safely"), &done_chunk("stop")]);
+        }
         MockResponse::json(
             200,
             &serde_json::json!({
@@ -456,10 +458,16 @@ async fn stale_last_words_never_drops_new_current_tool_history() {
         Message::tool("call_large", "read_file", "result ".repeat(2_500)),
     ];
 
-    let error = agent.run(&mut messages, &sink).await.unwrap_err();
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
 
-    assert!(error.to_string().contains("stale"), "{error:#}");
-    assert_eq!(server.request_count(), 2, "one bounded correction retry");
+    assert_eq!(turn.text, "continued safely");
+    assert_eq!(turn.rounds, 1);
+    assert_eq!(turn.usage.total_tokens, 35);
+    assert_eq!(
+        server.request_count(),
+        3,
+        "two side calls and one normal request"
+    );
     assert!(sink.projections.lock().unwrap().is_empty());
     assert_eq!(
         messages

@@ -65,6 +65,29 @@ struct LastWordsResult {
     usage: Usage,
 }
 
+struct PhaseFourSkipped {
+    error: anyhow::Error,
+    usage: Usage,
+}
+
+enum PhaseFourPrepareError {
+    Skipped(PhaseFourSkipped),
+    Fatal(anyhow::Error),
+}
+
+impl PhaseFourPrepareError {
+    fn skipped(error: anyhow::Error, usage: Usage) -> Self {
+        Self::Skipped(PhaseFourSkipped { error, usage })
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Skipped(skipped) => skipped.error,
+            Self::Fatal(error) => error,
+        }
+    }
+}
+
 impl ModelClient {
     /// Build a client for a profile, resolving the API key.
     pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
@@ -160,34 +183,48 @@ impl ModelClient {
         sink: &dyn EventSink,
     ) -> Result<PersistentCompletion> {
         let prepared = self.prepare_request(messages, tools, false)?;
+        let mut auxiliary_usage = Usage::default();
+        let mut phase_four_attempted = false;
         if self.phase_four_needed(&prepared, messages) {
-            let (retry, auxiliary_usage) = self
+            phase_four_attempted = true;
+            match self
                 .prepare_phase_four_retry(messages, tools, &prepared, sink)
-                .await?;
-            sink.info("compacted the current tool history into Last Words");
-            let completion = self
-                .complete_body(&retry.body, sink)
                 .await
-                .map_err(ClientError::into_error)?;
-            return Ok(PersistentCompletion {
-                completion,
-                auxiliary_usage,
-            });
+            {
+                Ok((retry, phase_four_usage)) => {
+                    sink.info("compacted the current tool history into Last Words");
+                    let completion = self
+                        .complete_body(&retry.body, sink)
+                        .await
+                        .map_err(ClientError::into_error)?;
+                    return Ok(PersistentCompletion {
+                        completion,
+                        auxiliary_usage: phase_four_usage,
+                    });
+                }
+                Err(PhaseFourPrepareError::Skipped(skipped)) => {
+                    auxiliary_usage.add(skipped.usage);
+                    sink.info(&format!("Last Words skipped: {:#}", skipped.error));
+                }
+                Err(PhaseFourPrepareError::Fatal(error)) => return Err(error),
+            }
         }
         Self::persist_prepared_compression(messages, &prepared.compression, sink)?;
         match self.complete_body(&prepared.body, sink).await {
             Ok(completion) => Ok(PersistentCompletion {
                 completion,
-                auxiliary_usage: Usage::default(),
+                auxiliary_usage,
             }),
             Err(ClientError::ContextOverflow { error, named_limit })
                 if self.can_retry_context_overflow(named_limit) =>
             {
                 let retry = self.prepare_request(messages, tools, true)?;
-                if Self::phase_four_eligible(messages) {
-                    let (phase_four, auxiliary_usage) = self
+                if !phase_four_attempted && Self::phase_four_eligible(messages) {
+                    let (phase_four, phase_four_usage) = self
                         .prepare_phase_four_retry(messages, tools, &retry, sink)
-                        .await?;
+                        .await
+                        .map_err(PhaseFourPrepareError::into_error)?;
+                    auxiliary_usage.add(phase_four_usage);
                     sink.info(
                         "model context overflow; compacting current tool history and retrying once",
                     );
@@ -211,7 +248,7 @@ impl ModelClient {
                     .map_err(ClientError::into_error)?;
                 Ok(PersistentCompletion {
                     completion,
-                    auxiliary_usage: Usage::default(),
+                    auxiliary_usage,
                 })
             }
             Err(error) => Err(error.into_error()),
@@ -243,13 +280,20 @@ impl ModelClient {
         tools: &[ToolDef],
         prepared: &PreparedRequest,
         sink: &dyn EventSink,
-    ) -> Result<(PreparedRequest, Usage)> {
-        let historical = prepared.compression.projected(messages)?;
+    ) -> std::result::Result<(PreparedRequest, Usage), PhaseFourPrepareError> {
+        let historical = prepared
+            .compression
+            .projected(messages)
+            .map_err(PhaseFourPrepareError::Fatal)?;
         let generated = self.generate_last_words(&historical, sink).await?;
         let user = historical
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
-            .context("cannot apply Last Words without a current user turn")?;
+            .ok_or_else(|| {
+                PhaseFourPrepareError::Fatal(anyhow!(
+                    "cannot apply Last Words without a current user turn"
+                ))
+            })?;
         let projection = crate::compaction::ContextProjection {
             historical_folds: prepared.compression.folds.clone(),
             current_turn: Some(crate::compaction::CurrentTurnFold {
@@ -257,15 +301,30 @@ impl ModelClient {
                 compacted_messages: historical.len() - user - 1,
             }),
         };
-        let projected = projection.projected(messages)?;
-        let retry = self.prepare_request(&projected, tools, false)?;
+        let projected = projection
+            .projected(messages)
+            .map_err(PhaseFourPrepareError::Fatal)?;
+        let retry = self
+            .prepare_request(&projected, tools, false)
+            .map_err(|error| {
+                PhaseFourPrepareError::Skipped(PhaseFourSkipped {
+                    error,
+                    usage: generated.usage,
+                })
+            })?;
         if retry.estimated_input >= prepared.estimated_input {
-            anyhow::bail!("Last Words did not reduce the estimated model input");
+            return Err(PhaseFourPrepareError::Skipped(PhaseFourSkipped {
+                error: anyhow!("Last Words did not reduce the estimated model input"),
+                usage: generated.usage,
+            }));
         }
         if !retry.compression.is_empty() {
-            anyhow::bail!("Last Words projection left an uncommitted historical fold");
+            return Err(PhaseFourPrepareError::Fatal(anyhow!(
+                "Last Words projection left an uncommitted historical fold"
+            )));
         }
-        Self::persist_prepared_projection(messages, &projection, projected, sink)?;
+        Self::persist_prepared_projection(messages, &projection, projected, sink)
+            .map_err(PhaseFourPrepareError::Fatal)?;
         Ok((retry, generated.usage))
     }
 
@@ -481,32 +540,45 @@ impl ModelClient {
         &self,
         messages: &[Message],
         usage_sink: &dyn EventSink,
-    ) -> Result<LastWordsResult> {
+    ) -> std::result::Result<LastWordsResult, PhaseFourPrepareError> {
         let user = messages
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
-            .context("cannot generate Last Words without a current user turn")?;
+            .ok_or_else(|| {
+                PhaseFourPrepareError::skipped(
+                    anyhow!("cannot generate Last Words without a current user turn"),
+                    Usage::default(),
+                )
+            })?;
         let current = &messages[user..];
         if !current.iter().any(|message| {
             matches!(message, Message::Assistant { message } if !message.tool_calls.is_empty())
         }) {
-            anyhow::bail!("cannot generate Last Words without a current tool-call group");
+            return Err(PhaseFourPrepareError::skipped(
+                anyhow!("cannot generate Last Words without a current tool-call group"),
+                Usage::default(),
+            ));
         }
         let transcript: Vec<Value> = current.iter().map(Message::to_api).collect();
-        let transcript = serde_json::to_string_pretty(&transcript)
-            .context("failed to encode current-turn transcript for Last Words")?;
+        let transcript = serde_json::to_string_pretty(&transcript).map_err(|error| {
+            PhaseFourPrepareError::skipped(
+                anyhow!(error).context("failed to encode current-turn transcript for Last Words"),
+                Usage::default(),
+            )
+        })?;
         let mut request = vec![
             Message::system(LAST_WORDS_SYSTEM_PROMPT),
             Message::user(format!("Current-turn transcript JSON:\n{transcript}")),
         ];
         let mut usage = Usage::default();
-        let mut last_validation = None;
         for attempt in 0..LAST_WORDS_GENERATION_ATTEMPTS {
-            let body = self.last_words_request_body(&request)?;
+            let body = self
+                .last_words_request_body(&request)
+                .map_err(|error| PhaseFourPrepareError::skipped(error, usage))?;
             let completion = self
                 .complete_body(&body, &crate::agent::NullSink)
                 .await
-                .map_err(ClientError::into_error)?;
+                .map_err(|error| PhaseFourPrepareError::skipped(error.into_error(), usage))?;
             usage.add(completion.usage);
             usage_sink.usage(&completion.usage);
             match validate_last_words(messages, &completion) {
@@ -519,12 +591,16 @@ impl ModelClient {
                     request.push(Message::user(format!(
                         "Correct the progress note. The previous response was invalid: {reason}"
                     )));
-                    last_validation = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(PhaseFourPrepareError::skipped(error, usage));
+                }
             }
         }
-        Err(last_validation.unwrap_or_else(|| anyhow!("Last Words generation failed")))
+        Err(PhaseFourPrepareError::skipped(
+            anyhow!("Last Words generation failed"),
+            usage,
+        ))
     }
 
     fn last_words_request_body(&self, messages: &[Message]) -> Result<Value> {
@@ -823,11 +899,27 @@ fn validate_last_words(messages: &[Message], completion: &Completion) -> Result<
 fn canonicalize_last_words(candidate: &str) -> Result<String> {
     let expected = ["Task", "Progress", "Next"];
     let mut sections = [String::new(), String::new(), String::new()];
-    let mut current = None;
+    let mut current: Option<usize> = None;
+    let mut fence = None;
     for line in candidate.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            let heading = trimmed.trim_start_matches('#').trim();
+        if let Some((marker, width)) = fence {
+            if let Some(index) = current {
+                if !sections[index].is_empty() {
+                    sections[index].push('\n');
+                }
+                sections[index].push_str(line);
+            } else if !trimmed.is_empty() {
+                anyhow::bail!("Last Words response has text before the Task heading");
+            }
+            if closes_markdown_fence(trimmed, marker, width) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = opens_markdown_fence(trimmed) {
+            fence = Some(opened);
+        } else if let Some(heading) = atx_heading(trimmed) {
             if let Some(index) = expected.iter().position(|expected| *expected == heading) {
                 if index != current.map_or(0, |current: usize| current + 1) {
                     anyhow::bail!("Last Words headings are missing, duplicated, or out of order");
@@ -859,11 +951,53 @@ fn canonicalize_last_words(candidate: &str) -> Result<String> {
     ))
 }
 
+fn atx_heading(trimmed: &str) -> Option<&str> {
+    let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let remainder = &trimmed[hashes..];
+    remainder
+        .starts_with(char::is_whitespace)
+        .then(|| remainder.trim())
+}
+
+fn opens_markdown_fence(trimmed: &str) -> Option<(u8, usize)> {
+    let marker = *trimmed.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let width = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    (width >= 3).then_some((marker, width))
+}
+
+fn closes_markdown_fence(trimmed: &str, marker: u8, width: usize) -> bool {
+    let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    count >= width && trimmed[count..].trim().is_empty()
+}
+
 fn extract_last_words_note(content: &str) -> Option<String> {
     let lines: Vec<_> = content.lines().collect();
-    let start = lines.iter().position(|line| {
-        line.trim().starts_with('#') && line.trim().trim_start_matches('#').trim() == "Task"
-    })?;
+    let mut fence = None;
+    let mut start = None;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some((marker, width)) = fence {
+            if closes_markdown_fence(trimmed, marker, width) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = opens_markdown_fence(trimmed) {
+            fence = Some(opened);
+            continue;
+        }
+        if atx_heading(trimmed) == Some("Task") {
+            start = Some(index);
+            break;
+        }
+    }
+    let start = start?;
     let end = lines[start..]
         .iter()
         .position(|line| line.trim() == "</system-reminder>")
@@ -1299,6 +1433,18 @@ mod tests {
         assert!(note.starts_with("## Task\n"));
         assert!(note.contains("\n\n## Progress\n"));
         assert!(note.contains("\n\n## Next\n"));
+
+        let fenced = format!(
+            "## Task\n{body}\n## Progress\n```c\n#include <stdio.h>\n# comment\n```\n{body}\n## Next\n#123 is an issue number\n{body}"
+        );
+        let completion = Completion {
+            message: AssistantMessage::text(fenced),
+            usage: Usage::default(),
+            finish_reason: Some("stop".into()),
+        };
+        let note = validate_last_words(&[Message::user("task")], &completion).unwrap();
+        assert!(note.contains("#include <stdio.h>"));
+        assert!(note.contains("#123 is an issue number"));
 
         for invalid in [
             format!("preamble\n{valid}"),
