@@ -20,6 +20,20 @@ impl EventSink for FailedRecoverySink {
     }
 }
 
+struct FailedResultCheckpointSink {
+    checkpoints: AtomicUsize,
+}
+
+impl EventSink for FailedResultCheckpointSink {
+    fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
+        if self.checkpoints.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(true)
+        } else {
+            anyhow::bail!("simulated tool-result checkpoint failure")
+        }
+    }
+}
+
 struct FailedCheckpointSink {
     entries: AtomicUsize,
     checkpoints: AtomicUsize,
@@ -159,6 +173,38 @@ async fn recovery_checkpoint_failure_prevents_provider_io() {
         "{error:#}"
     );
     assert_eq!(server.request_count(), 0);
+}
+
+#[tokio::test]
+async fn tool_result_checkpoint_failure_prevents_provider_continuation() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"hello.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            &done_chunk("tool_calls"),
+        ])
+    });
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("hello.txt"), "hello\n").unwrap();
+    let agent = build_agent(&server, directory.path(), Arc::new(AllowAll));
+    let sink = FailedResultCheckpointSink {
+        checkpoints: AtomicUsize::new(0),
+    };
+    let mut messages = vec![Message::user("read hello.txt")];
+
+    let error = agent.run(&mut messages, &sink).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed to checkpoint completed tool results"),
+        "{error:#}"
+    );
+    assert_eq!(server.request_count(), 1);
+    assert_eq!(sink.checkpoints.load(Ordering::SeqCst), 2);
+    assert!(matches!(messages.last(), Some(Message::Assistant { .. })));
+    assert!(!messages
+        .iter()
+        .any(|message| matches!(message, Message::Tool { .. })));
 }
 
 #[tokio::test]

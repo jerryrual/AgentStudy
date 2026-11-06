@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::Mutex;
 
 pub use events::{EventSink, NullSink};
@@ -272,7 +272,10 @@ impl Agent {
             };
 
             tool_calls += calls.len();
-            for message in self.execute_tool_batch(&calls, &context, sink).await {
+            let tool_messages = self
+                .execute_tool_batch(&calls, &context, messages, sink)
+                .await?;
+            for message in tool_messages {
                 messages.push(message.clone());
                 sink.message_added(&message);
             }
@@ -281,20 +284,23 @@ impl Agent {
 
     /// Execute one model tool-call batch. Maximal contiguous runs of tools that
     /// explicitly opt into parallel execution overlap; every other call is a
-    /// sequential barrier. Results always remain in provider call order.
+    /// sequential barrier. Each completed result is recovery-checkpointed, while
+    /// the returned batch always remains in provider call order.
     async fn execute_tool_batch(
         &self,
         calls: &[crate::model::ToolCall],
         context: &ToolContext,
+        message_prefix: &[Message],
         sink: &dyn EventSink,
-    ) -> Vec<Message> {
-        let mut messages = Vec::with_capacity(calls.len());
+    ) -> Result<Vec<Message>> {
+        let mut messages = vec![None; calls.len()];
         let mut index = 0;
         while index < calls.len() {
             if !self.is_parallel_safe(&calls[index]) {
                 let call = &calls[index];
                 let result = self.execute_tool(call, context, sink).await;
-                messages.push(Message::tool(call.id.clone(), call.name.clone(), result));
+                messages[index] = Some(Message::tool(call.id.clone(), call.name.clone(), result));
+                self.persist_tool_result_checkpoint(message_prefix, &messages, sink)?;
                 index += 1;
                 continue;
             }
@@ -303,31 +309,57 @@ impl Agent {
             while index < calls.len() && self.is_parallel_safe(&calls[index]) {
                 index += 1;
             }
-            let prepared: Vec<_> = calls[start..index]
-                .iter()
-                .map(|call| {
-                    let summary = self.tool_summary(call);
-                    sink.tool_started(&call.name, &summary);
-                    (call, summary)
-                })
-                .collect();
-            let executions = join_all(
-                prepared
-                    .iter()
-                    .map(|(call, summary)| self.execute_tool_inner(call, context, summary)),
-            )
-            .await;
+            let mut executions = FuturesUnordered::new();
+            for (offset, call) in calls[start..index].iter().enumerate() {
+                let call_index = start + offset;
+                let summary = self.tool_summary(call);
+                sink.tool_started(&call.name, &summary);
+                executions.push(async move {
+                    let execution = self.execute_tool_inner(call, context, &summary).await;
+                    (call_index, call, summary, execution)
+                });
+            }
+            let mut finishes = vec![None; index - start];
 
-            // `join_all` preserves input order. Emit finishes and persist tool
-            // messages in that order too, even if the calls completed in reverse.
-            for ((call, summary), (ok, duration, display, result)) in
-                prepared.into_iter().zip(executions)
+            while let Some((call_index, call, summary, (ok, duration, display, result))) =
+                executions.next().await
             {
-                sink.tool_finished(&call.name, ok, duration, &summary, &display);
-                messages.push(Message::tool(call.id.clone(), call.name.clone(), result));
+                finishes[call_index - start] = Some((ok, duration, summary, display));
+                messages[call_index] =
+                    Some(Message::tool(call.id.clone(), call.name.clone(), result));
+                self.persist_tool_result_checkpoint(message_prefix, &messages, sink)?;
+            }
+            for (offset, finish) in finishes.into_iter().enumerate() {
+                let (ok, duration, summary, display) = finish.ok_or_else(|| {
+                    anyhow::anyhow!("parallel tool ended without finish metadata")
+                })?;
+                sink.tool_finished(
+                    &calls[start + offset].name,
+                    ok,
+                    duration,
+                    &summary,
+                    &display,
+                );
             }
         }
         messages
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow::anyhow!("tool batch ended without every result"))
+    }
+
+    fn persist_tool_result_checkpoint(
+        &self,
+        message_prefix: &[Message],
+        tool_results: &[Option<Message>],
+        sink: &dyn EventSink,
+    ) -> Result<()> {
+        let mut checkpoint = Vec::with_capacity(message_prefix.len() + tool_results.len());
+        checkpoint.extend_from_slice(message_prefix);
+        checkpoint.extend(tool_results.iter().filter_map(Clone::clone));
+        sink.persist_recovery_checkpoint(&checkpoint)
+            .context("failed to checkpoint completed tool results")?;
+        Ok(())
     }
 
     fn is_parallel_safe(&self, call: &crate::model::ToolCall) -> bool {
@@ -466,11 +498,35 @@ mod tests {
     use anyhow::{bail, Result};
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
 
     use crate::config::ModelProfile;
     use crate::interaction::{AllowAll, NoAsker};
     use crate::tools::{Tool, ToolContext};
+
+    struct RecordingCheckpointSink {
+        snapshots: StdMutex<Vec<Vec<Message>>>,
+    }
+
+    impl EventSink for RecordingCheckpointSink {
+        fn persist_recovery_checkpoint(&self, messages: &[Message]) -> Result<bool> {
+            self.snapshots.lock().unwrap().push(messages.to_vec());
+            Ok(true)
+        }
+    }
+
+    struct SignalingCheckpointSink {
+        snapshots: StdMutex<Vec<Vec<Message>>>,
+        published: Notify,
+    }
+
+    impl EventSink for SignalingCheckpointSink {
+        fn persist_recovery_checkpoint(&self, messages: &[Message]) -> Result<bool> {
+            self.snapshots.lock().unwrap().push(messages.to_vec());
+            self.published.notify_waiters();
+            Ok(true)
+        }
+    }
 
     struct ParallelProbe {
         barrier: Arc<Barrier>,
@@ -556,14 +612,43 @@ mod tests {
             },
         ];
 
+        let prefix = vec![
+            Message::user("inspect"),
+            Message::assistant(crate::model::AssistantMessage {
+                content: None,
+                reasoning: None,
+                tool_calls: calls.clone(),
+                responses_items: Vec::new(),
+            }),
+        ];
+        let original_prefix = prefix.clone();
+        let sink = RecordingCheckpointSink {
+            snapshots: StdMutex::new(Vec::new()),
+        };
         let messages = tokio::time::timeout(
             Duration::from_secs(1),
-            agent.execute_tool_batch(&calls, &test_context(), &NullSink),
+            agent.execute_tool_batch(&calls, &test_context(), &prefix, &sink),
         )
         .await
-        .expect("parallel calls should both reach the barrier");
+        .expect("parallel calls should both reach the barrier")
+        .unwrap();
 
+        assert_eq!(prefix, original_prefix);
         assert_eq!(*completed.lock().unwrap(), ["fast", "slow"]);
+        let snapshots = sink.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(matches!(&snapshots[0][2], Message::Tool { call_id, .. } if call_id == "call_2"));
+        assert_eq!(
+            snapshots[1][2..]
+                .iter()
+                .map(|message| match message {
+                    Message::Tool { call_id, .. } => call_id.as_str(),
+                    _ => panic!("expected tool result"),
+                })
+                .collect::<Vec<_>>(),
+            ["call_1", "call_2"]
+        );
+        drop(snapshots);
         let ids_and_outputs: Vec<_> = messages
             .iter()
             .map(|message| match message {
@@ -574,6 +659,58 @@ mod tests {
             })
             .collect();
         assert_eq!(ids_and_outputs, [("call_1", "slow"), ("call_2", "fast")]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_parallel_batch_keeps_the_last_published_subset() {
+        let barrier = Arc::new(Barrier::new(2));
+        let completed = Arc::new(StdMutex::new(Vec::new()));
+        let agent = test_agent(Box::new(ParallelProbe {
+            barrier,
+            completed: completed.clone(),
+        }));
+        let calls = vec![
+            crate::model::ToolCall {
+                id: "call_slow".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"slow","delay_ms":500}"#.into(),
+            },
+            crate::model::ToolCall {
+                id: "call_fast".into(),
+                name: "probe".into(),
+                arguments: r#"{"id":"fast","delay_ms":0}"#.into(),
+            },
+        ];
+        let prefix = vec![Message::assistant(crate::model::AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: calls.clone(),
+            responses_items: Vec::new(),
+        })];
+        let original_prefix = prefix.clone();
+        let sink = SignalingCheckpointSink {
+            snapshots: StdMutex::new(Vec::new()),
+            published: Notify::new(),
+        };
+        let published = sink.published.notified();
+        tokio::pin!(published);
+        let context = test_context();
+        let mut execution = Box::pin(agent.execute_tool_batch(&calls, &context, &prefix, &sink));
+
+        tokio::select! {
+            () = &mut published => {}
+            result = &mut execution => panic!("batch ended before cancellation: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(1)) => panic!("first result was not checkpointed"),
+        }
+        drop(execution);
+
+        assert_eq!(prefix, original_prefix);
+        assert_eq!(*completed.lock().unwrap(), ["fast"]);
+        let snapshots = sink.snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(
+            matches!(&snapshots[0][1], Message::Tool { call_id, .. } if call_id == "call_fast")
+        );
     }
 
     #[tokio::test]
@@ -595,8 +732,9 @@ mod tests {
         ];
 
         let messages = agent
-            .execute_tool_batch(&calls, &test_context(), &NullSink)
-            .await;
+            .execute_tool_batch(&calls, &test_context(), &[], &NullSink)
+            .await
+            .unwrap();
         let outputs: Vec<_> = messages
             .iter()
             .map(|message| match message {
