@@ -32,7 +32,7 @@ pub trait EventSink: Send + Sync {
 
     /// Durably record whether a committed Phase 4 retry freed five context points.
     fn record_phase_four_progress(&self, _meaningful: bool) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("Phase 4 progress persistence is unavailable")
     }
 
     /// Charge one imminent Phase 4 provider attempt against this turn's input budget.
@@ -105,3 +105,13 @@ pub trait EventSink: Send + Sync {
 pub struct NullSink;
 
 impl EventSink for NullSink {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_progress_checkpoint_fails_closed() {
+        assert!(NullSink.record_phase_four_progress(true).is_err());
+    }
+}

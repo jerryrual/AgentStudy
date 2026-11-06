@@ -56,6 +56,10 @@ impl EventSink for SideCallQuotaSink {
         self.charged_attempts.fetch_add(1, Ordering::SeqCst) < self.allowed_attempts
     }
 
+    fn record_phase_four_progress(&self, _meaningful: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn persist_context_projection(
         &self,
         _source: &[Message],
