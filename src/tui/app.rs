@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::injection::{self, InjectionQueue};
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
 use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveManifest};
@@ -83,6 +84,10 @@ pub(crate) enum UiEvent {
     },
     Usage(Usage),
     MessageAdded(Message),
+    PersistInjectedUser {
+        message: Message,
+        reply: std::sync::mpsc::Sender<std::result::Result<(), String>>,
+    },
     PersistContextProjection {
         source: Vec<Message>,
         projection: ContextProjection,
@@ -162,6 +167,7 @@ pub struct App {
     events: mpsc::UnboundedReceiver<UiEvent>,
     events_tx: mpsc::UnboundedSender<UiEvent>,
     cancel_handle: Option<tokio::task::JoinHandle<()>>,
+    injection_queue: Option<InjectionQueue>,
     persistence_gate: Option<Arc<AtomicBool>>,
     recovery_writer: Option<RecoveryCheckpointWriter>,
     pub approver: Arc<dyn Approver>,
@@ -244,6 +250,7 @@ impl App {
             events,
             events_tx,
             cancel_handle: None,
+            injection_queue: None,
             persistence_gate: None,
             recovery_writer: None,
             approver,
@@ -389,6 +396,15 @@ impl App {
                     }
                 }
             }
+            UiEvent::PersistInjectedUser { message, reply } => {
+                let result = self
+                    .record_message(&message)
+                    .map_err(|error| format!("failed to save injected user message: {error:#}"));
+                if result.is_err() {
+                    self.unsaved_messages = true;
+                }
+                let _ = reply.send(result);
+            }
             UiEvent::PersistContextProjection {
                 source,
                 projection,
@@ -428,6 +444,7 @@ impl App {
                 ));
             }
             UiEvent::TurnFinished(result, messages, force_compression) => {
+                self.injection_queue = None;
                 let mut recovery_writer = self.recovery_writer.take();
                 self.persistence_gate = None;
                 self.messages = messages;
@@ -986,6 +1003,8 @@ impl App {
             .map(RecoveryCheckpointWriter::handle);
         self.persistence_gate = Some(persistence_gate.clone());
         self.recovery_writer = recovery_writer;
+        let (injection_queue, injection_source) = injection::channel();
+        self.injection_queue = Some(injection_queue);
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
             turn_id,
@@ -1019,7 +1038,9 @@ impl App {
                     tool_timeout: Duration::from_secs(120),
                 };
                 let agent = Agent::new(client, tools, approver, asker, options);
-                let turn = agent.run(&mut messages, sink.as_ref()).await?;
+                let turn = agent
+                    .run_with_injections(&mut messages, sink.as_ref(), &injection_source)
+                    .await?;
                 let force_compression = agent.should_force_compression(&turn);
                 Ok::<_, anyhow::Error>((turn, force_compression))
             }
@@ -1045,6 +1066,9 @@ impl App {
             .as_ref()
             .map(RecoveryCheckpointWriter::begin_preserve)
             .transpose();
+        if let Some(queue) = self.injection_queue.take() {
+            queue.close();
+        }
         if let Some(gate) = self.persistence_gate.take() {
             gate.store(false, Ordering::SeqCst);
         }
@@ -1823,6 +1847,46 @@ impl EventSink for TuiSink {
             CurrentTurnArchiveManifest::default();
     }
 
+    fn persist_injected_user(&self, message: &Message) -> anyhow::Result<()> {
+        if !matches!(message, Message::InjectedUser { .. }) {
+            anyhow::bail!("injected transcript persistence requires an InjectedUser message");
+        }
+        if !self.persistence_gate.load(Ordering::SeqCst) {
+            anyhow::bail!("turn was cancelled before injected transcript persistence");
+        }
+        let (reply, response) = std::sync::mpsc::channel();
+        self.tx
+            .send(UiEvent::Turn {
+                id: self.turn_id,
+                event: Box::new(UiEvent::PersistInjectedUser {
+                    message: message.clone(),
+                    reply,
+                }),
+            })
+            .map_err(|_| {
+                anyhow::anyhow!("TUI event loop closed before injected transcript persistence")
+            })?;
+        loop {
+            match response.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => return result.map_err(anyhow::Error::msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                    if !self.persistence_gate.load(Ordering::SeqCst) =>
+                {
+                    anyhow::bail!("turn was cancelled during injected transcript persistence")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("TUI injected transcript persistence was cancelled")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if !self.persistence_gate.load(Ordering::SeqCst) =>
+                {
+                    anyhow::bail!("turn was cancelled during injected transcript persistence")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
     fn persist_recovery_checkpoint(&self, messages: &[Message]) -> anyhow::Result<bool> {
         if !self.recovery_enabled {
             return Ok(false);
@@ -2235,6 +2299,137 @@ mod tests {
         assert!(loaded.messages().iter().any(
             |message| matches!(message, Message::Tool { content, .. } if content == "real result")
         ));
+    }
+
+    #[test]
+    fn tui_injected_persistence_follows_queued_tool_messages_exactly_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let recorder = Arc::new(Mutex::new(RecordBuffer::default()));
+        let gate = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(TuiSink {
+            tx,
+            turn_id: 9,
+            session: session.clone(),
+            recorder: recorder.clone(),
+            persistence_gate: gate,
+            recovery_enabled: true,
+            recovery_writer: None,
+            archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+        });
+        let assistant = Message::assistant(crate::model::AssistantMessage {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            ..crate::model::AssistantMessage::default()
+        });
+        sink.message_added(&assistant);
+        sink.message_added(&Message::tool("call_1", "read_file", "completed result"));
+        let injected = Message::injected_user("inject-1", "same-turn direction");
+        let worker = {
+            let sink = sink.clone();
+            let injected = injected.clone();
+            std::thread::spawn(move || sink.persist_injected_user(&injected))
+        };
+
+        for _ in 0..3 {
+            let UiEvent::Turn { id, event } = rx.blocking_recv().expect("queued turn event") else {
+                panic!("expected a turn-scoped event");
+            };
+            assert_eq!(id, 9);
+            match *event {
+                UiEvent::MessageAdded(message) => {
+                    recorder.lock().unwrap().record(&session, &message).unwrap()
+                }
+                UiEvent::PersistInjectedUser { message, reply } => {
+                    let result = recorder
+                        .lock()
+                        .unwrap()
+                        .record(&session, &message)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = reply.send(result);
+                }
+                _ => panic!("unexpected queued event"),
+            }
+        }
+        worker.join().unwrap().unwrap();
+
+        let loaded = store.load(session.id()).unwrap();
+        let tool_index = loaded
+            .records
+            .iter()
+            .position(|record| matches!(record, Record::Tool { content, .. } if content == "completed result"))
+            .unwrap();
+        let injected_indices = loaded
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                matches!(
+                    record,
+                    Record::InjectedUser { injection_id, text }
+                        if injection_id == "inject-1" && text == "same-turn direction"
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(injected_indices.len(), 1);
+        assert!(tool_index < injected_indices[0]);
+    }
+
+    #[test]
+    fn tui_injected_persistence_cancelled_before_dispatch_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let gate = Arc::new(AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = Arc::new(TuiSink {
+            tx,
+            turn_id: 11,
+            session: session.clone(),
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
+            persistence_gate: gate.clone(),
+            recovery_enabled: true,
+            recovery_writer: None,
+            archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+        });
+        let worker = {
+            let sink = sink.clone();
+            std::thread::spawn(move || {
+                sink.persist_injected_user(&Message::injected_user(
+                    "inject-cancelled",
+                    "do not persist",
+                ))
+            })
+        };
+        let UiEvent::Turn { id, event } = rx.blocking_recv().expect("queued turn event") else {
+            panic!("expected a turn-scoped event");
+        };
+        assert_eq!(id, 11);
+
+        gate.store(false, Ordering::SeqCst);
+        drop(event);
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        let loaded = store.load(session.id()).unwrap();
+        assert!(!loaded.records.iter().any(|record| matches!(
+            record,
+            Record::InjectedUser { injection_id, .. } if injection_id == "inject-cancelled"
+        )));
     }
 
     #[test]
