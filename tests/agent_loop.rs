@@ -56,6 +56,10 @@ impl EventSink for SideCallQuotaSink {
         self.charged_attempts.fetch_add(1, Ordering::SeqCst) < self.allowed_attempts
     }
 
+    fn record_phase_four_progress(&self, _meaningful: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn persist_context_projection(
         &self,
         _source: &[Message],
@@ -477,6 +481,7 @@ async fn generates_last_words_before_retrying_a_large_current_tool_turn() {
     assert_eq!(turn.rounds, 1);
     assert_eq!(turn.usage.total_tokens, 25);
     assert_eq!(sink.projections.lock().unwrap().len(), 1);
+    assert_eq!(*sink.progress.lock().unwrap(), vec![true]);
     assert!(matches!(messages[2], Message::LastWords { .. }));
     assert!(matches!(
         messages.last(),

@@ -55,6 +55,19 @@ impl PhaseFourBreakerState {
         self.attempts += 1;
         true
     }
+
+    pub(crate) fn record_progress(&mut self, meaningful: bool) {
+        if meaningful {
+            self.consecutive_no_progress = 0;
+            return;
+        }
+        self.consecutive_no_progress = self
+            .consecutive_no_progress
+            .saturating_add(1)
+            .min(STATE_INTEGER_MAX);
+        self.tail_override = true;
+        self.disabled = self.disabled || self.consecutive_no_progress >= 2;
+    }
 }
 
 /// Serializes breaker transitions for one logical user turn.
@@ -84,6 +97,20 @@ impl PhaseFourBreaker {
             .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
         *current = committed;
         Ok(admitted)
+    }
+
+    pub(crate) fn record_progress_and_persist<F>(&self, meaningful: bool, persist: F) -> Result<()>
+    where
+        F: FnOnce(&PhaseFourBreakerState, bool) -> Result<Option<PhaseFourBreakerState>>,
+    {
+        let mut current = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Phase 4 breaker lock is poisoned"))?;
+        let committed = persist(&current, meaningful)?
+            .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
+        *current = committed;
+        Ok(())
     }
 
     pub(crate) fn charge_and_persist<F>(&self, estimated_input: u64, persist: F) -> Result<bool>
@@ -140,6 +167,26 @@ mod tests {
         assert!(!spent.enter_round(100));
         assert!(spent.disabled);
         assert_eq!(spent.attempts, 0);
+    }
+
+    #[test]
+    fn progress_resets_only_consecutive_strikes_and_second_strike_disables() {
+        let mut state = PhaseFourBreakerState::default();
+        state.record_progress(false);
+        assert_eq!(state.consecutive_no_progress, 1);
+        assert!(state.tail_override);
+        assert!(!state.disabled);
+
+        state.record_progress(true);
+        assert_eq!(state.consecutive_no_progress, 0);
+        assert!(state.tail_override);
+        assert!(!state.disabled);
+
+        state.record_progress(false);
+        state.record_progress(false);
+        assert_eq!(state.consecutive_no_progress, 2);
+        assert!(state.tail_override);
+        assert!(state.disabled);
     }
 
     #[test]
