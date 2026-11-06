@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::agent::events::PhaseFourSideCallBudget;
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
 use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveManifest};
@@ -829,6 +830,7 @@ impl App {
         let kind = self.agent_kind;
         let cwd = self.cwd.clone();
         let max_rounds = self.settings.max_tool_rounds;
+        let phase_four_side_call_token_budget = self.settings.phase4_side_call_token_budget;
         let approver = self.approver.clone();
         let asker = self.asker.clone();
         let tools = self.tools.clone();
@@ -843,6 +845,9 @@ impl App {
             persistence_gate,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(
+                phase_four_side_call_token_budget,
+            ),
         });
         let handle = self.runtime.clone();
         let task = handle.spawn(async move {
@@ -1484,6 +1489,7 @@ struct TuiSink {
     persistence_gate: Arc<AtomicBool>,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
+    phase_four_side_call_budget: PhaseFourSideCallBudget,
 }
 
 impl TuiSink {
@@ -1497,6 +1503,7 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn turn_started(&self) {
+        self.phase_four_side_call_budget.reset();
         let pointer = self.session.archive_catalog_pointer().ok().flatten();
         *self
             .archive_pointer
@@ -1507,6 +1514,11 @@ impl EventSink for TuiSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             CurrentTurnArchiveManifest::default();
+    }
+
+    fn charge_phase_four_side_call(&self, estimated_input: u64) -> bool {
+        self.phase_four_side_call_budget
+            .charge_and_allow(estimated_input)
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -1760,6 +1772,7 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(true)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
 
         assert!(sink
@@ -1813,6 +1826,7 @@ mod tests {
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         });
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -1915,6 +1929,7 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
 
         assert!(!sink
@@ -1936,6 +1951,7 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {
@@ -1964,6 +1980,7 @@ mod tests {
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         });
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {

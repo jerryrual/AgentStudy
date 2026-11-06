@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::json;
 
+use crate::agent::events::PhaseFourSideCallBudget;
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
 use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::compaction_archive::CurrentTurnArchiveManifest;
@@ -38,6 +39,7 @@ struct RunSink {
     save_failed: AtomicBool,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
+    phase_four_side_call_budget: PhaseFourSideCallBudget,
 }
 
 struct RecordedSession {
@@ -57,6 +59,7 @@ impl RunSink {
 
 impl EventSink for RunSink {
     fn turn_started(&self) {
+        self.phase_four_side_call_budget.reset();
         let pointer = self
             .recorded
             .lock()
@@ -74,6 +77,11 @@ impl EventSink for RunSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             CurrentTurnArchiveManifest::default();
+    }
+
+    fn charge_phase_four_side_call(&self, estimated_input: u64) -> bool {
+        self.phase_four_side_call_budget
+            .charge_and_allow(estimated_input)
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -255,6 +263,9 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         save_failed: AtomicBool::new(false),
         archive_pointer: Mutex::new(None),
         current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+        phase_four_side_call_budget: PhaseFourSideCallBudget::new(
+            options.settings.phase4_side_call_token_budget,
+        ),
     };
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
@@ -403,6 +414,7 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
@@ -431,6 +443,7 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
@@ -550,6 +563,7 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -604,6 +618,7 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
         };
 
         assert!(sink

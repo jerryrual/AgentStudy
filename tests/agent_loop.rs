@@ -1,14 +1,57 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use icode::agent::{Agent, AgentKind, AgentOptions};
+use icode::agent::{Agent, AgentKind, AgentOptions, EventSink};
+use icode::compaction::ContextProjection;
 use icode::interaction::{AllowAll, ApprovalDecision, DenyAll, NoAsker, ScriptedApprover};
 use icode::model::{AssistantMessage, Message, ModelClient};
 use icode::tools::ToolRegistry;
+
+struct SideCallQuotaSink {
+    allowed_attempts: usize,
+    charged_attempts: AtomicUsize,
+    events: std::sync::Mutex<Vec<String>>,
+    projections: std::sync::Mutex<Vec<ContextProjection>>,
+}
+
+impl SideCallQuotaSink {
+    fn new(allowed_attempts: usize) -> Self {
+        Self {
+            allowed_attempts,
+            charged_attempts: AtomicUsize::new(0),
+            events: std::sync::Mutex::new(Vec::new()),
+            projections: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl EventSink for SideCallQuotaSink {
+    fn turn_started(&self) {
+        self.charged_attempts.store(0, Ordering::SeqCst);
+    }
+
+    fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
+        self.charged_attempts.fetch_add(1, Ordering::SeqCst) < self.allowed_attempts
+    }
+
+    fn persist_context_projection(
+        &self,
+        _source: &[Message],
+        projection: &ContextProjection,
+    ) -> anyhow::Result<bool> {
+        self.projections.lock().unwrap().push(projection.clone());
+        Ok(true)
+    }
+
+    fn info(&self, message: &str) {
+        self.events.lock().unwrap().push(message.to_string());
+    }
+}
 
 fn agent_options(cwd: PathBuf, max_rounds: usize) -> AgentOptions {
     AgentOptions {
@@ -262,6 +305,54 @@ async fn retries_transient_failures() {
     assert_eq!(turn.text, "recovered");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(sink.events().iter().any(|event| event.contains("retrying")));
+}
+
+#[tokio::test]
+async fn phase_four_quota_charges_each_physical_retry_before_provider_io() {
+    std::env::set_var("ICODE_RETRY_BASE_MS", "1");
+    let server = MockServer::new(move |_path, body| {
+        if body["stream"] == false {
+            return MockResponse::json(429, r#"{"error":{"message":"rate limited"}}"#);
+        }
+        MockResponse::sse(&[&text_chunk("continued raw"), &done_chunk("stop")])
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(30_000);
+    profile.max_tokens = Some(3_000);
+    let agent = Agent::new(
+        Arc::new(ModelClient::from_profile(&profile).unwrap()),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        agent_options(directory.path().to_path_buf(), 6),
+    );
+    let sink = SideCallQuotaSink::new(1);
+    let mut messages = vec![
+        Message::user("inspect the large result and continue"),
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![icode::model::ToolCall {
+                id: "call_large".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"large.txt"}"#.into(),
+            }],
+            ..AssistantMessage::default()
+        }),
+        Message::tool("call_large", "read_file", "result ".repeat(2_500)),
+    ];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+
+    assert_eq!(turn.text, "continued raw");
+    assert_eq!(server.request_count(), 2, "denied retry never reached HTTP");
+    assert_eq!(sink.charged_attempts.load(Ordering::SeqCst), 2);
+    assert!(sink.projections.lock().unwrap().is_empty());
+    assert!(sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.contains("side-call input-token budget exhausted")));
 }
 
 #[tokio::test]

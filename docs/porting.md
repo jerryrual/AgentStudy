@@ -26,7 +26,7 @@
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
 | 模型协议 | Chat Completions；核心无状态 Responses API（文本、推理摘要、本地函数工具、流式/非流式） | `src/model/` |
-| 重试 | 429/5xx/transport 指数退避重试；严格上下文溢出会强制运行 Phase 1–3，并在当前工具尾部可严格缩小时生成无工具、非流式 Last Words，原子持久化 Phase 4 后零延迟重试一次；全部恢复仍属于同一 agent round | `src/model/client.rs` |
+| 重试 | 429/5xx/transport 指数退避重试；严格上下文溢出会强制运行 Phase 1–3，并在当前工具尾部可严格缩小时生成无工具、非流式 Last Words，原子持久化 Phase 4 后零延迟重试一次；全部恢复仍属于同一 agent round。`phase4_side_call_token_budget` 按逻辑用户轮累计每次实际 Phase 4 HTTP 尝试的估算输入 token：`-1` 不限、`0` 禁用、正数按上游的 charge-first 且严格小于上限准入；格式纠正和 429/5xx/transport 重试共享配额，新用户轮重置 | `src/config.rs`、`src/agent/events.rs`、`src/model/client.rs` |
 
 ## 尚未移植
 
@@ -34,7 +34,7 @@
 
 ### 1. 上下文 / 协议
 
-1. 其余 Phase 4 接线。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。被投影替换的 assistant/tool 组已经按上游格式完整未脱敏归档（并行调用共用记录），Run/TUI 在 FIFO/session append 屏障内先写 record/catalog/manifest 再提交投影，任何归档拒绝或错误都会保留 raw JSONL。成功提交的同轮归档 rows 会跨多次 Phase 4 累积为有界 Last Words manifest，紧随当前提交的主请求会得到新 rows，后续 side-call 也能保留此前 rows；新用户轮次清空状态。此前轮次的 live catalog 数量和经过校验的绝对路径会在逻辑轮次开始时冻结，并在 `read_file` 可用时注入该轮所有请求；通用 `read_file` 可沿 catalog 中的相对路径检索完整压缩记录。side-call 累计配额与完整持久化 breaker 尚未移植；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。
+1. 其余 Phase 4 接线。Phase 1–4 已能按预算或 provider 溢出触发：Last Words side-call 不流式且不暴露工具，校验新 note 后将历史折叠和完整当前工具尾部替换原子持久化，严格缩小请求才在同一 agent round 继续；失败或取消不会丢弃工具历史，后续工具轮可再次合并旧 note 与新增工作。被投影替换的 assistant/tool 组已经按上游格式完整未脱敏归档（并行调用共用记录），Run/TUI 在 FIFO/session append 屏障内先写 record/catalog/manifest 再提交投影，任何归档拒绝或错误都会保留 raw JSONL。成功提交的同轮归档 rows 会跨多次 Phase 4 累积为有界 Last Words manifest，紧随当前提交的主请求会得到新 rows，后续 side-call 也能保留此前 rows；新用户轮次清空状态。此前轮次的 live catalog 数量和经过校验的绝对路径会在逻辑轮次开始时冻结，并在 `read_file` 可用时注入该轮所有请求；通用 `read_file` 可沿 catalog 中的相对路径检索完整压缩记录。完整持久化 breaker 尚未移植；当前实现每次逻辑模型调用最多进行一轮 Phase 4，并将 note 格式纠正限制为两次生成。side-call 输入 token 累计配额已按逻辑用户轮接线，包含物理 transport 重试且拒绝前仍记账；进程中断后的同轮配额恢复将随持久化 breaker 一并补齐。
 2. Responses API 的服务端续传、后台响应与托管工具。
 3. 图片输入、图片压缩与多模态消息持久化。
 
