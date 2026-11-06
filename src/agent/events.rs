@@ -50,6 +50,11 @@ pub trait EventSink: Send + Sync {
         Ok(self.charge_phase_four_side_call(estimated_input))
     }
 
+    /// Whether the active turn was cancelled while persistence was pending.
+    fn phase_four_cancelled(&self) -> bool {
+        false
+    }
+
     /// A chunk of assistant text arrived.
     fn text_delta(&self, _delta: &str) {}
 

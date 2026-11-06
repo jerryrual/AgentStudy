@@ -1546,6 +1546,10 @@ impl EventSink for TuiSink {
             })
     }
 
+    fn phase_four_cancelled(&self) -> bool {
+        !self.persistence_gate.load(Ordering::SeqCst)
+    }
+
     fn record_phase_four_progress(&self, meaningful: bool) -> anyhow::Result<()> {
         self.phase_four_breaker
             .record_progress_and_persist(meaningful, |_, meaningful| {

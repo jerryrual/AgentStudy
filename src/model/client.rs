@@ -450,8 +450,22 @@ impl ModelClient {
         projected: Vec<Message>,
         sink: &dyn EventSink,
     ) -> Result<()> {
-        if !sink.persist_context_projection(messages, projection)? {
-            anyhow::bail!("Last Words projection was not persisted for the active turn");
+        match sink.persist_context_projection(messages, projection) {
+            Ok(true) => {}
+            Ok(false) => {
+                if !sink.phase_four_cancelled() {
+                    sink.record_phase_four_failure(false)
+                        .context("failed to checkpoint Phase 4 spill abort")?;
+                }
+                anyhow::bail!("Last Words projection was not persisted for the active turn");
+            }
+            Err(error) => {
+                if !sink.phase_four_cancelled() {
+                    sink.record_phase_four_failure(false)
+                        .context("failed to checkpoint Phase 4 spill abort")?;
+                }
+                return Err(error);
+            }
         }
         *messages = projected;
         Ok(())
@@ -1562,9 +1576,21 @@ mod tests {
 
     struct ProjectionSink {
         outcome: std::result::Result<bool, &'static str>,
+        cancelled: bool,
+        failures: AtomicUsize,
     }
 
     impl EventSink for ProjectionSink {
+        fn phase_four_cancelled(&self) -> bool {
+            self.cancelled
+        }
+
+        fn record_phase_four_failure(&self, disable: bool) -> anyhow::Result<()> {
+            assert!(!disable);
+            self.failures.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn persist_context_projection(
             &self,
             _source: &[Message],
@@ -1747,18 +1773,30 @@ mod tests {
             }),
         };
         let projected = projection.projected(&original).unwrap();
-        for (outcome, expected_error) in [
-            (Ok(true), None),
-            (Ok(false), Some("not persisted")),
-            (Err("checkpoint failed"), Some("checkpoint failed")),
+        for (outcome, cancelled, expected_error, expected_failures) in [
+            (Ok(true), false, None, 0),
+            (Ok(false), false, Some("not persisted"), 1),
+            (
+                Err("checkpoint failed"),
+                false,
+                Some("checkpoint failed"),
+                1,
+            ),
+            (Ok(false), true, Some("not persisted"), 0),
         ] {
             let mut messages = original.clone();
+            let sink = ProjectionSink {
+                outcome,
+                cancelled,
+                failures: AtomicUsize::new(0),
+            };
             let result = ModelClient::persist_prepared_projection(
                 &mut messages,
                 &projection,
                 projected.clone(),
-                &ProjectionSink { outcome },
+                &sink,
             );
+            assert_eq!(sink.failures.load(Ordering::SeqCst), expected_failures);
             match expected_error {
                 Some(expected) => {
                     assert!(result.unwrap_err().to_string().contains(expected));
