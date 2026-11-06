@@ -25,10 +25,15 @@ pub trait EventSink: Send + Sync {
         None
     }
 
-    /// Durably snapshot the recoverable turn before provider work or after a
-    /// completed local tool result.
+    /// Durably snapshot the exact recoverable turn before provider work.
     fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
         Ok(false)
+    }
+
+    /// Accept a completed-tool snapshot for ordered background persistence.
+    /// A later strict barrier or terminal drain surfaces asynchronous failures.
+    fn publish_recovery_checkpoint(&self, messages: Vec<Message>) -> anyhow::Result<bool> {
+        self.persist_recovery_checkpoint(&messages)
     }
 
     /// Durably enter one Phase 4 recovery round before planning or provider work.

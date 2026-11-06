@@ -18,6 +18,7 @@ use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
 use crate::phase4_breaker::{PhaseFourBreaker, PhaseFourBreakerState};
+use crate::recovery_writer::{RecoveryCheckpointHandle, RecoveryCheckpointWriter};
 use crate::session::{Record, RecordBuffer, Session, SessionRunLease, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
@@ -156,6 +157,7 @@ pub struct App {
     events_tx: mpsc::UnboundedSender<UiEvent>,
     cancel_handle: Option<tokio::task::JoinHandle<()>>,
     persistence_gate: Option<Arc<AtomicBool>>,
+    recovery_writer: Option<RecoveryCheckpointWriter>,
     pub approver: Arc<dyn Approver>,
     pub asker: Arc<dyn Asker>,
     pub tools: Arc<ToolRegistry>,
@@ -226,6 +228,7 @@ impl App {
             events_tx,
             cancel_handle: None,
             persistence_gate: None,
+            recovery_writer: None,
             approver,
             asker,
             tools: Arc::new(ToolRegistry::builtin()),
@@ -398,6 +401,7 @@ impl App {
                 ));
             }
             UiEvent::TurnFinished(result, messages, force_compression) => {
+                let mut recovery_writer = self.recovery_writer.take();
                 self.persistence_gate = None;
                 self.messages = messages;
                 self.running = false;
@@ -437,7 +441,18 @@ impl App {
                                 ))),
                             }
                         }
-                        if !self.unsaved_messages {
+                        if let Some(writer) = recovery_writer.as_mut() {
+                            let finish = if self.unsaved_messages {
+                                writer.preserve()
+                            } else {
+                                writer.clear()
+                            };
+                            if let Err(error) = finish {
+                                self.view.push(ViewItem::Error(format!(
+                                    "failed to finish recovery checkpoint writer: {error:#}"
+                                )));
+                            }
+                        } else if !self.unsaved_messages {
                             if let Err(error) = self.session.clear_recovery_checkpoint() {
                                 self.view.push(ViewItem::Error(format!(
                                     "failed to clear recovery checkpoint: {error:#}"
@@ -453,7 +468,16 @@ impl App {
                             )));
                         }
                     }
-                    Err(error) => self.view.push(ViewItem::Error(error)),
+                    Err(error) => {
+                        if let Some(writer) = recovery_writer.as_mut() {
+                            if let Err(persist_error) = writer.preserve() {
+                                self.view.push(ViewItem::Error(format!(
+                                    "failed to preserve recovery checkpoint: {persist_error:#}"
+                                )));
+                            }
+                        }
+                        self.view.push(ViewItem::Error(error));
+                    }
                 }
             }
             UiEvent::CompactionFinished { result, duration } => {
@@ -814,6 +838,34 @@ impl App {
             return;
         }
         let message_text = self.expand_mentions(&raw);
+        let mut recovery_writer = if self.unsaved_messages {
+            None
+        } else {
+            let next_turn = match self.session.load_phase_four_breaker() {
+                Ok((turn, _)) => turn.saturating_add(1),
+                Err(error) => {
+                    self.history.pop();
+                    self.input = submitted;
+                    self.cursor = self.char_len();
+                    self.view.push(ViewItem::Error(format!(
+                        "failed to prepare recovery checkpoint writer: {error:#}"
+                    )));
+                    return;
+                }
+            };
+            match RecoveryCheckpointWriter::new(self.session.clone(), next_turn) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    self.history.pop();
+                    self.input = submitted;
+                    self.cursor = self.char_len();
+                    self.view.push(ViewItem::Error(format!(
+                        "failed to start recovery checkpoint writer: {error:#}"
+                    )));
+                    return;
+                }
+            }
+        };
         let user = Message::user(message_text.clone());
         self.messages.push(user);
         let phase_four = match self
@@ -822,6 +874,7 @@ impl App {
         {
             Ok(restored) => restored,
             Err(error) => {
+                recovery_writer = None;
                 self.unsaved_messages = true;
                 self.view.push(ViewItem::Error(format!(
                     "failed to save session: {error:#}"
@@ -835,13 +888,14 @@ impl App {
             reasoning: String::new(),
             streaming: true,
         });
-        self.start_agent(phase_four, self.approver.clone());
+        self.start_agent(phase_four, self.approver.clone(), recovery_writer);
     }
 
     fn start_agent(
         &mut self,
         phase_four: (u64, PhaseFourBreakerState),
         approver: Arc<dyn Approver>,
+        recovery_writer: Option<RecoveryCheckpointWriter>,
     ) {
         self.running = true;
         self.turn_id = self.turn_id.wrapping_add(1);
@@ -858,9 +912,13 @@ impl App {
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
         let (phase_four_turn, phase_four_state) = phase_four;
-        let recovery_enabled = !self.unsaved_messages;
+        let recovery_enabled = recovery_writer.is_some();
         let persistence_gate = Arc::new(AtomicBool::new(recovery_enabled));
+        let recovery_handle = recovery_writer
+            .as_ref()
+            .map(RecoveryCheckpointWriter::handle);
         self.persistence_gate = Some(persistence_gate.clone());
+        self.recovery_writer = recovery_writer;
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
             turn_id,
@@ -868,6 +926,7 @@ impl App {
             recorder: self.recorder.clone(),
             persistence_gate,
             recovery_enabled,
+            recovery_writer: recovery_handle,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn,
@@ -914,11 +973,28 @@ impl App {
         if !self.running {
             return;
         }
+        let preserve = self
+            .recovery_writer
+            .as_ref()
+            .map(RecoveryCheckpointWriter::begin_preserve)
+            .transpose();
         if let Some(gate) = self.persistence_gate.take() {
             gate.store(false, Ordering::SeqCst);
         }
         if let Some(handle) = self.cancel_handle.take() {
             handle.abort();
+        }
+        if let Some(mut writer) = self.recovery_writer.take() {
+            let result = match preserve {
+                Ok(Some(receiver)) => writer.wait_preserved(receiver),
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.view.push(ViewItem::Error(format!(
+                    "failed to preserve recovery checkpoint: {error:#}"
+                )));
+            }
         }
         if !self.unsaved_messages {
             self.requires_session_reload = true;
@@ -1281,6 +1357,15 @@ impl App {
                 return;
             }
         };
+        let recovery_writer = match RecoveryCheckpointWriter::new(self.session.clone(), turn) {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "cannot start recovery checkpoint writer: {error:#}"
+                )));
+                return;
+            }
+        };
 
         self.messages = messages;
         self.reset_recorder();
@@ -1293,7 +1378,7 @@ impl App {
             reasoning: String::new(),
             streaming: true,
         });
-        self.start_agent((turn, breaker), Arc::new(DenyAll));
+        self.start_agent((turn, breaker), Arc::new(DenyAll), Some(recovery_writer));
     }
 
     fn resume_session(&mut self, id: &str) {
@@ -1594,6 +1679,7 @@ struct TuiSink {
     recorder: Arc<Mutex<RecordBuffer>>,
     persistence_gate: Arc<AtomicBool>,
     recovery_enabled: bool,
+    recovery_writer: Option<RecoveryCheckpointHandle>,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
     phase_four_turn: u64,
@@ -1627,19 +1713,32 @@ impl EventSink for TuiSink {
         if !self.recovery_enabled {
             return Ok(false);
         }
-        let breaker = self.phase_four_breaker.snapshot()?;
-        let persisted = self.session.persist_recovery_checkpoint_if(
-            messages,
-            self.phase_four_turn,
-            &breaker,
-            || self.persistence_gate.load(Ordering::SeqCst),
-        )?;
-        if !persisted {
+        if !self.persistence_gate.load(Ordering::SeqCst) {
             anyhow::bail!("turn was cancelled before the recovery checkpoint");
         }
+        let breaker = self.phase_four_breaker.snapshot()?;
+        self.recovery_writer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recovery checkpoint writer is unavailable"))?
+            .barrier(messages, breaker)?;
         if !self.persistence_gate.load(Ordering::SeqCst) {
             anyhow::bail!("turn was cancelled during the recovery checkpoint");
         }
+        Ok(true)
+    }
+
+    fn publish_recovery_checkpoint(&self, messages: Vec<Message>) -> anyhow::Result<bool> {
+        if !self.recovery_enabled {
+            return Ok(false);
+        }
+        if !self.persistence_gate.load(Ordering::SeqCst) {
+            anyhow::bail!("turn was cancelled before the recovery checkpoint");
+        }
+        let breaker = self.phase_four_breaker.snapshot()?;
+        self.recovery_writer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("recovery checkpoint writer is unavailable"))?
+            .publish(messages, breaker)?;
         Ok(true)
     }
 
@@ -1924,6 +2023,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
             recovery_enabled: true,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: turn,
@@ -1967,6 +2067,7 @@ mod tests {
             recorder: recorder.clone(),
             persistence_gate: Arc::new(AtomicBool::new(true)),
             recovery_enabled: true,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2023,6 +2124,7 @@ mod tests {
             recorder: recorder.clone(),
             persistence_gate: gate.clone(),
             recovery_enabled: true,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2128,6 +2230,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
             recovery_enabled: false,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2155,6 +2258,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
             recovery_enabled: true,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2186,6 +2290,7 @@ mod tests {
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
             recovery_enabled: true,
+            recovery_writer: None,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
