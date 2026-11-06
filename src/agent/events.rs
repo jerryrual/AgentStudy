@@ -3,47 +3,12 @@
 //! The agent never draws anything itself: the TUI and `icode run` implement
 //! [`EventSink`] to render streaming text, tool calls and usage.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::model::{Message, Usage};
 
 use super::TurnResult;
-
-pub(crate) struct PhaseFourSideCallBudget {
-    limit: i64,
-    spent: AtomicU64,
-}
-
-impl PhaseFourSideCallBudget {
-    pub(crate) fn new(limit: i64) -> Self {
-        debug_assert!(limit >= -1);
-        Self {
-            limit,
-            spent: AtomicU64::new(0),
-        }
-    }
-
-    pub(crate) fn reset(&self) {
-        self.spent.store(0, Ordering::SeqCst);
-    }
-
-    pub(crate) fn charge_and_allow(&self, estimated_input: u64) -> bool {
-        let mut previous = self.spent.load(Ordering::SeqCst);
-        let charged = loop {
-            let charged = previous.saturating_add(estimated_input);
-            match self
-                .spent
-                .compare_exchange(previous, charged, Ordering::SeqCst, Ordering::SeqCst)
-            {
-                Ok(_) => break charged,
-                Err(current) => previous = current,
-            }
-        };
-        self.limit < 0 || charged < self.limit as u64
-    }
-}
 
 /// Receives incremental updates from the agent loop.
 pub trait EventSink: Send + Sync {
@@ -63,6 +28,11 @@ pub trait EventSink: Send + Sync {
     /// Charge one imminent Phase 4 provider attempt against this turn's input budget.
     fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
         true
+    }
+
+    /// Durably checkpoint one imminent Phase 4 provider attempt.
+    fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
+        Ok(self.charge_phase_four_side_call(estimated_input))
     }
 
     /// A chunk of assistant text arrived.
@@ -125,29 +95,3 @@ pub trait EventSink: Send + Sync {
 pub struct NullSink;
 
 impl EventSink for NullSink {}
-
-#[cfg(test)]
-mod tests {
-    use super::PhaseFourSideCallBudget;
-
-    #[test]
-    fn side_call_budget_charges_before_strict_admission() {
-        let budget = PhaseFourSideCallBudget::new(100);
-        assert!(budget.charge_and_allow(40));
-        assert!(!budget.charge_and_allow(60));
-        assert!(!budget.charge_and_allow(1));
-        budget.reset();
-        assert!(budget.charge_and_allow(99));
-    }
-
-    #[test]
-    fn side_call_budget_supports_disabled_and_unlimited_modes() {
-        let disabled = PhaseFourSideCallBudget::new(0);
-        assert!(!disabled.charge_and_allow(0));
-        assert!(!disabled.charge_and_allow(1));
-
-        let unlimited = PhaseFourSideCallBudget::new(-1);
-        assert!(unlimited.charge_and_allow(u64::MAX));
-        assert!(unlimited.charge_and_allow(1));
-    }
-}

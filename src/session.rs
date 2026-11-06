@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
 use crate::compaction_archive::{ArchiveStore, ArchivedContextProjection};
 use crate::model::{AssistantMessage, Message, ToolCall};
+use crate::phase4_breaker::PhaseFourBreakerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -53,6 +54,10 @@ pub enum Record {
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
+    },
+    PhaseFourBreaker {
+        turn: u64,
+        state: serde_json::Value,
     },
     Compaction {
         summary: String,
@@ -284,6 +289,35 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn load_phase_four_breaker(&self) -> Result<(u64, PhaseFourBreakerState)> {
+        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        Ok(loaded.latest_phase_four_breaker())
+    }
+
+    pub(crate) fn append_phase_four_breaker_if<F>(
+        &self,
+        turn: u64,
+        state: &PhaseFourBreakerState,
+        should_append: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        if loaded.user_turn_count() != turn || !should_append() {
+            return Ok(false);
+        }
+        self.append_unlocked(&Record::PhaseFourBreaker {
+            turn,
+            state: serde_json::to_value(state)?,
+        })?;
+        Ok(true)
+    }
+
     pub fn id(&self) -> &str {
         &self.meta.id
     }
@@ -296,6 +330,24 @@ pub struct LoadedSession {
 }
 
 impl LoadedSession {
+    fn user_turn_count(&self) -> u64 {
+        self.records
+            .iter()
+            .filter(|record| matches!(record, Record::User { .. }))
+            .count() as u64
+    }
+
+    pub(crate) fn latest_phase_four_breaker(&self) -> (u64, PhaseFourBreakerState) {
+        let current_turn = self.user_turn_count();
+        let state = self.records.iter().rev().find_map(|record| match record {
+            Record::PhaseFourBreaker { turn, state } if *turn == current_turn => {
+                PhaseFourBreakerState::from_value(state)
+            }
+            _ => None,
+        });
+        (current_turn, state.unwrap_or_default())
+    }
+
     /// Rebuild the model conversation (system prompt excluded).
     ///
     /// A cancelled turn can leave an assistant `tool_calls` record without all
@@ -377,7 +429,7 @@ impl LoadedSession {
                         pending = candidate_pending;
                     }
                 }
-                Record::Meta { .. } | Record::Usage { .. } => {}
+                Record::Meta { .. } | Record::Usage { .. } | Record::PhaseFourBreaker { .. } => {}
             }
         }
         flush(&mut messages, &mut pending);
@@ -1529,6 +1581,59 @@ mod tests {
             .records
             .iter()
             .all(|record| !matches!(record, Record::ContextProjection { .. })));
+    }
+
+    #[test]
+    fn phase_four_breaker_replays_only_the_latest_user_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append(&Record::User {
+                text: "first".into(),
+            })
+            .unwrap();
+        let (first_turn, mut state) = session.load_phase_four_breaker().unwrap();
+        assert_eq!(first_turn, 1);
+        state.side_call_tokens = 40;
+        assert!(session
+            .append_phase_four_breaker_if(first_turn, &state, || true)
+            .unwrap());
+        assert_eq!(
+            session.load_phase_four_breaker().unwrap(),
+            (1, state.clone())
+        );
+
+        session
+            .append(&Record::User {
+                text: "second".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            session.load_phase_four_breaker().unwrap(),
+            (2, PhaseFourBreakerState::default())
+        );
+        assert!(!session
+            .append_phase_four_breaker_if(first_turn, &state, || true)
+            .unwrap());
+
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: first_turn,
+                state: serde_json::to_value(&state).unwrap(),
+            })
+            .unwrap();
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: 2,
+                state: serde_json::json!({"version": 99}),
+            })
+            .unwrap();
+        assert_eq!(
+            session.load_phase_four_breaker().unwrap(),
+            (2, PhaseFourBreakerState::default())
+        );
+        assert_eq!(store.load(session.id()).unwrap().messages().len(), 2);
     }
 
     #[test]

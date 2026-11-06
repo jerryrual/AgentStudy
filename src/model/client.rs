@@ -453,7 +453,10 @@ impl ModelClient {
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if let Some((budget_sink, estimate)) = side_call_budget {
-                if !budget_sink.charge_phase_four_side_call(estimate) {
+                let admitted = budget_sink
+                    .checkpoint_phase_four_side_call(estimate)
+                    .map_err(ClientError::Fatal)?;
+                if !admitted {
                     return Err(ClientError::Fatal(anyhow!(
                         "Phase 4 side-call input-token budget exhausted for this turn"
                     )));
