@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Name of the built-in profile created on first run.
 pub const DEFAULT_PROFILE: &str = "deepseek";
@@ -197,6 +197,13 @@ pub struct Settings {
     /// Default agent (`code` or `qa`).
     #[serde(default = "default_agent")]
     pub agent: String,
+    /// Maximum aggregate estimated Phase 4 side-call input tokens per turn.
+    /// `-1` is unlimited and `0` disables Phase 4 side calls.
+    #[serde(
+        default = "default_phase4_side_call_token_budget",
+        deserialize_with = "deserialize_phase4_side_call_token_budget"
+    )]
+    pub phase4_side_call_token_budget: i64,
     /// Maximum number of model calls in one user turn.
     #[serde(default = "default_max_rounds")]
     pub max_tool_rounds: usize,
@@ -204,6 +211,18 @@ pub struct Settings {
 
 fn default_agent() -> String {
     "code".to_string()
+}
+
+fn default_phase4_side_call_token_budget() -> i64 {
+    -1
+}
+
+fn deserialize_phase4_side_call_token_budget<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?
+        .unwrap_or_else(default_phase4_side_call_token_budget))
 }
 
 fn default_max_rounds() -> usize {
@@ -217,6 +236,7 @@ impl Default for Settings {
             current_model: Some(DEFAULT_PROFILE.to_string()),
             approval_mode: ApprovalMode::Ask,
             agent: default_agent(),
+            phase4_side_call_token_budget: default_phase4_side_call_token_budget(),
             max_tool_rounds: default_max_rounds(),
         }
     }
@@ -272,6 +292,9 @@ impl Settings {
 
     /// Validate the document and fill in defaults for missing pieces.
     pub fn normalise(&mut self) -> Result<()> {
+        if self.phase4_side_call_token_budget < -1 {
+            bail!("phase4_side_call_token_budget must be -1 or greater");
+        }
         if self.models.is_empty() {
             self.models.push(ModelProfile::builtin_deepseek());
         }
@@ -541,6 +564,36 @@ mod tests {
         assert_eq!(settings.approval_mode, ApprovalMode::Ask);
         assert_eq!(settings.agent, "code");
         assert_eq!(settings.models[0].context_window, Some(128_000));
+    }
+
+    #[test]
+    fn phase_four_side_call_budget_defaults_and_validates() {
+        assert_eq!(Settings::default().phase4_side_call_token_budget, -1);
+
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.phase4_side_call_token_budget, -1);
+        let null_budget: Settings =
+            serde_json::from_str(r#"{"phase4_side_call_token_budget":null}"#).unwrap();
+        assert_eq!(null_budget.phase4_side_call_token_budget, -1);
+        assert!(
+            serde_json::from_str::<Settings>(r#"{"phase4_side_call_token_budget":true}"#).is_err()
+        );
+
+        let mut disabled = Settings {
+            phase4_side_call_token_budget: 0,
+            ..Default::default()
+        };
+        disabled.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(disabled).unwrap()["phase4_side_call_token_budget"],
+            0
+        );
+
+        let mut invalid = Settings {
+            phase4_side_call_token_budget: -2,
+            ..Default::default()
+        };
+        assert!(invalid.normalise().is_err());
     }
 
     #[test]

@@ -440,8 +440,25 @@ impl ModelClient {
         body: &Value,
         sink: &dyn EventSink,
     ) -> std::result::Result<Completion, ClientError> {
+        self.complete_body_with_side_call_budget(body, sink, None)
+            .await
+    }
+
+    async fn complete_body_with_side_call_budget(
+        &self,
+        body: &Value,
+        sink: &dyn EventSink,
+        side_call_budget: Option<(&dyn EventSink, u64)>,
+    ) -> std::result::Result<Completion, ClientError> {
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
+            if let Some((budget_sink, estimate)) = side_call_budget {
+                if !budget_sink.charge_phase_four_side_call(estimate) {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "Phase 4 side-call input-token budget exhausted for this turn"
+                    )));
+                }
+            }
             match self.send_once(body, sink).await {
                 Ok(completion) => return Ok(completion),
                 Err(error @ ClientError::ContextOverflow { .. }) => return Err(error),
@@ -668,11 +685,16 @@ impl ModelClient {
         )));
         let mut usage = Usage::default();
         for attempt in 0..LAST_WORDS_GENERATION_ATTEMPTS {
+            let estimated_input = u64::from(self.estimated_request_tokens(&request, &[]));
             let body = self
                 .last_words_request_body(&request)
                 .map_err(|error| PhaseFourPrepareError::skipped(error, usage))?;
             let completion = self
-                .complete_body(&body, &crate::agent::NullSink)
+                .complete_body_with_side_call_budget(
+                    &body,
+                    &crate::agent::NullSink,
+                    Some((usage_sink, estimated_input)),
+                )
                 .await
                 .map_err(|error| PhaseFourPrepareError::skipped(error.into_error(), usage))?;
             usage.add(completion.usage);
