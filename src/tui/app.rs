@@ -17,7 +17,7 @@ use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveMan
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
-use crate::phase4_breaker::PhaseFourBreaker;
+use crate::phase4_breaker::{PhaseFourBreaker, PhaseFourBreakerState};
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
@@ -802,24 +802,31 @@ impl App {
             return;
         }
         let message_text = self.expand_mentions(&raw);
-        let user = Message::user(message_text);
-        self.messages.push(user.clone());
-        if let Err(error) = self.session.append_message(&user) {
-            self.unsaved_messages = true;
-            self.view.push(ViewItem::Error(format!(
-                "failed to save session: {error:#}"
-            )));
-        }
+        let user = Message::user(message_text.clone());
+        self.messages.push(user);
+        let phase_four = match self
+            .session
+            .append_user_and_load_phase_four_breaker(&message_text)
+        {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.unsaved_messages = true;
+                self.view.push(ViewItem::Error(format!(
+                    "failed to save session: {error:#}"
+                )));
+                (0, Default::default())
+            }
+        };
         self.view.push(ViewItem::User(raw));
         self.view.push(ViewItem::Assistant {
             text: String::new(),
             reasoning: String::new(),
             streaming: true,
         });
-        self.start_agent();
+        self.start_agent(phase_four);
     }
 
-    fn start_agent(&mut self) {
+    fn start_agent(&mut self, phase_four: (u64, PhaseFourBreakerState)) {
         self.running = true;
         self.turn_id = self.turn_id.wrapping_add(1);
         let turn_id = self.turn_id;
@@ -835,16 +842,7 @@ impl App {
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
-        let (phase_four_turn, phase_four_state) = match self.session.load_phase_four_breaker() {
-            Ok(restored) => restored,
-            Err(error) => {
-                self.unsaved_messages = true;
-                self.view.push(ViewItem::Error(format!(
-                    "failed to load Phase 4 breaker state: {error:#}"
-                )));
-                (0, Default::default())
-            }
-        };
+        let (phase_four_turn, phase_four_state) = phase_four;
         let persistence_gate = Arc::new(AtomicBool::new(!self.unsaved_messages));
         self.persistence_gate = Some(persistence_gate.clone());
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
@@ -1531,11 +1529,13 @@ impl EventSink for TuiSink {
 
     fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
         self.phase_four_breaker
-            .charge_and_persist(estimated_input, |state| {
-                self.session
-                    .append_phase_four_breaker_if(self.phase_four_turn, state, || {
-                        self.persistence_gate.load(Ordering::SeqCst)
-                    })
+            .charge_and_persist(estimated_input, |previous, proposed| {
+                self.session.append_phase_four_breaker_if(
+                    self.phase_four_turn,
+                    previous,
+                    proposed,
+                    || self.persistence_gate.load(Ordering::SeqCst),
+                )
             })
     }
 

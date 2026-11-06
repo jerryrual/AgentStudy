@@ -10,10 +10,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
-use crate::compaction_archive::{ArchiveStore, ArchivedContextProjection};
+use crate::compaction_archive::{
+    ensure_private_directory, open_append_private_nofollow, open_read_nofollow, ArchiveStore,
+    ArchivedContextProjection,
+};
 use crate::model::{AssistantMessage, Message, ToolCall};
 use crate::phase4_breaker::PhaseFourBreakerState;
 
@@ -55,10 +59,6 @@ pub enum Record {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
-    PhaseFourBreaker {
-        turn: u64,
-        state: serde_json::Value,
-    },
     Compaction {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +69,11 @@ pub enum Record {
     },
     ContextProjection {
         projection: ContextProjection,
+    },
+    /// Legacy PR #25 checkpoint; new writes use the breaker sidecar.
+    PhaseFourBreaker {
+        turn: u64,
+        state: serde_json::Value,
     },
 }
 
@@ -98,6 +103,12 @@ impl Record {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhaseFourBreakerCheckpoint {
+    turn: u64,
+    state: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub meta: SessionMeta,
@@ -116,12 +127,26 @@ impl Session {
         ArchiveStore::with_root(&self.archive_root).catalog_pointer_text()
     }
 
+    fn lock_exclusive(&self) -> Result<std::fs::File> {
+        let lock_path = self.path.with_extension("lock");
+        let lock_file = open_append_private_nofollow(&lock_path)
+            .with_context(|| format!("failed to open session lock {}", lock_path.display()))?;
+        FileExt::lock_exclusive(&lock_file)
+            .with_context(|| format!("failed to lock session {}", self.meta.id))?;
+        Ok(lock_file)
+    }
+
+    pub(crate) fn phase_four_breaker_path(&self) -> PathBuf {
+        self.archive_root.join("phase4-breaker.jsonl")
+    }
+
     /// Append one record, flushing immediately.
     pub fn append(&self, record: &Record) -> Result<()> {
         let _guard = self
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
         self.append_unlocked(record)
     }
 
@@ -175,6 +200,7 @@ impl Session {
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
         if !should_append() {
             return Ok(false);
         }
@@ -210,6 +236,7 @@ impl Session {
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
         if !should_append() {
             return Ok(false);
         }
@@ -236,6 +263,7 @@ impl Session {
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
         if !should_append() {
             return Ok(None);
         }
@@ -278,6 +306,7 @@ impl Session {
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
         Ok(load_session_file(&self.path, self.id())?.messages())
     }
 
@@ -289,17 +318,91 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn append_user_and_load_phase_four_breaker(
+        &self,
+        text: &str,
+    ) -> Result<(u64, PhaseFourBreakerState)> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        self.append_unlocked(&Record::User {
+            text: text.to_string(),
+        })?;
+        let turn = load_session_file(&self.path, &self.meta.id)?.user_turn_count();
+        Ok((turn, PhaseFourBreakerState::default()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn load_phase_four_breaker(&self) -> Result<(u64, PhaseFourBreakerState)> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        self.load_phase_four_breaker_unlocked()
+    }
+
+    fn load_phase_four_breaker_unlocked(&self) -> Result<(u64, PhaseFourBreakerState)> {
         let loaded = load_session_file(&self.path, &self.meta.id)?;
-        Ok(loaded.latest_phase_four_breaker())
+        let turn = loaded.user_turn_count();
+        let legacy_state = loaded.records.iter().rev().find_map(|record| match record {
+            Record::PhaseFourBreaker {
+                turn: checkpoint_turn,
+                state,
+            } if *checkpoint_turn == turn => PhaseFourBreakerState::from_value(state),
+            _ => None,
+        });
+        ensure_private_directory(&self.archive_root).with_context(|| {
+            format!(
+                "failed to prepare session archive {}",
+                self.archive_root.display()
+            )
+        })?;
+        let path = self.phase_four_breaker_path();
+        let file = match open_read_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((turn, legacy_state.unwrap_or_default()));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open breaker state {}", path.display()));
+            }
+        };
+        let mut checkpoints = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line =
+                line.with_context(|| format!("failed to read breaker state {}", path.display()))?;
+            match serde_json::from_str::<PhaseFourBreakerCheckpoint>(&line) {
+                Ok(checkpoint) => checkpoints.push(checkpoint),
+                Err(_) => {
+                    serde_json::from_str::<serde_json::Value>(&line).with_context(|| {
+                        format!("invalid breaker state JSON {}", path.display())
+                    })?;
+                }
+            }
+        }
+        let state = checkpoints
+            .into_iter()
+            .rev()
+            .find_map(|checkpoint| {
+                (checkpoint.turn == turn)
+                    .then(|| PhaseFourBreakerState::from_value(&checkpoint.state))
+                    .flatten()
+            })
+            .unwrap_or_else(|| legacy_state.unwrap_or_default());
+        Ok((turn, state))
     }
 
     pub(crate) fn append_phase_four_breaker_if<F>(
         &self,
         turn: u64,
-        state: &PhaseFourBreakerState,
+        previous: &PhaseFourBreakerState,
+        proposed: &PhaseFourBreakerState,
         should_append: F,
-    ) -> Result<bool>
+    ) -> Result<Option<PhaseFourBreakerState>>
     where
         F: FnOnce() -> bool,
     {
@@ -307,15 +410,63 @@ impl Session {
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
-        let loaded = load_session_file(&self.path, &self.meta.id)?;
-        if loaded.user_turn_count() != turn || !should_append() {
-            return Ok(false);
+        let _file_guard = self.lock_exclusive()?;
+        let (persisted_turn, mut committed) = self.load_phase_four_breaker_unlocked()?;
+        if persisted_turn != turn || !should_append() {
+            return Ok(None);
         }
-        self.append_unlocked(&Record::PhaseFourBreaker {
+        let delta = proposed
+            .side_call_tokens
+            .checked_sub(previous.side_call_tokens)
+            .context("Phase 4 breaker spend cannot decrease")?;
+        let mut expected = previous.clone();
+        expected.side_call_tokens = proposed.side_call_tokens;
+        if expected != *proposed {
+            bail!("side-call checkpoint cannot change another breaker field");
+        }
+        committed.side_call_tokens = committed
+            .side_call_tokens
+            .saturating_add(delta)
+            .min(i64::MAX as u64);
+        self.append_phase_four_breaker_unlocked(turn, &committed)?;
+        Ok(Some(committed))
+    }
+
+    fn append_phase_four_breaker_unlocked(
+        &self,
+        turn: u64,
+        state: &PhaseFourBreakerState,
+    ) -> Result<()> {
+        ensure_private_directory(&self.archive_root).with_context(|| {
+            format!(
+                "failed to create session archive {}",
+                self.archive_root.display()
+            )
+        })?;
+        let path = self.phase_four_breaker_path();
+        let mut file = open_append_private_nofollow(&path)
+            .with_context(|| format!("failed to open breaker state {}", path.display()))?;
+        let previous_len = file.metadata()?.len();
+        let checkpoint = PhaseFourBreakerCheckpoint {
             turn,
             state: serde_json::to_value(state)?,
-        })?;
-        Ok(true)
+        };
+        let mut bytes = serde_json::to_vec(&checkpoint)?;
+        bytes.push(b'\n');
+        if let Err(error) = file.write_all(&bytes) {
+            let write_error = anyhow::Error::new(error)
+                .context(format!("failed to write breaker state {}", path.display()));
+            if let Err(rollback_error) =
+                open_append_private_nofollow(&path).and_then(|handle| handle.set_len(previous_len))
+            {
+                return Err(write_error.context(format!(
+                    "also failed to roll back breaker state {}: {rollback_error}",
+                    path.display()
+                )));
+            }
+            return Err(write_error);
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -335,17 +486,6 @@ impl LoadedSession {
             .iter()
             .filter(|record| matches!(record, Record::User { .. }))
             .count() as u64
-    }
-
-    pub(crate) fn latest_phase_four_breaker(&self) -> (u64, PhaseFourBreakerState) {
-        let current_turn = self.user_turn_count();
-        let state = self.records.iter().rev().find_map(|record| match record {
-            Record::PhaseFourBreaker { turn, state } if *turn == current_turn => {
-                PhaseFourBreakerState::from_value(state)
-            }
-            _ => None,
-        });
-        (current_turn, state.unwrap_or_default())
     }
 
     /// Rebuild the model conversation (system prompt excluded).
@@ -609,15 +749,18 @@ impl SessionStore {
     pub fn reopen(&self, id: &str) -> Result<Session> {
         let loaded = self.load(id)?;
         let archive_root = self.archive_root(id)?;
-        ArchiveStore::with_root(&archive_root)
-            .reconcile()
-            .with_context(|| format!("failed to reconcile archive for session {id}"))?;
-        Ok(Session {
+        let session = Session {
             meta: loaded.meta,
             path: self.path(id),
             archive_root,
             append_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        let _file_guard = session.lock_exclusive()?;
+        ArchiveStore::with_root(&session.archive_root)
+            .reconcile()
+            .with_context(|| format!("failed to reconcile archive for session {id}"))?;
+        drop(_file_guard);
+        Ok(session)
     }
 
     /// Load a session by id.
@@ -1593,16 +1736,37 @@ mod tests {
                 text: "first".into(),
             })
             .unwrap();
-        let (first_turn, mut state) = session.load_phase_four_breaker().unwrap();
+        let (first_turn, previous) = session.load_phase_four_breaker().unwrap();
         assert_eq!(first_turn, 1);
-        state.side_call_tokens = 40;
-        assert!(session
-            .append_phase_four_breaker_if(first_turn, &state, || true)
-            .unwrap());
+        let mut proposed = previous.clone();
+        proposed.side_call_tokens = 40;
+        assert_eq!(
+            session
+                .append_phase_four_breaker_if(first_turn, &previous, &proposed, || true)
+                .unwrap(),
+            Some(proposed.clone())
+        );
         assert_eq!(
             session.load_phase_four_breaker().unwrap(),
-            (1, state.clone())
+            (1, proposed.clone())
         );
+        assert_eq!(
+            store
+                .reopen(session.id())
+                .unwrap()
+                .load_phase_four_breaker()
+                .unwrap(),
+            (1, proposed.clone())
+        );
+        let transcript = std::fs::read_to_string(store.path(session.id())).unwrap();
+        assert!(!transcript.contains("phase_four_breaker"));
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: first_turn,
+                state: serde_json::to_value(&proposed).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(store.load(session.id()).unwrap().messages().len(), 1);
 
         session
             .append(&Record::User {
@@ -1613,27 +1777,118 @@ mod tests {
             session.load_phase_four_breaker().unwrap(),
             (2, PhaseFourBreakerState::default())
         );
-        assert!(!session
-            .append_phase_four_breaker_if(first_turn, &state, || true)
-            .unwrap());
+        assert_eq!(
+            session
+                .append_phase_four_breaker_if(first_turn, &previous, &proposed, || true)
+                .unwrap(),
+            None
+        );
 
-        session
-            .append(&Record::PhaseFourBreaker {
-                turn: first_turn,
-                state: serde_json::to_value(&state).unwrap(),
-            })
+        let malformed = PhaseFourBreakerCheckpoint {
+            turn: 2,
+            state: serde_json::json!({"version": 99}),
+        };
+        let mut sidecar = std::fs::OpenOptions::new()
+            .append(true)
+            .open(session.phase_four_breaker_path())
             .unwrap();
-        session
-            .append(&Record::PhaseFourBreaker {
-                turn: 2,
-                state: serde_json::json!({"version": 99}),
-            })
-            .unwrap();
+        serde_json::to_writer(&mut sidecar, &malformed).unwrap();
+        sidecar.write_all(b"\n").unwrap();
         assert_eq!(
             session.load_phase_four_breaker().unwrap(),
             (2, PhaseFourBreakerState::default())
         );
         assert_eq!(store.load(session.id()).unwrap().messages().len(), 2);
+    }
+
+    #[test]
+    fn phase_four_breaker_migrates_legacy_transcript_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let mut legacy = PhaseFourBreakerState::default();
+        legacy.side_call_tokens = 40;
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: 1,
+                state: serde_json::to_value(&legacy).unwrap(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            session.load_phase_four_breaker().unwrap(),
+            (1, legacy.clone())
+        );
+        let mut proposed = legacy.clone();
+        proposed.side_call_tokens = 50;
+        assert_eq!(
+            session
+                .append_phase_four_breaker_if(1, &legacy, &proposed, || true)
+                .unwrap(),
+            Some(proposed.clone())
+        );
+        assert_eq!(session.load_phase_four_breaker().unwrap(), (1, proposed));
+    }
+
+    #[test]
+    fn phase_four_breaker_rejects_corrupt_sidecar_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let previous = PhaseFourBreakerState::default();
+        let mut proposed = previous.clone();
+        proposed.side_call_tokens = 40;
+        session
+            .append_phase_four_breaker_if(1, &previous, &proposed, || true)
+            .unwrap();
+        let mut sidecar = open_append_private_nofollow(&session.phase_four_breaker_path()).unwrap();
+        sidecar.write_all(b"{broken\n").unwrap();
+
+        assert!(session.load_phase_four_breaker().is_err());
+        assert!(session
+            .append_phase_four_breaker_if(1, &proposed, &proposed, || true)
+            .is_err());
+    }
+
+    #[test]
+    fn phase_four_breaker_merges_spend_from_reopened_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let first = store.reopen(session.id()).unwrap();
+        let second = store.reopen(session.id()).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let charge = |session: Session, barrier: Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let previous = PhaseFourBreakerState::default();
+                let mut proposed = previous.clone();
+                proposed.side_call_tokens = 40;
+                barrier.wait();
+                session
+                    .append_phase_four_breaker_if(1, &previous, &proposed, || true)
+                    .unwrap()
+                    .unwrap()
+                    .side_call_tokens
+            })
+        };
+        let first_handle = charge(first, barrier.clone());
+        let second_handle = charge(second, barrier.clone());
+        barrier.wait();
+        let mut totals = vec![first_handle.join().unwrap(), second_handle.join().unwrap()];
+        totals.sort_unstable();
+
+        assert_eq!(totals, vec![40, 80]);
+        assert_eq!(
+            session
+                .load_phase_four_breaker()
+                .unwrap()
+                .1
+                .side_call_tokens,
+            80
+        );
     }
 
     #[test]

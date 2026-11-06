@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,7 +61,10 @@ impl PhaseFourBreaker {
 
     pub(crate) fn charge_and_persist<F>(&self, estimated_input: u64, persist: F) -> Result<bool>
     where
-        F: FnOnce(&PhaseFourBreakerState) -> Result<bool>,
+        F: FnOnce(
+            &PhaseFourBreakerState,
+            &PhaseFourBreakerState,
+        ) -> Result<Option<PhaseFourBreakerState>>,
     {
         let mut current = self
             .state
@@ -72,11 +75,10 @@ impl PhaseFourBreaker {
             .side_call_tokens
             .saturating_add(estimated_input)
             .min(STATE_INTEGER_MAX);
-        if !persist(&charged)? {
-            bail!("Phase 4 breaker checkpoint was declined");
-        }
-        let admitted = self.limit < 0 || charged.side_call_tokens < self.limit as u64;
-        *current = charged;
+        let committed = persist(&current, &charged)?
+            .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
+        let admitted = self.limit < 0 || committed.side_call_tokens < self.limit as u64;
+        *current = committed;
         Ok(admitted)
     }
 
@@ -96,17 +98,21 @@ mod tests {
     #[test]
     fn charge_is_checkpointed_before_strict_admission() {
         let breaker = PhaseFourBreaker::new(100, PhaseFourBreakerState::default());
-        assert!(breaker.charge_and_persist(40, |_| Ok(true)).unwrap());
-        assert!(!breaker.charge_and_persist(60, |_| Ok(true)).unwrap());
+        assert!(breaker
+            .charge_and_persist(40, |_, next| Ok(Some(next.clone())))
+            .unwrap());
+        assert!(!breaker
+            .charge_and_persist(60, |_, next| Ok(Some(next.clone())))
+            .unwrap());
         assert_eq!(breaker.state().side_call_tokens, 100);
     }
 
     #[test]
     fn declined_or_failed_checkpoint_does_not_mutate_memory() {
         let breaker = PhaseFourBreaker::new(-1, PhaseFourBreakerState::default());
-        assert!(breaker.charge_and_persist(10, |_| Ok(false)).is_err());
+        assert!(breaker.charge_and_persist(10, |_, _| Ok(None)).is_err());
         assert!(breaker
-            .charge_and_persist(10, |_| anyhow::bail!("disk full"))
+            .charge_and_persist(10, |_, _| anyhow::bail!("disk full"))
             .is_err());
         assert_eq!(breaker.state(), PhaseFourBreakerState::default());
     }

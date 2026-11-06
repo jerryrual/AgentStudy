@@ -75,6 +75,10 @@ fn run_json_returns_a_machine_readable_result() {
     let sessions: Vec<_> = std::fs::read_dir(home.path().join("sessions"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
         .collect();
     assert_eq!(sessions.len(), 1, "one session file was written");
 
