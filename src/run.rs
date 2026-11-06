@@ -29,6 +29,8 @@ pub struct RunOptions {
     pub json: bool,
     /// Continue an existing session instead of creating a new one.
     pub session: Option<String>,
+    /// Resume the latest user turn without appending a new User record.
+    pub resume_turn: bool,
     pub store: SessionStore,
 }
 
@@ -284,10 +286,10 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             })??,
     );
     let store = options.store;
-    let (session, mut messages): (Session, Vec<Message>) = match &options.session {
-        Some(id) => {
-            let loaded = store.load(id)?;
-            (store.reopen(id)?, loaded.messages())
+    let (session, loaded) = match &options.session {
+        Some(id) => (store.reopen(id)?, Some(store.load(id)?)),
+        None if options.resume_turn => {
+            anyhow::bail!("same-turn resume requires an existing session")
         }
         None => (
             store.create(
@@ -295,17 +297,22 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 &options.profile.model,
                 options.agent.as_str(),
             )?,
-            Vec::new(),
+            None,
         ),
     };
 
-    let task = options.task.trim().to_string();
-    if task.is_empty() {
-        anyhow::bail!("the task prompt must not be empty");
-    }
-    messages.push(Message::user(task.clone()));
-    let (phase_four_turn, phase_four_state) =
-        session.append_user_and_load_phase_four_breaker(&task)?;
+    let (mut messages, phase_four_turn, phase_four_state) = if options.resume_turn {
+        session.load_resumable_turn()?
+    } else {
+        let mut messages = loaded.map(|loaded| loaded.messages()).unwrap_or_default();
+        let task = options.task.trim().to_string();
+        if task.is_empty() {
+            anyhow::bail!("the task prompt must not be empty");
+        }
+        messages.push(Message::user(task.clone()));
+        let (turn, state) = session.append_user_and_load_phase_four_breaker(&task)?;
+        (messages, turn, state)
+    };
 
     let approver: std::sync::Arc<dyn Approver> = match options.approval {
         ApprovalMode::Deny => std::sync::Arc::new(DenyAll),

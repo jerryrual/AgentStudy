@@ -334,6 +334,21 @@ impl Session {
         Ok((turn, PhaseFourBreakerState::default()))
     }
 
+    pub(crate) fn load_resumable_turn(&self) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let messages = loaded.resumable_turn_messages()?;
+        let (turn, state) = self.load_phase_four_breaker_unlocked()?;
+        if turn != loaded.user_turn_count() {
+            anyhow::bail!("session changed while preparing same-turn resume");
+        }
+        Ok((messages, turn, state))
+    }
+
     #[cfg(test)]
     pub(crate) fn load_phase_four_breaker(&self) -> Result<(u64, PhaseFourBreakerState)> {
         let _guard = self
@@ -555,6 +570,50 @@ impl LoadedSession {
             .iter()
             .filter(|record| matches!(record, Record::User { .. }))
             .count() as u64
+    }
+
+    pub(crate) fn resumable_turn_messages(&self) -> Result<Vec<Message>> {
+        let Some(user) = self
+            .records
+            .iter()
+            .rposition(|record| matches!(record, Record::User { .. }))
+        else {
+            anyhow::bail!("session has no user turn to resume");
+        };
+        let mut pending = std::collections::BTreeSet::new();
+        let mut safe_checkpoint = false;
+        for record in &self.records[user + 1..] {
+            match record {
+                Record::Assistant { tool_calls, .. } if tool_calls.is_empty() => {
+                    anyhow::bail!("the latest user turn already completed");
+                }
+                Record::Assistant { tool_calls, .. } => {
+                    if !pending.is_empty() {
+                        anyhow::bail!("the latest user turn has an interrupted tool group");
+                    }
+                    pending.extend(tool_calls.iter().map(|call| call.id.clone()));
+                }
+                Record::Tool { call_id, .. } if pending.remove(call_id) => {
+                    safe_checkpoint = pending.is_empty();
+                }
+                Record::ContextProjection { projection }
+                    if projection.current_turn.is_some() && pending.is_empty() =>
+                {
+                    safe_checkpoint = true;
+                }
+                Record::User { .. } => unreachable!("latest User was selected"),
+                _ => {}
+            }
+        }
+        if !pending.is_empty() {
+            anyhow::bail!("the latest user turn has an interrupted tool group");
+        }
+        if !safe_checkpoint {
+            anyhow::bail!(
+                "the latest user turn has no complete tool or Last Words checkpoint to resume"
+            );
+        }
+        Ok(self.messages())
     }
 
     /// Rebuild the model conversation (system prompt excluded).
@@ -970,6 +1029,86 @@ mod tests {
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn resumable_turn_requires_a_complete_durable_checkpoint() {
+        let user = Record::User {
+            text: "continue work".into(),
+        };
+        assert!(loaded(vec![user.clone()])
+            .resumable_turn_messages()
+            .is_err());
+
+        let call = Record::Assistant {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            responses_items: Vec::new(),
+        };
+        assert!(loaded(vec![user.clone(), call.clone()])
+            .resumable_turn_messages()
+            .unwrap_err()
+            .to_string()
+            .contains("interrupted tool group"));
+
+        let tool = Record::Tool {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "result".into(),
+        };
+        let messages = loaded(vec![user.clone(), call.clone(), tool.clone()])
+            .resumable_turn_messages()
+            .unwrap();
+        assert!(matches!(messages.last(), Some(Message::Tool { .. })));
+
+        assert!(loaded(vec![user, call, tool, assistant_record("done")])
+            .resumable_turn_messages()
+            .unwrap_err()
+            .to_string()
+            .contains("already completed"));
+    }
+
+    #[test]
+    fn resumable_turn_restores_breaker_state_without_a_new_user() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("continue work"))
+            .unwrap();
+        session
+            .append(&Record::Assistant {
+                content: None,
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                responses_items: Vec::new(),
+            })
+            .unwrap();
+        session
+            .append(&Record::Tool {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                content: "result".into(),
+            })
+            .unwrap();
+        session
+            .enter_phase_four_round_if(1, -1, || true)
+            .unwrap()
+            .unwrap();
+
+        let (messages, turn, breaker) = session.load_resumable_turn().unwrap();
+        assert_eq!(turn, 1);
+        assert_eq!(breaker.attempts, 1);
+        assert!(matches!(messages.last(), Some(Message::Tool { .. })));
     }
 
     #[test]

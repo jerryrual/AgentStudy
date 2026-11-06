@@ -256,3 +256,131 @@ fn run_continue_uses_the_latest_session() {
     assert!(contents.contains(&"previous context"), "{contents:?}");
     assert!(contents.contains(&"follow up"), "{contents:?}");
 }
+
+#[test]
+fn resume_turn_continues_only_from_a_complete_tool_checkpoint() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("resumed"), &done_chunk("stop")])
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let id = "1a1a0000000-00002";
+    let records = [
+        json!({
+            "type": "meta",
+            "meta": {
+                "id": id,
+                "created_ms": 2,
+                "cwd": work.path(),
+                "model": "mock-model",
+                "agent": "code"
+            }
+        }),
+        json!({"type": "user", "text": "inspect the result"}),
+        json!({
+            "type": "assistant",
+            "content": null,
+            "reasoning": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"a.txt\"}"
+            }],
+            "responses_items": []
+        }),
+        json!({
+            "type": "tool",
+            "call_id": "call_1",
+            "name": "read_file",
+            "content": "durable result"
+        }),
+    ];
+    let transcript = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = sessions.join(format!("{id}.jsonl"));
+    std::fs::write(&path, format!("{transcript}\n")).unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "resume-turn",
+            "--session",
+            id,
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = &server.requests()[0];
+    let contents: Vec<&str> = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(contents.contains(&"inspect the result"), "{contents:?}");
+    assert!(contents.contains(&"durable result"), "{contents:?}");
+
+    let persisted = std::fs::read_to_string(path).unwrap();
+    assert_eq!(
+        persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record["type"] == "user")
+            .count(),
+        1,
+        "same-turn resume must not append a User"
+    );
+}
+
+#[test]
+fn resume_turn_rejects_an_ambiguous_user_only_tail() {
+    let server = MockServer::new(|_path, _body| panic!("provider must not be called"));
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let id = "1a1a0000000-00003";
+    let meta = json!({
+        "type": "meta",
+        "meta": {
+            "id": id,
+            "created_ms": 3,
+            "cwd": work.path(),
+            "model": "mock-model",
+            "agent": "code"
+        }
+    });
+    let user = json!({"type": "user", "text": "ambiguous work"});
+    std::fs::write(
+        sessions.join(format!("{id}.jsonl")),
+        format!("{meta}\n{user}\n"),
+    )
+    .unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args(["resume-turn", "--session", id])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no complete tool or Last Words checkpoint"),
+        "{stderr}"
+    );
+    assert_eq!(server.request_count(), 0);
+}
