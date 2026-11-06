@@ -144,6 +144,7 @@ pub struct App {
     pub scroll_back: u16,
     pub running: bool,
     pub continue_available: bool,
+    pub(crate) recovery_probe_failed: bool,
     turn_id: u64,
     pub turn_started: Option<Instant>,
     pub elapsed: Duration,
@@ -196,7 +197,11 @@ impl App {
                     (session, lease, Vec::new(), welcome(), false)
                 }
             };
-        let continue_available = opened_existing && inspect_continue_available(&session, &mut view);
+        let (continue_available, recovery_probe_failed) = if opened_existing {
+            inspect_continue_available(&session, &mut view)
+        } else {
+            (false, false)
+        };
         if continue_available {
             view.push(continue_available_notice());
         }
@@ -221,6 +226,7 @@ impl App {
             scroll_back: 0,
             running: false,
             continue_available,
+            recovery_probe_failed,
             turn_id: 0,
             turn_started: None,
             elapsed: Duration::default(),
@@ -799,8 +805,9 @@ impl App {
     // ----- turn lifecycle -------------------------------------------------
 
     fn refresh_continue_available(&mut self, announce: bool) {
-        let available = inspect_continue_available(&self.session, &mut self.view);
+        let (available, failed) = inspect_continue_available(&self.session, &mut self.view);
         self.continue_available = available;
+        self.recovery_probe_failed = failed;
         if announce && available {
             self.view.push(continue_available_notice());
         }
@@ -815,6 +822,7 @@ impl App {
                 self.messages = messages;
                 self.reset_recorder();
                 self.requires_session_reload = false;
+                self.refresh_continue_available(false);
                 true
             }
             Err(error) => {
@@ -853,6 +861,16 @@ impl App {
             self.history.pop();
             self.input = submitted;
             self.cursor = self.char_len();
+            return;
+        }
+        if self.recovery_probe_failed {
+            self.history.pop();
+            self.input = submitted;
+            self.cursor = self.char_len();
+            self.view.push(ViewItem::Error(
+                "Cannot start a new turn while recovery inspection is failing. Use /new or /resume instead."
+                    .to_string(),
+            ));
             return;
         }
         let message_text = self.expand_mentions(&raw);
@@ -1481,6 +1499,7 @@ impl App {
         self.unsaved_messages = false;
         self.requires_session_reload = false;
         self.continue_available = false;
+        self.recovery_probe_failed = false;
         self.view
             .push(ViewItem::Info("Started a new session.".to_string()));
     }
@@ -1592,14 +1611,14 @@ fn wrapped_cell_lines(text: &str, width: usize) -> usize {
     total.max(1)
 }
 
-fn inspect_continue_available(session: &Session, view: &mut Vec<ViewItem>) -> bool {
+fn inspect_continue_available(session: &Session, view: &mut Vec<ViewItem>) -> (bool, bool) {
     match session.resumable_turn_available() {
-        Ok(available) => available,
+        Ok(available) => (available, false),
         Err(error) => {
             view.push(ViewItem::Error(format!(
                 "cannot inspect interrupted turn: {error:#}"
             )));
-            false
+            (false, true)
         }
     }
 }

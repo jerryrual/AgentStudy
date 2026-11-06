@@ -1317,6 +1317,72 @@ mod tests {
     }
 
     #[test]
+    fn restored_tui_reports_recovery_probe_errors() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let original = test_app();
+        original
+            .session
+            .append_message(&Message::user("interrupted request"))
+            .unwrap();
+        original
+            .session
+            .persist_recovery_checkpoint(
+                &[
+                    Message::system("captured system"),
+                    Message::user("interrupted request"),
+                ],
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let transcript = original.store.path(original.session.id());
+        let sidecar = original
+            .session
+            .archive_root()
+            .join("session.recovery.json");
+        std::fs::write(&sidecar, b"{truncated").unwrap();
+        let transcript_before = std::fs::read(&transcript).unwrap();
+        let sidecar_before = std::fs::read(&sidecar).unwrap();
+        let runtime = original.runtime.clone();
+        let options = AppOptions {
+            settings: original.settings.clone(),
+            profile: original.profile.clone(),
+            agent: original.agent_kind,
+            cwd: original.cwd.clone(),
+            store: original.store.clone(),
+            resume: Some(original.session.id().to_string()),
+            theme: original.theme,
+            approval: original.approval_mode,
+        };
+        drop(original);
+
+        let mut app = App::new(runtime, options).unwrap();
+        let output = render(&mut app, 100, 24);
+        assert!(!app.continue_available);
+        assert!(app.recovery_probe_failed);
+        assert!(
+            output.contains("cannot inspect interrupted turn"),
+            "{output}"
+        );
+
+        app.input = "new work".to_string();
+        app.cursor = app.input.len();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        let blocked_output = render(&mut app, 100, 24);
+        println!("AFTER (corrupt recovery blocks new turn, 100x24):\n{blocked_output}");
+        assert!(!app.running);
+        assert_eq!(std::fs::read(&transcript).unwrap(), transcript_before);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+        assert!(app.view.iter().any(|item| matches!(
+            item,
+            ViewItem::Error(message) if message.contains("Cannot start a new turn")
+        )));
+    }
+
+    #[test]
     fn continue_turn_reuses_the_durable_user_and_breaker() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = test_app();

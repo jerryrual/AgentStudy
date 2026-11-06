@@ -152,6 +152,17 @@ pub struct Session {
     append_lock: Arc<Mutex<()>>,
 }
 
+struct ValidatedResumableTurn {
+    messages: Vec<Message>,
+    loaded: LoadedSession,
+    records: Vec<Record>,
+}
+
+enum ResumableTurnInspection {
+    Available(ValidatedResumableTurn),
+    Unavailable(anyhow::Error),
+}
+
 struct ResumableTurnPlan {
     messages: Vec<Message>,
     turn: u64,
@@ -588,7 +599,12 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
         let loaded = load_session_file(&self.path, &self.meta.id)?;
-        Ok(self.prepare_resumable_turn_unlocked(loaded).is_ok())
+        let candidate = match self.inspect_resumable_turn_unlocked(loaded)? {
+            ResumableTurnInspection::Available(candidate) => candidate,
+            ResumableTurnInspection::Unavailable(_) => return Ok(false),
+        };
+        self.load_phase_four_breaker_from(&candidate.loaded)?;
+        Ok(true)
     }
 
     /// Load the current resumable turn, atomically adopting a validated sidecar suffix if needed.
@@ -605,6 +621,23 @@ impl Session {
     }
 
     fn prepare_resumable_turn_unlocked(&self, loaded: LoadedSession) -> Result<ResumableTurnPlan> {
+        let candidate = match self.inspect_resumable_turn_unlocked(loaded)? {
+            ResumableTurnInspection::Available(candidate) => candidate,
+            ResumableTurnInspection::Unavailable(error) => return Err(error),
+        };
+        let (turn, breaker) = self.load_phase_four_breaker_from(&candidate.loaded)?;
+        Ok(ResumableTurnPlan {
+            messages: candidate.messages,
+            turn,
+            breaker,
+            records: candidate.records,
+        })
+    }
+
+    fn inspect_resumable_turn_unlocked(
+        &self,
+        loaded: LoadedSession,
+    ) -> Result<ResumableTurnInspection> {
         let transcript_bytes = open_read_nofollow(&self.path)
             .with_context(|| format!("failed to open session {}", self.path.display()))?
             .metadata()
@@ -615,24 +648,28 @@ impl Session {
                 && checkpoint.version == RECOVERY_CHECKPOINT_VERSION
                 && checkpoint.transcript_bytes == Some(transcript_bytes)
             {
-                return self.prepare_recovery_checkpoint_unlocked(loaded, checkpoint);
+                return Ok(
+                    match Self::validate_recovery_checkpoint(loaded, checkpoint) {
+                        Ok(candidate) => ResumableTurnInspection::Available(candidate),
+                        Err(error) => ResumableTurnInspection::Unavailable(error),
+                    },
+                );
             }
         }
-        let messages = loaded.resumable_turn_messages()?;
-        let (turn, breaker) = self.load_phase_four_breaker_from(&loaded)?;
-        Ok(ResumableTurnPlan {
-            messages,
-            turn,
-            breaker,
-            records: Vec::new(),
+        Ok(match loaded.resumable_turn_messages() {
+            Ok(messages) => ResumableTurnInspection::Available(ValidatedResumableTurn {
+                messages,
+                loaded,
+                records: Vec::new(),
+            }),
+            Err(error) => ResumableTurnInspection::Unavailable(error),
         })
     }
 
-    fn prepare_recovery_checkpoint_unlocked(
-        &self,
+    fn validate_recovery_checkpoint(
         mut loaded: LoadedSession,
         checkpoint: RecoveryCheckpoint,
-    ) -> Result<ResumableTurnPlan> {
+    ) -> Result<ValidatedResumableTurn> {
         let shaped_messages = shape_recovery_messages(&checkpoint.messages)?;
         let recovery_messages = canonical_recovery_messages(&shaped_messages)?;
         validate_recovery_provider_boundary(recovery_messages)?;
@@ -655,11 +692,9 @@ impl Session {
         if loaded.messages() != recovery_messages {
             bail!("recovery checkpoint suffix does not reconstruct the saved model state");
         }
-        let (turn, breaker) = self.load_phase_four_breaker_from(&loaded)?;
-        Ok(ResumableTurnPlan {
+        Ok(ValidatedResumableTurn {
             messages: shaped_messages,
-            turn,
-            breaker,
+            loaded,
             records,
         })
     }
@@ -2081,6 +2116,7 @@ mod tests {
 
         replace_private_file(&session.recovery_checkpoint_path(), b"{truncated").unwrap();
         assert!(session.load_recovery_checkpoint().is_err());
+        assert!(session.resumable_turn_available().is_err());
     }
 
     #[cfg(unix)]
@@ -3198,6 +3234,22 @@ mod tests {
         sidecar.write_all(b"{broken\n").unwrap();
 
         assert!(session.load_phase_four_breaker().is_err());
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            responses_items: Vec::new(),
+        });
+        let mut buffer = RecordBuffer::default();
+        buffer.record(&session, &assistant).unwrap();
+        buffer
+            .record(&session, &Message::tool("call_1", "read_file", "done"))
+            .unwrap();
+        assert!(session.resumable_turn_available().is_err());
         assert!(session
             .append_phase_four_breaker_if(1, &proposed, &proposed, || true)
             .is_err());
