@@ -25,6 +25,11 @@ pub trait EventSink: Send + Sync {
         None
     }
 
+    /// Durably enter one Phase 4 recovery round before planning or provider work.
+    fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
     /// Charge one imminent Phase 4 provider attempt against this turn's input budget.
     fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
         true

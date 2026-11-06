@@ -79,6 +79,22 @@ impl EventSink for RunSink {
             CurrentTurnArchiveManifest::default();
     }
 
+    fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
+        let result = self.phase_four_breaker.enter_round_and_persist(|_, limit| {
+            let recorded = self
+                .recorded
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
+            recorded
+                .session
+                .enter_phase_four_round_if(self.phase_four_turn, limit, || true)
+        });
+        if result.is_err() {
+            self.save_failed.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
         let result =
             self.phase_four_breaker

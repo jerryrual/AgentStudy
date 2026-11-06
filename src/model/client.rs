@@ -321,6 +321,15 @@ impl ModelClient {
         file_read_available: bool,
         sink: &dyn EventSink,
     ) -> std::result::Result<(PreparedRequest, Usage), PhaseFourPrepareError> {
+        let admitted = sink
+            .enter_phase_four_round()
+            .map_err(|error| PhaseFourPrepareError::skipped(error, Usage::default()))?;
+        if !admitted {
+            return Err(PhaseFourPrepareError::skipped(
+                anyhow!("Phase 4 breaker disabled for this user turn"),
+                Usage::default(),
+            ));
+        }
         let historical = prepared
             .compression
             .projected(messages)

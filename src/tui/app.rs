@@ -1527,6 +1527,15 @@ impl EventSink for TuiSink {
             CurrentTurnArchiveManifest::default();
     }
 
+    fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
+        self.phase_four_breaker.enter_round_and_persist(|_, limit| {
+            self.session
+                .enter_phase_four_round_if(self.phase_four_turn, limit, || {
+                    self.persistence_gate.load(Ordering::SeqCst)
+                })
+        })
+    }
+
     fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
         self.phase_four_breaker
             .charge_and_persist(estimated_input, |previous, proposed| {

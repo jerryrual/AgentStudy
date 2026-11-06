@@ -12,11 +12,19 @@ use icode::interaction::{AllowAll, ApprovalDecision, DenyAll, NoAsker, ScriptedA
 use icode::model::{AssistantMessage, Message, ModelClient};
 use icode::tools::ToolRegistry;
 
-struct FailedCheckpointSink(AtomicUsize);
+struct FailedCheckpointSink {
+    entries: AtomicUsize,
+    checkpoints: AtomicUsize,
+}
 
 impl EventSink for FailedCheckpointSink {
+    fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
+        self.entries.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
     fn checkpoint_phase_four_side_call(&self, _estimated_input: u64) -> anyhow::Result<bool> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.checkpoints.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("simulated checkpoint failure")
     }
 }
@@ -350,10 +358,14 @@ async fn phase_four_checkpoint_failure_prevents_side_call_provider_io() {
         Message::tool("call_large", "read_file", "result ".repeat(2_500)),
     ];
 
-    let sink = FailedCheckpointSink(AtomicUsize::new(0));
+    let sink = FailedCheckpointSink {
+        entries: AtomicUsize::new(0),
+        checkpoints: AtomicUsize::new(0),
+    };
     let turn = agent.run(&mut messages, &sink).await.unwrap();
 
-    assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.entries.load(Ordering::SeqCst), 1);
+    assert_eq!(sink.checkpoints.load(Ordering::SeqCst), 1);
     assert_eq!(turn.text, "continued raw");
     assert_eq!(side_requests.load(Ordering::SeqCst), 0);
     assert_eq!(server.request_count(), 1, "only the raw main request ran");
