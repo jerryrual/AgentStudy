@@ -11,13 +11,13 @@ use ratatui::layout::Rect;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::events::PhaseFourSideCallBudget;
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
 use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveManifest};
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
+use crate::phase4_breaker::PhaseFourBreaker;
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
@@ -835,6 +835,16 @@ impl App {
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
+        let (phase_four_turn, phase_four_state) = match self.session.load_phase_four_breaker() {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.unsaved_messages = true;
+                self.view.push(ViewItem::Error(format!(
+                    "failed to load Phase 4 breaker state: {error:#}"
+                )));
+                (0, Default::default())
+            }
+        };
         let persistence_gate = Arc::new(AtomicBool::new(!self.unsaved_messages));
         self.persistence_gate = Some(persistence_gate.clone());
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
@@ -845,8 +855,10 @@ impl App {
             persistence_gate,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(
+            phase_four_turn,
+            phase_four_breaker: PhaseFourBreaker::new(
                 phase_four_side_call_token_budget,
+                phase_four_state,
             ),
         });
         let handle = self.runtime.clone();
@@ -1436,6 +1448,7 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
             }
             crate::session::Record::Meta { .. }
             | crate::session::Record::Usage { .. }
+            | crate::session::Record::PhaseFourBreaker { .. }
             | crate::session::Record::CompressionBatch { .. }
             | crate::session::Record::ContextProjection { .. } => {}
         }
@@ -1489,7 +1502,8 @@ struct TuiSink {
     persistence_gate: Arc<AtomicBool>,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
-    phase_four_side_call_budget: PhaseFourSideCallBudget,
+    phase_four_turn: u64,
+    phase_four_breaker: PhaseFourBreaker,
 }
 
 impl TuiSink {
@@ -1503,7 +1517,6 @@ impl TuiSink {
 
 impl EventSink for TuiSink {
     fn turn_started(&self) {
-        self.phase_four_side_call_budget.reset();
         let pointer = self.session.archive_catalog_pointer().ok().flatten();
         *self
             .archive_pointer
@@ -1516,9 +1529,14 @@ impl EventSink for TuiSink {
             CurrentTurnArchiveManifest::default();
     }
 
-    fn charge_phase_four_side_call(&self, estimated_input: u64) -> bool {
-        self.phase_four_side_call_budget
-            .charge_and_allow(estimated_input)
+    fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
+        self.phase_four_breaker
+            .charge_and_persist(estimated_input, |state| {
+                self.session
+                    .append_phase_four_breaker_if(self.phase_four_turn, state, || {
+                        self.persistence_gate.load(Ordering::SeqCst)
+                    })
+            })
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -1742,6 +1760,34 @@ mod tests {
     }
 
     #[test]
+    fn tui_sink_checkpoints_side_call_spend_under_the_turn_gate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let (turn, state) = session.load_phase_four_breaker().unwrap();
+        let gate = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = TuiSink {
+            tx,
+            turn_id: 1,
+            session: session.clone(),
+            recorder: Arc::new(Mutex::new(RecordBuffer::default())),
+            persistence_gate: gate.clone(),
+            archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_turn: turn,
+            phase_four_breaker: PhaseFourBreaker::new(100, state),
+        };
+
+        assert!(sink.checkpoint_phase_four_side_call(40).unwrap());
+        gate.store(false, Ordering::SeqCst);
+        assert!(sink.checkpoint_phase_four_side_call(10).is_err());
+        let (_, restored) = session.load_phase_four_breaker().unwrap();
+        assert_eq!(restored.side_call_tokens, 40);
+    }
+
+    #[test]
     fn tui_sink_orders_compression_before_a_buffered_tool_group() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_root(directory.path());
@@ -1772,7 +1818,8 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(true)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
 
         assert!(sink
@@ -1826,7 +1873,8 @@ mod tests {
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         });
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -1929,7 +1977,8 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
 
         assert!(!sink
@@ -1951,7 +2000,8 @@ mod tests {
             persistence_gate: Arc::new(AtomicBool::new(false)),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {
@@ -1980,7 +2030,8 @@ mod tests {
             persistence_gate: gate.clone(),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         });
         let projection = ContextProjection {
             historical_folds: vec![crate::compaction::CompressionFold {

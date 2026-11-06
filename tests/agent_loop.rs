@@ -12,6 +12,14 @@ use icode::interaction::{AllowAll, ApprovalDecision, DenyAll, NoAsker, ScriptedA
 use icode::model::{AssistantMessage, Message, ModelClient};
 use icode::tools::ToolRegistry;
 
+struct FailedCheckpointSink;
+
+impl EventSink for FailedCheckpointSink {
+    fn checkpoint_phase_four_side_call(&self, _estimated_input: u64) -> anyhow::Result<bool> {
+        anyhow::bail!("simulated checkpoint failure")
+    }
+}
+
 struct SideCallQuotaSink {
     allowed_attempts: usize,
     charged_attempts: AtomicUsize,
@@ -305,6 +313,50 @@ async fn retries_transient_failures() {
     assert_eq!(turn.text, "recovered");
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(sink.events().iter().any(|event| event.contains("retrying")));
+}
+
+#[tokio::test]
+async fn phase_four_checkpoint_failure_prevents_side_call_provider_io() {
+    let side_requests = Arc::new(AtomicUsize::new(0));
+    let observed = side_requests.clone();
+    let server = MockServer::new(move |_path, body| {
+        if body["stream"] == false {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+        MockResponse::sse(&[&text_chunk("continued raw"), &done_chunk("stop")])
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(30_000);
+    profile.max_tokens = Some(3_000);
+    let agent = Agent::new(
+        Arc::new(ModelClient::from_profile(&profile).unwrap()),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        agent_options(directory.path().to_path_buf(), 6),
+    );
+    let mut messages = vec![
+        Message::user("inspect the large result and continue"),
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![icode::model::ToolCall {
+                id: "call_large".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"large.txt"}"#.into(),
+            }],
+            ..AssistantMessage::default()
+        }),
+        Message::tool("call_large", "read_file", "result ".repeat(2_500)),
+    ];
+
+    let turn = agent
+        .run(&mut messages, &FailedCheckpointSink)
+        .await
+        .unwrap();
+
+    assert_eq!(turn.text, "continued raw");
+    assert_eq!(side_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(server.request_count(), 1, "only the raw main request ran");
 }
 
 #[tokio::test]

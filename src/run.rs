@@ -8,13 +8,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::agent::events::PhaseFourSideCallBudget;
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
 use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::compaction_archive::CurrentTurnArchiveManifest;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
+use crate::phase4_breaker::PhaseFourBreaker;
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::tools::ToolRegistry;
 
@@ -39,7 +39,8 @@ struct RunSink {
     save_failed: AtomicBool,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
-    phase_four_side_call_budget: PhaseFourSideCallBudget,
+    phase_four_turn: u64,
+    phase_four_breaker: PhaseFourBreaker,
 }
 
 struct RecordedSession {
@@ -59,7 +60,6 @@ impl RunSink {
 
 impl EventSink for RunSink {
     fn turn_started(&self) {
-        self.phase_four_side_call_budget.reset();
         let pointer = self
             .recorded
             .lock()
@@ -79,9 +79,22 @@ impl EventSink for RunSink {
             CurrentTurnArchiveManifest::default();
     }
 
-    fn charge_phase_four_side_call(&self, estimated_input: u64) -> bool {
-        self.phase_four_side_call_budget
-            .charge_and_allow(estimated_input)
+    fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
+        let result = self
+            .phase_four_breaker
+            .charge_and_persist(estimated_input, |state| {
+                let recorded = self
+                    .recorded
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
+                recorded
+                    .session
+                    .append_phase_four_breaker_if(self.phase_four_turn, state, || true)
+            });
+        if result.is_err() {
+            self.save_failed.store(true, Ordering::Relaxed);
+        }
+        result
     }
 
     fn archive_pointer(&self) -> Option<String> {
@@ -235,6 +248,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
     }
     messages.push(Message::user(task.clone()));
     session.append(&Record::User { text: task.clone() })?;
+    let (phase_four_turn, phase_four_state) = session.load_phase_four_breaker()?;
 
     let approver: std::sync::Arc<dyn Approver> = match options.approval {
         ApprovalMode::Deny => std::sync::Arc::new(DenyAll),
@@ -263,8 +277,10 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         save_failed: AtomicBool::new(false),
         archive_pointer: Mutex::new(None),
         current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-        phase_four_side_call_budget: PhaseFourSideCallBudget::new(
+        phase_four_turn,
+        phase_four_breaker: PhaseFourBreaker::new(
             options.settings.phase4_side_call_token_budget,
+            phase_four_state,
         ),
     };
 
@@ -399,6 +415,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_sink_checkpoints_side_call_spend_before_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let (turn, state) = session.load_phase_four_breaker().unwrap();
+        let sink = RunSink {
+            json: true,
+            recorded: Mutex::new(RecordedSession {
+                session: session.clone(),
+                buffer: RecordBuffer::default(),
+            }),
+            wrote_text: AtomicBool::new(false),
+            save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_turn: turn,
+            phase_four_breaker: PhaseFourBreaker::new(100, state),
+        };
+
+        assert!(sink.checkpoint_phase_four_side_call(40).unwrap());
+        assert!(!sink.checkpoint_phase_four_side_call(60).unwrap());
+        let (_, restored) = session.load_phase_four_breaker().unwrap();
+        assert_eq!(restored.side_call_tokens, 100);
+        assert_eq!(
+            store
+                .load(session.id())
+                .unwrap()
+                .records
+                .iter()
+                .filter(|record| matches!(record, Record::PhaseFourBreaker { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn run_sink_tracks_unsaved_messages_for_compaction_guard() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_root(directory.path());
@@ -414,7 +467,8 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
@@ -443,7 +497,8 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
@@ -563,7 +618,8 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -618,7 +674,8 @@ mod tests {
             save_failed: AtomicBool::new(false),
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_side_call_budget: PhaseFourSideCallBudget::new(-1),
+            phase_four_turn: 0,
+            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
         };
 
         assert!(sink
