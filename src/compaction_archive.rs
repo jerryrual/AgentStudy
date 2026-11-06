@@ -915,6 +915,7 @@ fn projection_archive_records(
     let created_at = unix_timestamp();
     let mut records = Vec::new();
     let mut cursor = 0usize;
+    let mut group_start = 0usize;
     while cursor < tail.len() {
         let Message::Assistant { message } = &tail[cursor] else {
             cursor += 1;
@@ -930,7 +931,7 @@ fn projection_archive_records(
                 matches!(candidate, Message::Assistant { message } if !message.tool_calls.is_empty())
             })
             .map_or(tail.len(), |offset| cursor + 1 + offset);
-        let group = &tail[cursor..end];
+        let group = &tail[group_start..end];
         let sequence = records.len() as u64 + 1;
         records.push(ArchiveRecord {
             turn,
@@ -949,8 +950,9 @@ fn projection_archive_records(
                 .map(|call| call.id.clone())
                 .unwrap_or_else(|| format!("turn-{turn}-round-{round}-group-{sequence}")),
             session_id: session_id.to_string(),
-            markdown: render_tool_group(message, group),
+            markdown: render_tool_group(message, group, cursor - group_start),
         });
+        group_start = end;
         cursor = end;
     }
     if records.is_empty() {
@@ -1152,8 +1154,14 @@ fn projection_manifest_entries(
     entries
 }
 
-fn render_tool_group(assistant: &AssistantMessage, group: &[Message]) -> String {
+fn render_tool_group(
+    assistant: &AssistantMessage,
+    group: &[Message],
+    assistant_index: usize,
+) -> String {
     let mut output = String::new();
+    let assistant_index = assistant_index.min(group.len());
+    render_injected_messages(&mut output, &group[..assistant_index]);
     let mut context = Vec::new();
     if let Some(content) = assistant
         .content
@@ -1207,7 +1215,19 @@ fn render_tool_group(assistant: &AssistantMessage, group: &[Message]) -> String 
             "### Unmatched tool result: {name}\n\nCall ID: `{call_id}`\n\n{content}\n\n"
         ));
     }
+    let after_assistant = group.get(assistant_index + 1..).unwrap_or_default();
+    render_injected_messages(&mut output, after_assistant);
     output
+}
+
+fn render_injected_messages(output: &mut String, messages: &[Message]) {
+    for message in messages {
+        if let Message::InjectedUser { content, .. } = message {
+            output.push_str("## Injected user message\n\n");
+            output.push_str(content);
+            output.push_str("\n\n");
+        }
+    }
 }
 
 fn render_tool_call(
@@ -1927,6 +1947,44 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.available));
+    }
+
+    #[test]
+    fn projection_archive_preserves_injected_user_content_in_the_tool_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ArchiveStore::with_root(directory.path().join("session"));
+        let source = vec![
+            Message::user("task"),
+            Message::injected_user("inject-1", "do not change the public API"),
+            Message::assistant(AssistantMessage {
+                tool_calls: vec![ToolCall {
+                    id: "call_a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                ..AssistantMessage::default()
+            }),
+            Message::tool("call_a", "read_file", "result-a"),
+        ];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(crate::compaction::CurrentTurnFold {
+                note: "fresh progress".into(),
+                compacted_messages: 3,
+            }),
+        };
+
+        let records = store
+            .archive_context_projection("session-id", 1, 1, &source, &projection)
+            .unwrap();
+        let archived = std::fs::read_to_string(store.root.join(&records[0].relative_path)).unwrap();
+
+        assert!(archived.contains("## Injected user message"));
+        assert!(archived.contains("do not change the public API"));
+        assert!(
+            archived.find("## Injected user message").unwrap()
+                < archived.find("## Call: read_file").unwrap()
+        );
     }
 
     #[test]
