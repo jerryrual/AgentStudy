@@ -107,6 +107,15 @@ impl Record {
 const RECOVERY_CHECKPOINT_VERSION: u32 = 1;
 const MAX_RECOVERY_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
+fn ensure_recovery_checkpoint_size(size: u64) -> Result<()> {
+    if size > MAX_RECOVERY_CHECKPOINT_BYTES {
+        bail!(
+            "recovery checkpoint is too large: {size} bytes exceeds {MAX_RECOVERY_CHECKPOINT_BYTES}"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RecoveryCheckpoint {
     version: u32,
@@ -405,6 +414,7 @@ impl Session {
             phase_four_breaker: phase_four_breaker.clone(),
         };
         let payload = serde_json::to_vec(&checkpoint)?;
+        ensure_recovery_checkpoint_size(payload.len() as u64)?;
         replace_private_file(&self.recovery_checkpoint_path(), &payload).with_context(|| {
             format!(
                 "failed to persist recovery checkpoint {}",
@@ -436,9 +446,7 @@ impl Session {
                 return Err(error).with_context(|| format!("failed to open {}", path.display()))
             }
         };
-        if file.metadata()?.len() > MAX_RECOVERY_CHECKPOINT_BYTES {
-            bail!("recovery checkpoint {} is too large", path.display());
-        }
+        ensure_recovery_checkpoint_size(file.metadata()?.len())?;
         let checkpoint: RecoveryCheckpoint = serde_json::from_reader(file)
             .with_context(|| format!("failed to parse recovery checkpoint {}", path.display()))?;
         let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
@@ -1202,6 +1210,12 @@ mod tests {
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn recovery_checkpoint_size_is_bounded_before_io() {
+        assert!(ensure_recovery_checkpoint_size(MAX_RECOVERY_CHECKPOINT_BYTES).is_ok());
+        assert!(ensure_recovery_checkpoint_size(MAX_RECOVERY_CHECKPOINT_BYTES + 1).is_err());
     }
 
     #[test]
