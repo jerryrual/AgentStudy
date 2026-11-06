@@ -886,9 +886,6 @@ fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
         if next != messages.len() {
             bail!("recovery checkpoint has a non-trailing incomplete tool-call group");
         }
-        if !assistant.responses_items.is_empty() {
-            bail!("cannot shape an incomplete native Responses tool-call group");
-        }
         let mut retained_calls = Vec::new();
         let mut retained_results = Vec::new();
         for call in &assistant.tool_calls {
@@ -900,11 +897,60 @@ fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
         if retained_calls.is_empty() {
             bail!("recovery checkpoint has no completed tool results to retain");
         }
+        let retained_responses_items = shape_partial_responses_items(
+            &assistant.responses_items,
+            &assistant.tool_calls,
+            &retained_calls,
+        )?;
         let mut retained_assistant = assistant.clone();
         retained_assistant.tool_calls = retained_calls;
+        retained_assistant.responses_items = retained_responses_items;
         shaped.push(Message::assistant(retained_assistant));
         shaped.extend(retained_results);
         index = next;
+    }
+    Ok(shaped)
+}
+
+fn shape_partial_responses_items(
+    items: &[serde_json::Value],
+    calls: &[ToolCall],
+    retained_calls: &[ToolCall],
+) -> Result<Vec<serde_json::Value>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let call_ids = calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let retained_ids = retained_calls
+        .iter()
+        .map(|call| call.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut shaped = Vec::with_capacity(items.len());
+    for item in items {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+            shaped.push(item.clone());
+            continue;
+        }
+        let call_id = item
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("native Responses function call has no call_id"))?;
+        if !call_ids.contains(call_id) {
+            bail!("native Responses function call does not match the assistant calls");
+        }
+        if !seen.insert(call_id) {
+            bail!("native Responses output has duplicate function-call IDs");
+        }
+        if retained_ids.contains(call_id) {
+            shaped.push(item.clone());
+        }
+    }
+    if seen.len() != call_ids.len() {
+        bail!("native Responses output is missing an assistant function call");
     }
     Ok(shaped)
 }
@@ -1709,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_recovery_without_completed_results_or_with_native_items_fails_closed() {
+    fn partial_recovery_without_completed_results_or_with_malformed_native_items_fails_closed() {
         let assistant = AssistantMessage {
             content: Some("visible text".into()),
             reasoning: None,
@@ -1727,13 +1773,66 @@ mod tests {
         .is_err());
 
         let mut native = assistant;
+        native.tool_calls.push(ToolCall {
+            id: "call_2".into(),
+            name: "grep".into(),
+            arguments: "{}".into(),
+        });
         native
             .responses_items
             .push(serde_json::json!({"type": "function_call"}));
-        assert!(
-            shape_recovery_messages(&[Message::user("inspect"), Message::assistant(native),])
-                .is_err()
+        assert!(shape_recovery_messages(&[
+            Message::user("inspect"),
+            Message::assistant(native),
+            Message::tool("call_1", "read_file", "result"),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn partial_recovery_filters_native_responses_calls_and_preserves_other_items() {
+        let messages = shape_recovery_messages(&[
+            Message::user("inspect"),
+            Message::assistant(AssistantMessage {
+                content: Some("visible text".into()),
+                reasoning: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_a".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "call_b".into(),
+                        name: "grep".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+                responses_items: vec![
+                    serde_json::json!({"type": "reasoning", "id": "rs_1"}),
+                    serde_json::json!({"type": "function_call", "call_id": "call_a"}),
+                    serde_json::json!({"type": "function_call", "call_id": "call_b"}),
+                    serde_json::json!({"type": "message", "id": "msg_1"}),
+                ],
+            }),
+            Message::tool("call_b", "grep", "B result"),
+        ])
+        .unwrap();
+
+        let Message::Assistant { message } = &messages[1] else {
+            panic!("expected a shaped native assistant message");
+        };
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].id, "call_b");
+        assert_eq!(
+            message
+                .responses_items
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reasoning", "function_call", "message"]
         );
+        assert_eq!(message.responses_items[1]["call_id"], "call_b");
     }
 
     #[test]

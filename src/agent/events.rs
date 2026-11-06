@@ -25,7 +25,8 @@ pub trait EventSink: Send + Sync {
         None
     }
 
-    /// Durably snapshot the recoverable turn immediately before provider work.
+    /// Durably snapshot the recoverable turn before provider work or after a
+    /// completed local tool result.
     fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
         Ok(false)
     }
