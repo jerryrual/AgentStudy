@@ -286,20 +286,29 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             })??,
     );
     let store = options.store;
-    let (session, loaded) = match &options.session {
-        Some(id) => (store.reopen(id)?, Some(store.load(id)?)),
+    let (session, _run_lease) = match &options.session {
+        Some(id) => {
+            let lease = store.try_acquire_run_lease(id)?;
+            (store.reopen(id)?, lease)
+        }
         None if options.resume_turn => {
             anyhow::bail!("same-turn resume requires an existing session")
         }
-        None => (
-            store.create(
+        None => {
+            let session = store.create(
                 &options.cwd.display().to_string(),
                 &options.profile.model,
                 options.agent.as_str(),
-            )?,
-            None,
-        ),
+            )?;
+            let lease = store.try_acquire_run_lease(session.id())?;
+            (session, lease)
+        }
     };
+    let loaded = options
+        .session
+        .as_deref()
+        .map(|id| store.load(id))
+        .transpose()?;
 
     let (mut messages, phase_four_turn, phase_four_state) = if options.resume_turn {
         session.load_resumable_turn()?

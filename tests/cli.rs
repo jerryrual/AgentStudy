@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::*;
+use fs2::FileExt;
 use serde_json::{json, Value};
 
 fn settings_json(base_url: &str) -> String {
@@ -257,6 +258,87 @@ fn run_continue_uses_the_latest_session() {
         .collect();
     assert!(contents.contains(&"previous context"), "{contents:?}");
     assert!(contents.contains(&"follow up"), "{contents:?}");
+}
+
+#[test]
+fn headless_run_lease_blocks_a_second_owner_before_provider_io() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("continued"), &done_chunk("stop")])
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let id = "1a1a0000000-00004";
+    let meta = json!({
+        "type": "meta",
+        "meta": {
+            "id": id,
+            "created_ms": 4,
+            "cwd": work.path(),
+            "model": "mock-model",
+            "agent": "code"
+        }
+    });
+    let user = json!({"type": "user", "text": "previous context"});
+    let transcript_path = sessions.join(format!("{id}.jsonl"));
+    std::fs::write(&transcript_path, format!("{meta}\n{user}\n")).unwrap();
+    let lease_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(sessions.join(format!("{id}.run.lock")))
+        .unwrap();
+    lease_file.lock_exclusive().unwrap();
+
+    let blocked = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "follow up",
+            "--session",
+            id,
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("active in another headless process"),
+        "{stderr}"
+    );
+    assert_eq!(server.request_count(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&transcript_path)
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+
+    drop(lease_file);
+    let resumed = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "follow up",
+            "--session",
+            id,
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(server.request_count(), 1);
 }
 
 #[test]
