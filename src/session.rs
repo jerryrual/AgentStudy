@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
 use crate::compaction_archive::{
-    ensure_private_directory, open_append_private_nofollow, open_read_nofollow,
-    replace_private_file, sync_directory, ArchiveStore, ArchivedContextProjection,
+    ensure_private_directory, open_append_existing_nofollow, open_append_private_nofollow,
+    open_read_nofollow, replace_private_file, sync_directory, ArchiveStore,
+    ArchivedContextProjection,
 };
 use crate::model::{AssistantMessage, Message, ToolCall};
 use crate::phase4_breaker::PhaseFourBreakerState;
@@ -363,11 +364,29 @@ impl Session {
         turn: u64,
         phase_four_breaker: &PhaseFourBreakerState,
     ) -> Result<()> {
+        self.persist_recovery_checkpoint_if(messages, turn, phase_four_breaker, || true)?
+            .then_some(())
+            .ok_or_else(|| anyhow::anyhow!("recovery checkpoint was declined"))
+    }
+
+    pub(crate) fn persist_recovery_checkpoint_if<F>(
+        &self,
+        messages: &[Message],
+        turn: u64,
+        phase_four_breaker: &PhaseFourBreakerState,
+        should_persist: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> bool,
+    {
         let _guard = self
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
+        if !should_persist() {
+            return Ok(false);
+        }
         let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
         if turn == 0 || turn != current_turn {
             bail!("recovery checkpoint turn {turn} does not match current turn {current_turn}");
@@ -393,7 +412,7 @@ impl Session {
             )
         })?;
         match self.load_recovery_checkpoint_unlocked()? {
-            Some(persisted) if persisted == checkpoint => Ok(()),
+            Some(persisted) if persisted == checkpoint => Ok(true),
             _ => bail!("recovery checkpoint read-back did not match the written snapshot"),
         }
     }
@@ -445,13 +464,22 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
         let path = self.recovery_checkpoint_path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => sync_directory(&self.archive_root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
             }
         }
+        open_append_existing_nofollow(&self.path)
+            .with_context(|| format!("failed to open session {}", self.path.display()))?
+            .sync_all()
+            .with_context(|| format!("failed to sync session {}", self.path.display()))?;
+        sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))
+            .with_context(|| format!("failed to sync session directory for {}", self.id()))?;
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        sync_directory(&self.archive_root)
     }
 
     fn recovery_checkpoint_path(&self) -> PathBuf {
@@ -1187,6 +1215,10 @@ mod tests {
         let first_messages = vec![Message::user("continue work")];
         let mut first_breaker = PhaseFourBreakerState::default();
         first_breaker.attempts = 1;
+        assert!(!session
+            .persist_recovery_checkpoint_if(&first_messages, 1, &first_breaker, || false)
+            .unwrap());
+        assert!(!session.recovery_checkpoint_path().exists());
         session
             .persist_recovery_checkpoint(&first_messages, 1, &first_breaker)
             .unwrap();
@@ -1281,6 +1313,32 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_cleanup_preserves_sidecar_when_transcript_sync_fails() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("work")).unwrap();
+        session
+            .persist_recovery_checkpoint(
+                &[Message::user("work")],
+                1,
+                &PhaseFourBreakerState::default(),
+            )
+            .unwrap();
+        let original = session.path.with_extension("saved");
+        std::fs::rename(&session.path, &original).unwrap();
+        let outside = directory.path().join("outside-transcript");
+        std::fs::write(&outside, "sentinel").unwrap();
+        symlink(&outside, &session.path).unwrap();
+
+        assert!(session.clear_recovery_checkpoint().is_err());
+        assert!(session.recovery_checkpoint_path().exists());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "sentinel");
     }
 
     #[test]

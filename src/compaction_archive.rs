@@ -1590,6 +1590,21 @@ pub(crate) fn open_append_private_nofollow(path: &Path) -> std::io::Result<File>
 }
 
 #[cfg(unix)]
+pub(crate) fn open_append_existing_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_append_existing_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).append(true).open(path)
+}
+
+#[cfg(unix)]
 pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()

@@ -1627,12 +1627,16 @@ impl EventSink for TuiSink {
         if !self.recovery_enabled {
             return Ok(false);
         }
-        if !self.persistence_gate.load(Ordering::SeqCst) {
+        let breaker = self.phase_four_breaker.snapshot()?;
+        let persisted = self.session.persist_recovery_checkpoint_if(
+            messages,
+            self.phase_four_turn,
+            &breaker,
+            || self.persistence_gate.load(Ordering::SeqCst),
+        )?;
+        if !persisted {
             anyhow::bail!("turn was cancelled before the recovery checkpoint");
         }
-        let breaker = self.phase_four_breaker.snapshot()?;
-        self.session
-            .persist_recovery_checkpoint(messages, self.phase_four_turn, &breaker)?;
         if !self.persistence_gate.load(Ordering::SeqCst) {
             anyhow::bail!("turn was cancelled during the recovery checkpoint");
         }
