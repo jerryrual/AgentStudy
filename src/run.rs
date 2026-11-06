@@ -394,8 +394,18 @@ pub async fn execute(options: RunOptions) -> Result<()> {
     };
     drop(run);
     let Some(result) = result else {
-        if let Err(error) = recovery_writer.preserve() {
-            eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
+        let preserve = tokio::task::spawn_blocking(move || recovery_writer.preserve());
+        match tokio::time::timeout(Duration::from_secs(5), preserve).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
+            }
+            Ok(Err(error)) => {
+                eprintln!("warning: recovery checkpoint task failed: {error}");
+            }
+            Err(_) => {
+                eprintln!("warning: timed out preserving recovery checkpoint");
+            }
         }
         if !options.json {
             eprintln!();

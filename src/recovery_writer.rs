@@ -446,6 +446,17 @@ mod tests {
             let result = barrier.barrier(&[Message::user("B")], PhaseFourBreakerState::default());
             result_tx.send(result).unwrap();
         });
+        while writer
+            .handle
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .controls
+            .is_empty()
+        {
+            std::thread::yield_now();
+        }
         assert!(matches!(result_rx.try_recv(), Err(TryRecvError::Empty)));
         release.send(()).unwrap();
         assert_eq!(started.recv().unwrap(), "strict:B");
