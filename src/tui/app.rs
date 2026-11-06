@@ -196,8 +196,7 @@ impl App {
                     (session, lease, Vec::new(), welcome(), false)
                 }
             };
-        let continue_available =
-            opened_existing && session.resumable_turn_available().unwrap_or(false);
+        let continue_available = opened_existing && inspect_continue_available(&session, &mut view);
         if continue_available {
             view.push(continue_available_notice());
         }
@@ -800,7 +799,7 @@ impl App {
     // ----- turn lifecycle -------------------------------------------------
 
     fn refresh_continue_available(&mut self, announce: bool) {
-        let available = self.session.resumable_turn_available().unwrap_or(false);
+        let available = inspect_continue_available(&self.session, &mut self.view);
         self.continue_available = available;
         if announce && available {
             self.view.push(continue_available_notice());
@@ -1591,6 +1590,18 @@ fn wrapped_cell_lines(text: &str, width: usize) -> usize {
         total += rows;
     }
     total.max(1)
+}
+
+fn inspect_continue_available(session: &Session, view: &mut Vec<ViewItem>) -> bool {
+    match session.resumable_turn_available() {
+        Ok(available) => available,
+        Err(error) => {
+            view.push(ViewItem::Error(format!(
+                "cannot inspect interrupted turn: {error:#}"
+            )));
+            false
+        }
+    }
 }
 
 fn continue_available_notice() -> ViewItem {

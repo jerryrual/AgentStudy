@@ -580,6 +580,7 @@ impl Session {
         self.archive_root.join("session.recovery.json")
     }
 
+    /// Check whether the current durable state can safely resume without adopting a sidecar.
     pub(crate) fn resumable_turn_available(&self) -> Result<bool> {
         let _guard = self
             .append_lock
@@ -590,6 +591,7 @@ impl Session {
         Ok(self.prepare_resumable_turn_unlocked(loaded).is_ok())
     }
 
+    /// Load the current resumable turn, atomically adopting a validated sidecar suffix if needed.
     pub(crate) fn load_resumable_turn(&self) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
         let _guard = self
             .append_lock
