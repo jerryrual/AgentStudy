@@ -479,6 +479,59 @@ mod tests {
     }
 
     #[test]
+    fn current_turn_fold_absorbs_injected_user_content_without_moving_the_boundary() {
+        let messages = vec![
+            Message::user("current task"),
+            tool_call_message("call_1", "read_file"),
+            Message::tool("call_1", "read_file", "result"),
+            Message::injected_user("inject-current", "also check the tests"),
+        ];
+        let projection = ContextProjection {
+            historical_folds: Vec::new(),
+            current_turn: Some(CurrentTurnFold {
+                note: "read the file and received an added test constraint".into(),
+                compacted_messages: 3,
+            }),
+        };
+
+        let projected = projection.projected(&messages).unwrap();
+
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0], Message::user("current task"));
+        assert!(matches!(
+            &projected[1],
+            Message::LastWords { content }
+                if content.contains("received an added test constraint")
+        ));
+    }
+
+    #[test]
+    fn forced_compression_counts_injected_user_content_inside_its_primary_turn() {
+        let messages = vec![
+            Message::user("old request"),
+            Message::assistant(AssistantMessage::text("working")),
+            Message::injected_user("inject-old", "added constraint"),
+            Message::assistant(AssistantMessage::text("done")),
+            Message::user("current request"),
+        ];
+
+        let plan = plan_forced_compression(&messages).unwrap();
+
+        assert_eq!(plan.compacted_messages, 4);
+        assert_eq!(
+            plan.summary,
+            "User: old request; Injected user: added constraint"
+        );
+        assert_eq!(
+            plan.projected(&messages),
+            vec![
+                summary_message("User: old request; Injected user: added constraint"),
+                Message::user("current request"),
+            ]
+        );
+    }
+
+    #[test]
     fn current_turn_fold_rejects_unmatched_or_tool_free_tails() {
         let text_only = vec![
             Message::user("current task"),

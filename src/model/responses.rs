@@ -22,6 +22,7 @@ pub(super) fn request_body(
         match message {
             Message::System { content }
             | Message::User { content }
+            | Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => input.push(json!({
                 "type": "message",
@@ -412,6 +413,32 @@ mod tests {
         );
         assert_eq!(body["store"], false);
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn maps_injected_user_without_leaking_identity() {
+        let body = request_body(
+            &[Message::injected_user(
+                "injection-1",
+                "updated requirements",
+            )],
+            &[],
+            "model",
+            false,
+            None,
+            Some(128),
+            false,
+        );
+
+        assert_eq!(
+            body["input"][0],
+            serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "updated requirements"}],
+            })
+        );
+        assert!(body["input"][0].get("injection_id").is_none());
     }
 
     #[test]

@@ -266,12 +266,32 @@ pub(crate) fn automatic_turn_summary(turn: &[Message]) -> String {
             _ => None,
         })
         .collect();
+    let injected_user_messages: Vec<_> = turn
+        .iter()
+        .filter_map(|message| match message {
+            Message::InjectedUser { content, .. } if !content.is_empty() => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
     let mut parts = Vec::new();
     if let Some(content) = user_messages.first() {
         parts.push(format!("User: {}", truncate_chars(content, 100, "...")));
         if user_messages.len() > 1 {
             parts.push(format!("(+{} more messages)", user_messages.len() - 1));
         }
+    }
+    const MAX_INJECTED_SUMMARY_MESSAGES: usize = 3;
+    parts.extend(
+        injected_user_messages
+            .iter()
+            .take(MAX_INJECTED_SUMMARY_MESSAGES)
+            .map(|content| format!("Injected user: {}", truncate_chars(content, 100, "..."))),
+    );
+    if injected_user_messages.len() > MAX_INJECTED_SUMMARY_MESSAGES {
+        parts.push(format!(
+            "(+{} more injected messages)",
+            injected_user_messages.len() - MAX_INJECTED_SUMMARY_MESSAGES
+        ));
     }
 
     let mut tools = BTreeSet::new();
@@ -1071,6 +1091,37 @@ mod tests {
         assert_eq!(
             automatic_turn_summary(&[Message::user("first"), Message::user("second")]),
             "User: first; (+1 more messages)"
+        );
+    }
+
+    #[test]
+    fn historical_turn_summary_keeps_injected_user_content_without_a_new_boundary() {
+        let digest = automatic_turn_summary(&[
+            Message::user("primary request"),
+            Message::assistant(AssistantMessage::text("working")),
+            Message::injected_user("inject-1", "also preserve this constraint"),
+        ]);
+
+        assert_eq!(
+            digest,
+            "User: primary request; Injected user: also preserve this constraint"
+        );
+        assert_eq!(
+            user_indices(&[
+                Message::user("primary request"),
+                Message::injected_user("inject-1", "same turn"),
+            ]),
+            vec![0]
+        );
+        assert_eq!(
+            automatic_turn_summary(&[
+                Message::user("primary"),
+                Message::injected_user("inject-1", "one"),
+                Message::injected_user("inject-2", "two"),
+                Message::injected_user("inject-3", "three"),
+                Message::injected_user("inject-4", "four"),
+            ]),
+            "User: primary; Injected user: one; Injected user: two; Injected user: three; (+1 more injected messages)"
         );
     }
 

@@ -41,6 +41,10 @@ pub enum Record {
     User {
         text: String,
     },
+    InjectedUser {
+        injection_id: String,
+        text: String,
+    },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
@@ -83,6 +87,13 @@ impl Record {
         match message {
             Message::System { .. } | Message::Summary { .. } | Message::LastWords { .. } => None,
             Message::User { content } => Some(Self::User {
+                text: content.clone(),
+            }),
+            Message::InjectedUser {
+                injection_id,
+                content,
+            } => Some(Self::InjectedUser {
+                injection_id: injection_id.clone(),
                 text: content.clone(),
             }),
             Message::Assistant { message } => Some(Self::Assistant {
@@ -682,7 +693,7 @@ impl Session {
         let records = suffix
             .iter()
             .map(|message| match message {
-                Message::Assistant { .. } | Message::Tool { .. } => {
+                Message::Assistant { .. } | Message::Tool { .. } | Message::InjectedUser { .. } => {
                     Record::from_message(message).context("recovery suffix is not persistable")
                 }
                 _ => bail!("recovery checkpoint suffix crosses a user-turn boundary"),
@@ -1173,6 +1184,13 @@ impl LoadedSession {
                     flush(&mut messages, &mut pending);
                     messages.push(Message::user(text));
                 }
+                Record::InjectedUser { injection_id, text } => {
+                    flush(&mut messages, &mut pending);
+                    messages.push(Message::InjectedUser {
+                        injection_id: injection_id.clone(),
+                        content: text.clone(),
+                    });
+                }
                 Record::Assistant {
                     content,
                     reasoning,
@@ -1579,6 +1597,95 @@ mod tests {
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn injected_user_record_round_trips_with_its_identity() {
+        let message = Message::InjectedUser {
+            injection_id: "inject-1".into(),
+            content: "additional direction".into(),
+        };
+        let expected =
+            r#"{"type":"injected_user","injection_id":"inject-1","text":"additional direction"}"#;
+        let record = Record::from_message(&message).unwrap();
+        assert_eq!(serde_json::to_string(&record).unwrap(), expected);
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("primary request"))
+            .unwrap();
+        session.append_message(&message).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&session.path)
+                .unwrap()
+                .lines()
+                .last(),
+            Some(expected)
+        );
+        assert_eq!(
+            store.load(session.id()).unwrap().messages(),
+            vec![Message::user("primary request"), message]
+        );
+    }
+
+    #[test]
+    fn injected_users_do_not_count_as_turns_or_supply_the_session_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("real request"))
+            .unwrap();
+        session
+            .append_message(&Message::InjectedUser {
+                injection_id: "inject-1".into(),
+                content: "same turn one".into(),
+            })
+            .unwrap();
+        session
+            .append_message(&Message::InjectedUser {
+                injection_id: "inject-2".into(),
+                content: "same turn two".into(),
+            })
+            .unwrap();
+
+        let loaded = store.load(session.id()).unwrap();
+        assert_eq!(loaded.user_turn_count(), 1);
+        assert_eq!(store.list().unwrap()[0].preview, "real request");
+    }
+
+    #[test]
+    fn recovery_checkpoint_adopts_an_injected_user_without_starting_a_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("original request"))
+            .unwrap();
+        let checkpoint = vec![
+            Message::system("captured system"),
+            Message::user("original request"),
+            Message::InjectedUser {
+                injection_id: "inject-1".into(),
+                content: "additional direction".into(),
+            },
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint, 1, &Default::default())
+            .unwrap();
+
+        let (messages, turn, _) = session.load_resumable_turn().unwrap();
+        assert_eq!(messages, checkpoint);
+        assert_eq!(turn, 1);
+        let loaded = store.load(session.id()).unwrap();
+        assert_eq!(loaded.user_turn_count(), 1);
+        assert!(matches!(
+            loaded.records.last(),
+            Some(Record::InjectedUser { injection_id, text })
+                if injection_id == "inject-1" && text == "additional direction"
+        ));
     }
 
     #[test]

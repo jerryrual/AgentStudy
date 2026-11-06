@@ -72,6 +72,11 @@ pub enum Message {
     User {
         content: String,
     },
+    /// Same-turn user-role context with a durable local identity.
+    InjectedUser {
+        injection_id: String,
+        content: String,
+    },
     /// Persisted compaction context sent to providers with the user role.
     Summary {
         content: String,
@@ -99,6 +104,13 @@ impl Message {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
+            content: content.into(),
+        }
+    }
+
+    pub fn injected_user(injection_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::InjectedUser {
+            injection_id: injection_id.into(),
             content: content.into(),
         }
     }
@@ -136,6 +148,7 @@ impl Message {
         match self {
             Message::System { content } => json!({"role": "system", "content": content}),
             Message::User { content }
+            | Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => {
                 json!({"role": "user", "content": content})
@@ -183,6 +196,7 @@ impl Message {
         let text = match self {
             Message::System { content }
             | Message::User { content }
+            | Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => content.clone(),
             Message::Assistant { message } => message.content.clone().unwrap_or_default(),
@@ -255,6 +269,27 @@ mod tests {
         let preview = message.preview();
         assert!(preview.chars().count() <= 101, "{preview}");
         assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn injected_user_round_trips_identity_without_leaking_it_to_chat_api() {
+        let message = Message::injected_user("injection-1", "updated requirements");
+        let stored = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(
+            stored,
+            json!({
+                "role": "injected_user",
+                "injection_id": "injection-1",
+                "content": "updated requirements",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
+        assert_eq!(message.preview(), "updated requirements");
+        assert_eq!(
+            message.to_api(),
+            json!({"role": "user", "content": "updated requirements"})
+        );
     }
 
     #[test]
