@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{approval_layout, App, Modal, ToolStatus, ViewItem};
+use super::app::{approval_hint, approval_layout, App, Modal, ToolStatus, ViewItem};
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -419,7 +419,7 @@ fn draw_approval(
     // Grow the dialog so the complete command stays reviewable. The summary is
     // wrapped here (not by Paragraph) because commands are often a single long
     // word that Paragraph does not break.
-    let layout = approval_layout(area, tool, summary);
+    let layout = approval_layout(area, tool, summary, allow_always);
     let interior = layout.interior;
     let clipped = layout.clipped;
     let mut lines = Vec::new();
@@ -443,11 +443,7 @@ fn draw_approval(
         lines.push(Line::default());
         lines.extend(wrap_line(
             Line::from(Span::styled(
-                if allow_always {
-                    "  y allow once · a always allow · n deny · esc deny"
-                } else {
-                    "  y allow once · n deny · esc deny"
-                },
+                approval_hint(allow_always),
                 Style::default().fg(app.theme.dim),
             )),
             interior,

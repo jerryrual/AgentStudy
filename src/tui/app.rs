@@ -730,7 +730,7 @@ impl App {
         if matches!(
             decision,
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
-        ) && approval_layout(screen, &request.tool, &request.summary).clipped
+        ) && approval_layout(screen, &request.tool, &request.summary, *allow_always).clipped
         {
             return;
         }
@@ -1590,12 +1590,26 @@ pub(crate) struct ApprovalLayout {
     pub clipped: bool,
 }
 
+/// Return the keyboard hint rendered for this approval mode.
+pub(crate) fn approval_hint(allow_always: bool) -> &'static str {
+    if allow_always {
+        "  y allow once · a always allow · n deny · esc deny"
+    } else {
+        "  y allow once · n deny · esc deny"
+    }
+}
+
 /// Compute the approval popup geometry for the current terminal size.
 ///
 /// `ui::draw_approval` renders with this layout, and `decide_approval` refuses
 /// allow decisions when `clipped` is set, so approval can never be granted for
 /// text the user cannot see.
-pub(crate) fn approval_layout(screen: Rect, tool: &str, summary: &str) -> ApprovalLayout {
+pub(crate) fn approval_layout(
+    screen: Rect,
+    tool: &str,
+    summary: &str,
+    allow_always: bool,
+) -> ApprovalLayout {
     // Keep in sync with `centered(area, 70, height)` in the renderer.
     let popup_width = (screen.width as u32 * 70 / 100) as u16;
     let interior = popup_width.saturating_sub(2) as usize;
@@ -1606,10 +1620,7 @@ pub(crate) fn approval_layout(screen: Rect, tool: &str, summary: &str) -> Approv
         };
     }
     let summary_lines = wrapped_cell_lines(&format!("  {tool}: {summary}"), interior);
-    let hint_lines = wrapped_cell_lines(
-        "  y allow once · a always allow · n deny · esc deny",
-        interior,
-    );
+    let hint_lines = wrapped_cell_lines(approval_hint(allow_always), interior);
     let needed = summary_lines + 1 + hint_lines + 2;
     ApprovalLayout {
         interior,
@@ -2438,12 +2449,15 @@ mod tests {
         // At 40x7 a character-count heuristic would claim the command fits,
         // but the wide characters need one more rendered row.
         assert!(
-            approval_layout(Rect::new(0, 0, 40, 7), "bash", &wide).clipped,
+            approval_layout(Rect::new(0, 0, 40, 7), "bash", &wide, true).clipped,
             "{wide}"
         );
-        assert!(!approval_layout(Rect::new(0, 0, 120, 40), "bash", "cargo test").clipped);
+        assert!(!approval_layout(Rect::new(0, 0, 120, 40), "bash", "cargo test", true).clipped);
         // A very narrow popup has too little room for the text: refuse.
-        assert!(approval_layout(Rect::new(0, 0, 12, 20), "bash", "cargo test").clipped);
+        assert!(approval_layout(Rect::new(0, 0, 12, 20), "bash", "cargo test", true).clipped);
+        // The shorter recovery hint fits one row where the ordinary hint wraps.
+        assert!(approval_layout(Rect::new(0, 0, 60, 5), "bash", "cargo test", true).clipped);
+        assert!(!approval_layout(Rect::new(0, 0, 60, 5), "bash", "cargo test", false).clipped);
     }
 
     #[tokio::test]
