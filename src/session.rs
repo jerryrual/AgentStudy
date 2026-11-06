@@ -109,6 +109,17 @@ struct PhaseFourBreakerCheckpoint {
     state: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub(crate) struct SessionRunLease {
+    _file: std::fs::File,
+}
+
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && (expected.raw_os_error().is_none() || error.raw_os_error() == expected.raw_os_error())
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub meta: SessionMeta,
@@ -844,6 +855,23 @@ impl SessionStore {
         &self.root
     }
 
+    pub(crate) fn try_acquire_run_lease(&self, id: &str) -> Result<SessionRunLease> {
+        validate_session_id(id)?;
+        let transcript = self.path(id);
+        open_read_nofollow(&transcript).with_context(|| format!("failed to open session {id}"))?;
+        let path = self.root.join(format!("{id}.run.lock"));
+        let file = open_append_private_nofollow(&path)
+            .with_context(|| format!("failed to open session run lease {}", path.display()))?;
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(SessionRunLease { _file: file }),
+            Err(error) if is_lock_contended(&error) => {
+                anyhow::bail!("session {id} is active in another headless process")
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to acquire session run lease {}", path.display())),
+        }
+    }
+
     /// Start a new session and write its metadata line.
     pub fn create(&self, cwd: &str, model: &str, agent: &str) -> Result<Session> {
         let created_ms = now_ms();
@@ -1113,6 +1141,43 @@ mod tests {
         assert_eq!(turn, 1);
         assert_eq!(breaker.attempts, 1);
         assert!(matches!(messages.last(), Some(Message::Tool { .. })));
+    }
+
+    #[test]
+    fn run_lease_excludes_headless_owners_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let other_store = SessionStore::with_root(directory.path());
+
+        let lease = store.try_acquire_run_lease(session.id()).unwrap();
+        let error = other_store.try_acquire_run_lease(session.id()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active in another headless process"));
+        session
+            .append_message(&Message::user("still writable"))
+            .unwrap();
+
+        drop(lease);
+        let reacquired = other_store.try_acquire_run_lease(session.id()).unwrap();
+        drop(reacquired);
+        assert!(directory
+            .path()
+            .join(format!("{}.run.lock", session.id()))
+            .exists());
+    }
+
+    #[test]
+    fn run_leases_are_independent_per_session_and_validate_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let first = store.create("/tmp", "model", "code").unwrap();
+        let second = store.create("/tmp", "model", "code").unwrap();
+
+        let _first_lease = store.try_acquire_run_lease(first.id()).unwrap();
+        let _second_lease = store.try_acquire_run_lease(second.id()).unwrap();
+        assert!(store.try_acquire_run_lease("../outside").is_err());
     }
 
     #[test]
