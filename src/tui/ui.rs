@@ -266,11 +266,15 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
         app.theme.warning
     } else if app.running {
         app.theme.dim
+    } else if app.continue_available {
+        app.theme.warning
     } else {
         app.theme.border
     };
     let title = if app.pending_ask.is_some() {
         " answer "
+    } else if app.continue_available {
+        " continue "
     } else {
         " prompt "
     };
@@ -284,8 +288,13 @@ fn draw_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let (visible, _) = visible_input(app, inner.width.saturating_sub(2) as usize);
     let mut spans = vec![Span::styled("❯ ", Style::default().fg(app.theme.accent))];
     if visible.is_empty() {
+        let placeholder = if app.continue_available {
+            "Press Enter to continue the interrupted turn"
+        } else {
+            "Ask a coding question, or type /help"
+        };
         spans.push(Span::styled(
-            "Ask a coding question, or type /help",
+            placeholder,
             Style::default().fg(app.theme.dim),
         ));
     } else {
@@ -1225,6 +1234,86 @@ mod tests {
                 .replace(&target_id, "<TARGET_SESSION>")
                 .replace(&current_id, "<CURRENT_SESSION>")
         );
+    }
+
+    #[test]
+    fn restored_tui_offers_continue_without_adopting_the_sidecar() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let original = test_app();
+        original
+            .session
+            .append_message(&Message::user("interrupted request"))
+            .unwrap();
+        original
+            .session
+            .persist_recovery_checkpoint(
+                &[
+                    Message::system("captured system"),
+                    Message::user("interrupted request"),
+                ],
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let id = original.session.id().to_string();
+        let transcript = original.store.path(&id);
+        let sidecar = original
+            .session
+            .archive_root()
+            .join("session.recovery.json");
+        let transcript_before = std::fs::read(&transcript).unwrap();
+        let sidecar_before = std::fs::read(&sidecar).unwrap();
+        let runtime = original.runtime.clone();
+        let options = AppOptions {
+            settings: original.settings.clone(),
+            profile: original.profile.clone(),
+            agent: original.agent_kind,
+            cwd: original.cwd.clone(),
+            store: original.store.clone(),
+            resume: Some(id.clone()),
+            theme: original.theme,
+            approval: original.approval_mode,
+        };
+        drop(original);
+
+        let mut app = App::new(runtime, options).unwrap();
+        let before_continue = render(&mut app, 100, 24);
+        println!("AFTER (restored Continue prompt, 100x24):\n{before_continue}");
+        assert!(app.continue_available);
+        assert!(!app.running);
+        assert!(before_continue.contains("continue"), "{before_continue}");
+        assert!(
+            before_continue.contains("Press Enter to continue the interrupted turn"),
+            "{before_continue}"
+        );
+        assert_eq!(std::fs::read(&transcript).unwrap(), transcript_before);
+        assert_eq!(std::fs::read(&sidecar).unwrap(), sidecar_before);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        assert!(app.running);
+        assert!(!app.continue_available);
+        assert_eq!(std::fs::read(&transcript).unwrap(), transcript_before);
+        app.cancel();
+        assert!(app.continue_available);
+
+        app.input = "/new".to_string();
+        app.cursor = app.input.len();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        assert!(!app.continue_available);
+
+        app.input = format!("/resume {id}");
+        app.cursor = app.input.len();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        assert!(app.continue_available);
     }
 
     #[test]
