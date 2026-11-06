@@ -134,11 +134,95 @@ fn failed_run_preserves_the_pre_provider_recovery_snapshot() {
         .join("sessions")
         .join(format!("{id}/session.recovery.json"));
     let checkpoint: Value = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
-    assert_eq!(checkpoint["version"], 1);
+    assert_eq!(checkpoint["version"], 2);
+    assert!(checkpoint["transcript_bytes"].as_u64().is_some());
     assert_eq!(checkpoint["session_id"], id);
     assert_eq!(checkpoint["turn"], 1);
     assert_eq!(checkpoint["messages"][1]["role"], "user");
     assert_eq!(checkpoint["messages"][1]["content"], "recover me");
+}
+
+#[test]
+fn resume_turn_adopts_failed_run_sidecar_and_denies_mutating_tools() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = calls.clone();
+    let server = MockServer::new(move |_path, _body| {
+        match calls_for_server.fetch_add(1, Ordering::SeqCst) {
+            0 => MockResponse::json(401, r#"{"error":{"message":"simulated interruption"}}"#),
+            1 => MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write","function":{"name":"write_file","arguments":"{\"path\":\"blocked.txt\",\"content\":\"must not write\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                &done_chunk("tool_calls"),
+            ]),
+            _ => MockResponse::sse(&[&text_chunk("recovered"), &done_chunk("stop")]),
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+
+    let failed = icode()
+        .env("ICODE_HOME", home.path())
+        .args(["run", "recover me", "--cwd", work.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    let transcript = std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+    let id = transcript.file_stem().unwrap().to_str().unwrap();
+
+    let resumed = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "resume-turn",
+            "--session",
+            id,
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        resumed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(server.request_count(), 3);
+    let resumed_requests = server.requests();
+    assert_eq!(resumed_requests[1]["messages"][1]["content"], "recover me");
+    let final_contents: Vec<&str> = resumed_requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        final_contents.contains(&"Error: the user denied this operation."),
+        "{final_contents:?}"
+    );
+    assert!(!work.path().join("blocked.txt").exists());
+    assert!(!home
+        .path()
+        .join("sessions")
+        .join(id)
+        .join("session.recovery.json")
+        .exists());
+    let persisted = std::fs::read_to_string(transcript).unwrap();
+    assert_eq!(
+        persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|record| record["type"] == "user")
+            .count(),
+        1
+    );
 }
 
 #[test]
