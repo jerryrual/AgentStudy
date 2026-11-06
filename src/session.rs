@@ -396,6 +396,29 @@ impl Session {
         Ok((turn, state))
     }
 
+    pub(crate) fn enter_phase_four_round_if<F>(
+        &self,
+        turn: u64,
+        side_call_limit: i64,
+        should_append: F,
+    ) -> Result<Option<(PhaseFourBreakerState, bool)>>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let (persisted_turn, mut committed) = self.load_phase_four_breaker_unlocked()?;
+        if persisted_turn != turn || !should_append() {
+            return Ok(None);
+        }
+        let admitted = committed.enter_round(side_call_limit);
+        self.append_phase_four_breaker_unlocked(turn, &committed)?;
+        Ok(Some((committed, admitted)))
+    }
+
     pub(crate) fn append_phase_four_breaker_if<F>(
         &self,
         turn: u64,
@@ -1850,6 +1873,31 @@ mod tests {
         assert!(session
             .append_phase_four_breaker_if(1, &proposed, &proposed, || true)
             .is_err());
+    }
+
+    #[test]
+    fn phase_four_round_entry_disables_after_one_hundred_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+
+        for expected in 1..=100 {
+            let (state, admitted) = session
+                .enter_phase_four_round_if(1, -1, || true)
+                .unwrap()
+                .unwrap();
+            assert!(admitted);
+            assert_eq!(state.attempts, expected);
+        }
+        let (state, admitted) = session
+            .enter_phase_four_round_if(1, -1, || true)
+            .unwrap()
+            .unwrap();
+        assert!(!admitted);
+        assert!(state.disabled);
+        assert_eq!(state.attempts, 100);
+        assert_eq!(session.load_phase_four_breaker().unwrap().1, state);
     }
 
     #[test]

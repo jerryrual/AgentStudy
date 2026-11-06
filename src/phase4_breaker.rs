@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const BREAKER_STATE_VERSION: u64 = 1;
+const MAX_ATTEMPTS: u64 = 100;
 const STATE_INTEGER_MAX: u64 = i64::MAX as u64;
 
 /// Versioned Phase 4 state checkpointed before provider work.
@@ -42,9 +43,21 @@ impl PhaseFourBreakerState {
             && state.side_call_tokens <= STATE_INTEGER_MAX)
             .then_some(state)
     }
+
+    pub(crate) fn enter_round(&mut self, side_call_limit: i64) -> bool {
+        let exhausted = self.disabled
+            || self.attempts >= MAX_ATTEMPTS
+            || (side_call_limit >= 0 && self.side_call_tokens >= side_call_limit as u64);
+        if exhausted {
+            self.disabled = true;
+            return false;
+        }
+        self.attempts += 1;
+        true
+    }
 }
 
-/// Serializes charge-first state checkpoints for one logical user turn.
+/// Serializes breaker transitions for one logical user turn.
 pub(crate) struct PhaseFourBreaker {
     limit: i64,
     state: Mutex<PhaseFourBreakerState>,
@@ -57,6 +70,20 @@ impl PhaseFourBreaker {
             limit,
             state: Mutex::new(state),
         }
+    }
+
+    pub(crate) fn enter_round_and_persist<F>(&self, persist: F) -> Result<bool>
+    where
+        F: FnOnce(&PhaseFourBreakerState, i64) -> Result<Option<(PhaseFourBreakerState, bool)>>,
+    {
+        let mut current = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Phase 4 breaker lock is poisoned"))?;
+        let (committed, admitted) = persist(&current, self.limit)?
+            .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
+        *current = committed;
+        Ok(admitted)
     }
 
     pub(crate) fn charge_and_persist<F>(&self, estimated_input: u64, persist: F) -> Result<bool>
@@ -94,6 +121,26 @@ impl PhaseFourBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn round_entry_persists_attempts_and_disables_on_limits() {
+        let mut state = PhaseFourBreakerState::default();
+        for expected in 1..=MAX_ATTEMPTS {
+            assert!(state.enter_round(-1));
+            assert_eq!(state.attempts, expected);
+        }
+        assert!(!state.enter_round(-1));
+        assert!(state.disabled);
+        assert_eq!(state.attempts, MAX_ATTEMPTS);
+
+        let mut spent = PhaseFourBreakerState {
+            side_call_tokens: 100,
+            ..PhaseFourBreakerState::default()
+        };
+        assert!(!spent.enter_round(100));
+        assert!(spent.disabled);
+        assert_eq!(spent.attempts, 0);
+    }
 
     #[test]
     fn charge_is_checkpointed_before_strict_admission() {
