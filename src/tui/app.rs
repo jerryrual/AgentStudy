@@ -56,6 +56,8 @@ pub enum Modal {
     Approval {
         request: ApprovalRequest,
         reply: oneshot::Sender<ApprovalDecision>,
+        allow_always: bool,
+        recovery: bool,
     },
     Help,
 }
@@ -92,6 +94,8 @@ pub(crate) enum UiEvent {
     Approval {
         request: ApprovalRequest,
         reply: oneshot::Sender<ApprovalDecision>,
+        allow_always: bool,
+        recovery: bool,
     },
     Ask {
         question: String,
@@ -203,7 +207,7 @@ impl App {
             (false, false)
         };
         if continue_available {
-            view.push(continue_available_notice());
+            view.push(continue_available_notice(options.approval));
         }
         Ok(Self {
             settings: options.settings,
@@ -402,8 +406,18 @@ impl App {
             }
             UiEvent::Info(message) => self.view.push(ViewItem::Info(message)),
             UiEvent::Error(message) => self.view.push(ViewItem::Error(message)),
-            UiEvent::Approval { request, reply } => {
-                self.modal = Some(Modal::Approval { request, reply });
+            UiEvent::Approval {
+                request,
+                reply,
+                allow_always,
+                recovery,
+            } => {
+                self.modal = Some(Modal::Approval {
+                    request,
+                    reply,
+                    allow_always,
+                    recovery,
+                });
             }
             UiEvent::Ask { question, reply } => {
                 self.pending_ask = Some(reply);
@@ -672,6 +686,13 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent, screen: Rect) {
+        let allow_always = matches!(
+            &modal,
+            Modal::Approval {
+                allow_always: true,
+                ..
+            }
+        );
         self.modal = Some(modal);
         match key.code {
             KeyCode::Esc => self.decide_approval(ApprovalDecision::Deny, screen),
@@ -683,7 +704,7 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.decide_approval(ApprovalDecision::Deny, screen)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
+            KeyCode::Char('a') | KeyCode::Char('A') if allow_always => {
                 self.decide_approval(ApprovalDecision::AllowAlways, screen)
             }
             _ => {}
@@ -694,10 +715,18 @@ impl App {
     /// the dialog has to clip the command, so the user cannot approve text they
     /// cannot read.
     fn decide_approval(&mut self, decision: ApprovalDecision, screen: Rect) {
-        let Some(Modal::Approval { request, .. }) = &self.modal else {
+        let Some(Modal::Approval {
+            request,
+            allow_always,
+            ..
+        }) = &self.modal
+        else {
             self.modal = None;
             return;
         };
+        if decision == ApprovalDecision::AllowAlways && !*allow_always {
+            return;
+        }
         if matches!(
             decision,
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowAlways
@@ -809,7 +838,8 @@ impl App {
         self.continue_available = available;
         self.recovery_probe_failed = failed;
         if announce && available {
-            self.view.push(continue_available_notice());
+            self.view
+                .push(continue_available_notice(self.approval_mode));
         }
     }
 
@@ -1404,20 +1434,28 @@ impl App {
                 return;
             }
         };
+        let (approver, safety_message): (Arc<dyn Approver>, &str) = match self.approval_mode {
+            ApprovalMode::Deny => (
+                Arc::new(DenyAll),
+                "Continuing the current user turn with mutating tools denied.",
+            ),
+            ApprovalMode::Ask | ApprovalMode::Auto => (
+                Arc::new(TuiApprover::recovery(self.events_tx.clone())),
+                "Continuing the current user turn; every mutating tool requires confirmation.",
+            ),
+        };
 
         self.continue_available = false;
         self.messages = messages;
         self.reset_recorder();
         self.requires_session_reload = false;
-        self.view.push(ViewItem::Info(
-            "Continuing the current user turn with mutating tools denied.".to_string(),
-        ));
+        self.view.push(ViewItem::Info(safety_message.to_string()));
         self.view.push(ViewItem::Assistant {
             text: String::new(),
             reasoning: String::new(),
             streaming: true,
         });
-        self.start_agent((turn, breaker), Arc::new(DenyAll), Some(recovery_writer));
+        self.start_agent((turn, breaker), approver, Some(recovery_writer));
     }
 
     fn resume_session(&mut self, id: &str) {
@@ -1623,10 +1661,14 @@ fn inspect_continue_available(session: &Session, view: &mut Vec<ViewItem>) -> (b
     }
 }
 
-fn continue_available_notice() -> ViewItem {
-    ViewItem::Info(
-        "Interrupted turn available. Continuing keeps mutating tools denied.".to_string(),
-    )
+fn continue_available_notice(approval: ApprovalMode) -> ViewItem {
+    let message = match approval {
+        ApprovalMode::Deny => "Interrupted turn available. Continuing keeps mutating tools denied.",
+        ApprovalMode::Ask | ApprovalMode::Auto => {
+            "Interrupted turn available. Every mutating tool requires confirmation."
+        }
+    };
+    ViewItem::Info(message.to_string())
 }
 
 fn welcome() -> Vec<ViewItem> {
@@ -1964,6 +2006,7 @@ impl EventSink for TuiSink {
 struct TuiApprover {
     tx: mpsc::UnboundedSender<UiEvent>,
     always: std::sync::Mutex<std::collections::HashSet<String>>,
+    recovery: bool,
 }
 
 impl TuiApprover {
@@ -1971,6 +2014,15 @@ impl TuiApprover {
         Self {
             tx,
             always: std::sync::Mutex::new(std::collections::HashSet::new()),
+            recovery: false,
+        }
+    }
+
+    fn recovery(tx: mpsc::UnboundedSender<UiEvent>) -> Self {
+        Self {
+            tx,
+            always: std::sync::Mutex::new(std::collections::HashSet::new()),
+            recovery: true,
         }
     }
 
@@ -1991,7 +2043,7 @@ impl TuiApprover {
 #[async_trait::async_trait]
 impl Approver for TuiApprover {
     async fn approve(&self, request: &ApprovalRequest) -> ApprovalDecision {
-        if self.always_allowed(&request.tool) {
+        if !self.recovery && self.always_allowed(&request.tool) {
             return ApprovalDecision::AllowOnce;
         }
         let (reply, response) = oneshot::channel();
@@ -2000,12 +2052,17 @@ impl Approver for TuiApprover {
             .send(UiEvent::Approval {
                 request: request.clone(),
                 reply,
+                allow_always: !self.recovery,
+                recovery: self.recovery,
             })
             .is_err()
         {
             return ApprovalDecision::Deny;
         }
         let decision = response.await.unwrap_or(ApprovalDecision::Deny);
+        if self.recovery && decision == ApprovalDecision::AllowAlways {
+            return ApprovalDecision::AllowOnce;
+        }
         if decision == ApprovalDecision::AllowAlways {
             self.remember(&request.tool);
         }
@@ -2387,6 +2444,47 @@ mod tests {
         assert!(!approval_layout(Rect::new(0, 0, 120, 40), "bash", "cargo test").clipped);
         // A very narrow popup has too little room for the text: refuse.
         assert!(approval_layout(Rect::new(0, 0, 12, 20), "bash", "cargo test").clipped);
+    }
+
+    #[tokio::test]
+    async fn recovery_approver_never_remembers_mutating_tools() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let approver = Arc::new(TuiApprover::recovery(tx));
+        let request = ApprovalRequest::new("bash", "cargo test");
+
+        for response in [ApprovalDecision::AllowAlways, ApprovalDecision::Deny] {
+            let pending = {
+                let approver = approver.clone();
+                let request = request.clone();
+                tokio::spawn(async move { approver.approve(&request).await })
+            };
+            match rx.recv().await.expect("recovery approval prompt") {
+                UiEvent::Approval {
+                    reply,
+                    allow_always,
+                    recovery,
+                    ..
+                } => {
+                    assert!(!allow_always);
+                    assert!(recovery);
+                    let _ = reply.send(response);
+                }
+                _ => panic!("expected a recovery approval event"),
+            }
+            let expected = if response == ApprovalDecision::AllowAlways {
+                ApprovalDecision::AllowOnce
+            } else {
+                response
+            };
+            assert_eq!(pending.await.unwrap(), expected);
+        }
+
+        drop(rx);
+        assert_eq!(
+            approver.approve(&request).await,
+            ApprovalDecision::Deny,
+            "closed recovery prompt channel must fail closed"
+        );
     }
 
     #[tokio::test]
