@@ -104,7 +104,7 @@ impl Record {
     }
 }
 
-const RECOVERY_CHECKPOINT_VERSION: u32 = 1;
+const RECOVERY_CHECKPOINT_VERSION: u32 = 2;
 const MAX_RECOVERY_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 fn ensure_recovery_checkpoint_size(size: u64) -> Result<()> {
@@ -121,6 +121,8 @@ pub(crate) struct RecoveryCheckpoint {
     version: u32,
     session_id: String,
     turn: u64,
+    #[serde(default)]
+    transcript_bytes: Option<u64>,
     messages: Vec<Message>,
     phase_four_breaker: PhaseFourBreakerState,
 }
@@ -367,6 +369,38 @@ impl Session {
         Ok((turn, PhaseFourBreakerState::default()))
     }
 
+    fn append_records_unlocked(&self, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut file = open_append_existing_nofollow(&self.path)
+            .with_context(|| format!("failed to open session {}", self.path.display()))?;
+        let previous_len = file
+            .metadata()
+            .with_context(|| format!("failed to inspect session {}", self.path.display()))?
+            .len();
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
+        }
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            let write_error = anyhow::Error::new(error)
+                .context(format!("failed to adopt recovery state for {}", self.id()));
+            if let Err(rollback_error) = open_append_existing_nofollow(&self.path)
+                .and_then(|handle| handle.set_len(previous_len))
+                .and_then(|()| open_append_existing_nofollow(&self.path)?.sync_all())
+            {
+                return Err(write_error.context(format!(
+                    "also failed to roll back session {}: {rollback_error}",
+                    self.path.display()
+                )));
+            }
+            return Err(write_error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn persist_recovery_checkpoint(
         &self,
         messages: &[Message],
@@ -400,6 +434,17 @@ impl Session {
         if turn == 0 || turn != current_turn {
             bail!("recovery checkpoint turn {turn} does not match current turn {current_turn}");
         }
+        let transcript = open_append_existing_nofollow(&self.path)
+            .with_context(|| format!("failed to open session {}", self.path.display()))?;
+        transcript
+            .sync_all()
+            .with_context(|| format!("failed to sync session {}", self.path.display()))?;
+        let transcript_bytes = transcript
+            .metadata()
+            .with_context(|| format!("failed to inspect session {}", self.path.display()))?
+            .len();
+        sync_directory(self.path.parent().unwrap_or_else(|| Path::new(".")))
+            .with_context(|| format!("failed to sync session directory for {}", self.id()))?;
         ensure_private_directory(&self.archive_root).with_context(|| {
             format!(
                 "failed to prepare session archive {}",
@@ -410,6 +455,7 @@ impl Session {
             version: RECOVERY_CHECKPOINT_VERSION,
             session_id: self.id().to_string(),
             turn,
+            transcript_bytes: Some(transcript_bytes),
             messages: messages.to_vec(),
             phase_four_breaker: phase_four_breaker.clone(),
         };
@@ -438,6 +484,20 @@ impl Session {
     }
 
     fn load_recovery_checkpoint_unlocked(&self) -> Result<Option<RecoveryCheckpoint>> {
+        let checkpoint = self.read_recovery_checkpoint_unlocked()?;
+        if let Some(checkpoint) = &checkpoint {
+            let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
+            if checkpoint.turn != current_turn {
+                bail!(
+                    "recovery checkpoint {} is stale",
+                    self.recovery_checkpoint_path().display()
+                );
+            }
+        }
+        Ok(checkpoint)
+    }
+
+    fn read_recovery_checkpoint_unlocked(&self) -> Result<Option<RecoveryCheckpoint>> {
         let path = self.recovery_checkpoint_path();
         let file = match open_read_nofollow(&path) {
             Ok(file) => file,
@@ -449,18 +509,21 @@ impl Session {
         ensure_recovery_checkpoint_size(file.metadata()?.len())?;
         let checkpoint: RecoveryCheckpoint = serde_json::from_reader(file)
             .with_context(|| format!("failed to parse recovery checkpoint {}", path.display()))?;
-        let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
-        if checkpoint.version != RECOVERY_CHECKPOINT_VERSION
+        let supported_version = match checkpoint.version {
+            1 => checkpoint.transcript_bytes.is_none(),
+            RECOVERY_CHECKPOINT_VERSION => checkpoint.transcript_bytes.is_some(),
+            _ => false,
+        };
+        if !supported_version
             || checkpoint.session_id != self.id()
             || checkpoint.turn == 0
-            || checkpoint.turn != current_turn
             || checkpoint.messages.is_empty()
             || PhaseFourBreakerState::from_value(&serde_json::to_value(
                 &checkpoint.phase_four_breaker,
             )?)
             .is_none()
         {
-            bail!("recovery checkpoint {} is invalid or stale", path.display());
+            bail!("recovery checkpoint {} is invalid", path.display());
         }
         Ok(Some(checkpoint))
     }
@@ -501,9 +564,53 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
         let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let transcript_bytes = open_read_nofollow(&self.path)
+            .with_context(|| format!("failed to open session {}", self.path.display()))?
+            .metadata()
+            .with_context(|| format!("failed to inspect session {}", self.path.display()))?
+            .len();
+        if let Some(checkpoint) = self.read_recovery_checkpoint_unlocked()? {
+            if checkpoint.turn == loaded.user_turn_count()
+                && checkpoint.version == RECOVERY_CHECKPOINT_VERSION
+                && checkpoint.transcript_bytes == Some(transcript_bytes)
+            {
+                return self.adopt_recovery_checkpoint_unlocked(loaded, checkpoint);
+            }
+        }
         let messages = loaded.resumable_turn_messages()?;
         let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
         Ok((messages, turn, state))
+    }
+
+    fn adopt_recovery_checkpoint_unlocked(
+        &self,
+        mut loaded: LoadedSession,
+        checkpoint: RecoveryCheckpoint,
+    ) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
+        let recovery_messages = canonical_recovery_messages(&checkpoint.messages)?;
+        validate_recovery_provider_boundary(recovery_messages)?;
+        let durable_messages = loaded.messages();
+        let suffix = recovery_messages
+            .strip_prefix(durable_messages.as_slice())
+            .ok_or_else(|| {
+                anyhow::anyhow!("recovery checkpoint does not extend the durable transcript")
+            })?;
+        let records = suffix
+            .iter()
+            .map(|message| match message {
+                Message::Assistant { .. } | Message::Tool { .. } => {
+                    Record::from_message(message).context("recovery suffix is not persistable")
+                }
+                _ => bail!("recovery checkpoint suffix crosses a user-turn boundary"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        loaded.records.extend(records.iter().cloned());
+        if loaded.messages() != recovery_messages {
+            bail!("recovery checkpoint suffix does not reconstruct the saved model state");
+        }
+        let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
+        self.append_records_unlocked(&records)?;
+        Ok((checkpoint.messages, turn, state))
     }
 
     #[cfg(test)]
@@ -720,6 +827,58 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.meta.id
     }
+}
+
+fn canonical_recovery_messages(messages: &[Message]) -> Result<&[Message]> {
+    let messages = match messages.split_first() {
+        Some((Message::System { .. }, rest)) => rest,
+        Some(_) => messages,
+        None => bail!("recovery checkpoint has no messages"),
+    };
+    if messages
+        .iter()
+        .any(|message| matches!(message, Message::System { .. }))
+    {
+        bail!("recovery checkpoint has a misplaced system message");
+    }
+    Ok(messages)
+}
+
+fn validate_recovery_provider_boundary(messages: &[Message]) -> Result<()> {
+    let mut pending = std::collections::BTreeSet::new();
+    for message in messages {
+        match message {
+            Message::Assistant { message } if !message.tool_calls.is_empty() => {
+                if !pending.is_empty() {
+                    bail!("recovery checkpoint has overlapping tool-call groups");
+                }
+                for call in &message.tool_calls {
+                    if !pending.insert(call.id.as_str()) {
+                        bail!("recovery checkpoint has duplicate tool-call IDs");
+                    }
+                }
+            }
+            Message::Tool { call_id, .. } => {
+                if !pending.remove(call_id.as_str()) {
+                    bail!("recovery checkpoint has an orphan tool result");
+                }
+            }
+            _ if !pending.is_empty() => {
+                bail!("recovery checkpoint has an incomplete tool-call group");
+            }
+            _ => {}
+        }
+    }
+    if !pending.is_empty() {
+        bail!("recovery checkpoint has an incomplete tool-call group");
+    }
+    if matches!(
+        messages.last(),
+        Some(Message::Assistant { message }) if message.tool_calls.is_empty()
+    ) {
+        bail!("recovery checkpoint already contains a completed turn");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1280,6 +1439,123 @@ mod tests {
     }
 
     #[test]
+    fn recovery_checkpoint_equal_to_its_transcript_baseline_can_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("retry request"))
+            .unwrap();
+        let (breaker, admitted) = session
+            .enter_phase_four_round_if(1, -1, || true)
+            .unwrap()
+            .unwrap();
+        assert!(admitted);
+        let checkpoint_messages = vec![
+            Message::system("captured system"),
+            Message::user("retry request"),
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint_messages, 1, &breaker)
+            .unwrap();
+        let before = std::fs::read(&session.path).unwrap();
+
+        let (messages, turn, restored_breaker) = session.load_resumable_turn().unwrap();
+
+        assert_eq!(messages, checkpoint_messages);
+        assert_eq!(turn, 1);
+        assert_eq!(restored_breaker, breaker);
+        assert_eq!(std::fs::read(&session.path).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_checkpoint_atomically_adopts_a_complete_tool_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("inspect")).unwrap();
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            }],
+            responses_items: Vec::new(),
+        });
+        let tool = Message::tool("call_1", "read_file", "contents");
+        let checkpoint_messages = vec![
+            Message::system("captured system"),
+            Message::user("inspect"),
+            assistant.clone(),
+            tool.clone(),
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint_messages, 1, &PhaseFourBreakerState::default())
+            .unwrap();
+
+        let (messages, turn, _) = session.load_resumable_turn().unwrap();
+        assert_eq!(messages, checkpoint_messages);
+        assert_eq!(turn, 1);
+        assert_eq!(
+            store.load(session.id()).unwrap().messages(),
+            vec![Message::user("inspect"), assistant, tool,]
+        );
+        assert_eq!(
+            session.load_resumable_turn().unwrap().0,
+            vec![
+                Message::user("inspect"),
+                checkpoint_messages[2].clone(),
+                checkpoint_messages[3].clone(),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_or_divergent_recovery_checkpoint_is_not_adopted() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("original")).unwrap();
+        session
+            .persist_recovery_checkpoint(
+                &[Message::system("system"), Message::user("original")],
+                1,
+                &PhaseFourBreakerState::default(),
+            )
+            .unwrap();
+        let path = session.recovery_checkpoint_path();
+        let mut checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        checkpoint["messages"][1]["content"] = serde_json::json!("different");
+        replace_private_file(&path, &serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(session.load_resumable_turn().is_err());
+
+        checkpoint["messages"][1]["content"] = serde_json::json!("original");
+        checkpoint["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(Message::user("injected turn")).unwrap());
+        replace_private_file(&path, &serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(session.load_resumable_turn().is_err());
+        checkpoint["messages"].as_array_mut().unwrap().pop();
+
+        checkpoint["version"] = serde_json::json!(1);
+        checkpoint
+            .as_object_mut()
+            .unwrap()
+            .remove("transcript_bytes");
+        checkpoint["messages"][1]["content"] = serde_json::json!("original");
+        replace_private_file(&path, &serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(session.load_resumable_turn().is_err());
+        assert_eq!(
+            store.load(session.id()).unwrap().messages(),
+            vec![Message::user("original")]
+        );
+    }
+
+    #[test]
     fn recovery_checkpoint_rejects_stale_and_malformed_state() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_root(directory.path());
@@ -1294,6 +1570,21 @@ mod tests {
             .unwrap();
         session.append_message(&Message::user("second")).unwrap();
         assert!(session.load_recovery_checkpoint().is_err());
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_2".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            responses_items: Vec::new(),
+        });
+        session.append_message(&assistant).unwrap();
+        session
+            .append_message(&Message::tool("call_2", "read_file", "done"))
+            .unwrap();
+        assert_eq!(session.load_resumable_turn().unwrap().1, 2);
 
         replace_private_file(&session.recovery_checkpoint_path(), b"{truncated").unwrap();
         assert!(session.load_recovery_checkpoint().is_err());

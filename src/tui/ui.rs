@@ -1264,6 +1264,52 @@ mod tests {
     }
 
     #[test]
+    fn continue_turn_adopts_the_recovery_sidecar_for_a_user_only_tail() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        app.session
+            .append_message(&Message::user("interrupted request"))
+            .unwrap();
+        app.messages = app.session.load_messages().unwrap();
+        app.session
+            .persist_recovery_checkpoint(
+                &[
+                    Message::system("captured system"),
+                    Message::user("interrupted request"),
+                ],
+                1,
+                &Default::default(),
+            )
+            .unwrap();
+        let transcript = app.store.path(app.session.id());
+        let before = std::fs::read(&transcript).unwrap();
+        app.input = "/continue-turn".to_string();
+        app.cursor = app.input.len();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        let output = render(&mut app, 100, 24);
+
+        assert!(app.running);
+        assert_eq!(std::fs::read(&transcript).unwrap(), before);
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message, Message::User { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            output.contains("Continuing the current user turn"),
+            "{output}"
+        );
+        println!("AFTER (TUI recovery sidecar):\n{output}");
+        app.cancel();
+    }
+
+    #[test]
     fn continue_turn_failure_does_not_start_or_mutate_the_turn() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = test_app();
