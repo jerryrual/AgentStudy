@@ -520,7 +520,7 @@ mod tests {
     use anyhow::{bail, Result};
     use async_trait::async_trait;
     use serde_json::{json, Value};
-    use tokio::sync::{Barrier, Notify};
+    use tokio::sync::{oneshot, Barrier, Notify};
 
     use crate::config::ModelProfile;
     use crate::interaction::{AllowAll, NoAsker};
@@ -657,7 +657,7 @@ mod tests {
 
     type BlockedOneShotServer = (
         String,
-        std_mpsc::Receiver<()>,
+        oneshot::Receiver<()>,
         std_mpsc::Sender<()>,
         std::thread::JoinHandle<serde_json::Value>,
     );
@@ -665,12 +665,12 @@ mod tests {
     fn blocked_one_shot_model_server() -> BlockedOneShotServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (request_seen_tx, request_seen_rx) = std_mpsc::channel();
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_model_request(&mut stream);
-            request_seen_tx.send(()).unwrap();
+            let _ = request_seen_tx.send(());
             release_rx.recv().unwrap();
             request
         });
@@ -684,7 +684,7 @@ mod tests {
 
     type BlockedServer = (
         String,
-        std_mpsc::Receiver<()>,
+        oneshot::Receiver<()>,
         std_mpsc::Sender<()>,
         std::thread::JoinHandle<Vec<serde_json::Value>>,
     );
@@ -692,12 +692,12 @@ mod tests {
     fn blocked_two_shot_model_server() -> BlockedServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (first_seen_tx, first_seen_rx) = std_mpsc::channel();
+        let (first_seen_tx, first_seen_rx) = oneshot::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let handle = std::thread::spawn(move || {
             let (mut first_stream, _) = listener.accept().unwrap();
             let first = read_model_request(&mut first_stream);
-            first_seen_tx.send(()).unwrap();
+            let _ = first_seen_tx.send(());
             release_rx.recv().unwrap();
             write_model_response(&mut first_stream, "first answer");
 
@@ -821,7 +821,6 @@ mod tests {
         let sink = InjectionOrderSink::new(false);
         let (queue, source) = injection::channel();
         let mut messages = vec![Message::user("original request")];
-        let first_seen = tokio::task::spawn_blocking(move || first_seen.recv().unwrap());
         let mut run = Box::pin(agent.run_with_injections(&mut messages, &sink, &source));
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -927,7 +926,6 @@ mod tests {
         let sink = InjectionOrderSink::new(false);
         let (queue, source) = injection::channel();
         let mut messages = vec![Message::user("original request")];
-        let request_seen = tokio::task::spawn_blocking(move || request_seen.recv().unwrap());
         let mut run = Box::pin(agent.run_with_injections(&mut messages, &sink, &source));
 
         tokio::time::timeout(Duration::from_secs(2), async {
