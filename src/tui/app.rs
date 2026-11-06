@@ -143,6 +143,7 @@ pub struct App {
     pub follow: bool,
     pub scroll_back: u16,
     pub running: bool,
+    pub continue_available: bool,
     turn_id: u64,
     pub turn_started: Option<Instant>,
     pub elapsed: Duration,
@@ -175,25 +176,30 @@ impl App {
         let asker: Arc<dyn Asker> = Arc::new(TuiAsker {
             tx: events_tx.clone(),
         });
-        let (session, session_run_lease, messages, view) = match options.resume.as_deref() {
-            Some(id) => {
-                let lease = options.store.try_acquire_run_lease(id)?;
-                let loaded = options.store.load(id)?;
-                let messages = loaded.messages();
-                let view = view_from_records(&loaded.records);
-                let session = options.store.reopen(id)?;
-                (session, lease, messages, view)
-            }
-            None => {
-                let session = options.store.create(
-                    &options.cwd.display().to_string(),
-                    &options.profile.model,
-                    options.agent.as_str(),
-                )?;
-                let lease = options.store.try_acquire_run_lease(session.id())?;
-                (session, lease, Vec::new(), welcome())
-            }
-        };
+        let (session, session_run_lease, messages, mut view, opened_existing) =
+            match options.resume.as_deref() {
+                Some(id) => {
+                    let lease = options.store.try_acquire_run_lease(id)?;
+                    let loaded = options.store.load(id)?;
+                    let messages = loaded.messages();
+                    let view = view_from_records(&loaded.records);
+                    let session = options.store.reopen(id)?;
+                    (session, lease, messages, view, true)
+                }
+                None => {
+                    let session = options.store.create(
+                        &options.cwd.display().to_string(),
+                        &options.profile.model,
+                        options.agent.as_str(),
+                    )?;
+                    let lease = options.store.try_acquire_run_lease(session.id())?;
+                    (session, lease, Vec::new(), welcome(), false)
+                }
+            };
+        let continue_available = opened_existing && inspect_continue_available(&session, &mut view);
+        if continue_available {
+            view.push(continue_available_notice());
+        }
         Ok(Self {
             settings: options.settings,
             profile: options.profile,
@@ -214,6 +220,7 @@ impl App {
             follow: true,
             scroll_back: 0,
             running: false,
+            continue_available,
             turn_id: 0,
             turn_started: None,
             elapsed: Duration::default(),
@@ -479,6 +486,7 @@ impl App {
                         self.view.push(ViewItem::Error(error));
                     }
                 }
+                self.refresh_continue_available(false);
             }
             UiEvent::CompactionFinished { result, duration } => {
                 self.running = false;
@@ -623,6 +631,8 @@ impl App {
                     let answer = std::mem::take(&mut self.input);
                     self.cursor = 0;
                     self.answer_question(answer);
+                } else if !self.running && self.continue_available && self.input.trim().is_empty() {
+                    self.continue_turn();
                 } else if !self.running {
                     self.submit();
                 }
@@ -788,6 +798,14 @@ impl App {
 
     // ----- turn lifecycle -------------------------------------------------
 
+    fn refresh_continue_available(&mut self, announce: bool) {
+        let available = inspect_continue_available(&self.session, &mut self.view);
+        self.continue_available = available;
+        if announce && available {
+            self.view.push(continue_available_notice());
+        }
+    }
+
     fn reload_session_before_turn(&mut self) -> bool {
         if !self.requires_session_reload {
             return true;
@@ -866,6 +884,7 @@ impl App {
                 }
             }
         };
+        self.continue_available = false;
         let user = Message::user(message_text.clone());
         self.messages.push(user);
         let phase_four = match self
@@ -1009,6 +1028,7 @@ impl App {
                 ))),
             }
         }
+        self.refresh_continue_available(false);
         if let Some(Modal::Approval { reply, .. }) = self.modal.take() {
             let _ = reply.send(ApprovalDecision::Deny);
         }
@@ -1367,6 +1387,7 @@ impl App {
             }
         };
 
+        self.continue_available = false;
         self.messages = messages;
         self.reset_recorder();
         self.requires_session_reload = false;
@@ -1425,6 +1446,7 @@ impl App {
             "Resumed session {} ({}).",
             loaded.meta.id, loaded.meta.cwd
         )));
+        self.refresh_continue_available(true);
     }
 
     fn new_session(&mut self) {
@@ -1458,6 +1480,7 @@ impl App {
         self.reset_recorder();
         self.unsaved_messages = false;
         self.requires_session_reload = false;
+        self.continue_available = false;
         self.view
             .push(ViewItem::Info("Started a new session.".to_string()));
     }
@@ -1567,6 +1590,24 @@ fn wrapped_cell_lines(text: &str, width: usize) -> usize {
         total += rows;
     }
     total.max(1)
+}
+
+fn inspect_continue_available(session: &Session, view: &mut Vec<ViewItem>) -> bool {
+    match session.resumable_turn_available() {
+        Ok(available) => available,
+        Err(error) => {
+            view.push(ViewItem::Error(format!(
+                "cannot inspect interrupted turn: {error:#}"
+            )));
+            false
+        }
+    }
+}
+
+fn continue_available_notice() -> ViewItem {
+    ViewItem::Info(
+        "Interrupted turn available. Continuing keeps mutating tools denied.".to_string(),
+    )
 }
 
 fn welcome() -> Vec<ViewItem> {

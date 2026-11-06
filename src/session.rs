@@ -152,6 +152,13 @@ pub struct Session {
     append_lock: Arc<Mutex<()>>,
 }
 
+struct ResumableTurnPlan {
+    messages: Vec<Message>,
+    turn: u64,
+    breaker: PhaseFourBreakerState,
+    records: Vec<Record>,
+}
+
 impl Session {
     /// Directory sibling of the JSONL transcript used for derived archive files.
     pub fn archive_root(&self) -> &Path {
@@ -573,6 +580,18 @@ impl Session {
         self.archive_root.join("session.recovery.json")
     }
 
+    /// Check whether the current durable state can safely resume without adopting a sidecar.
+    pub(crate) fn resumable_turn_available(&self) -> Result<bool> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        Ok(self.prepare_resumable_turn_unlocked(loaded).is_ok())
+    }
+
+    /// Load the current resumable turn, atomically adopting a validated sidecar suffix if needed.
     pub(crate) fn load_resumable_turn(&self) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
         let _guard = self
             .append_lock
@@ -580,6 +599,12 @@ impl Session {
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
         let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let plan = self.prepare_resumable_turn_unlocked(loaded)?;
+        self.append_records_unlocked(&plan.records)?;
+        Ok((plan.messages, plan.turn, plan.breaker))
+    }
+
+    fn prepare_resumable_turn_unlocked(&self, loaded: LoadedSession) -> Result<ResumableTurnPlan> {
         let transcript_bytes = open_read_nofollow(&self.path)
             .with_context(|| format!("failed to open session {}", self.path.display()))?
             .metadata()
@@ -590,19 +615,24 @@ impl Session {
                 && checkpoint.version == RECOVERY_CHECKPOINT_VERSION
                 && checkpoint.transcript_bytes == Some(transcript_bytes)
             {
-                return self.adopt_recovery_checkpoint_unlocked(loaded, checkpoint);
+                return self.prepare_recovery_checkpoint_unlocked(loaded, checkpoint);
             }
         }
         let messages = loaded.resumable_turn_messages()?;
-        let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
-        Ok((messages, turn, state))
+        let (turn, breaker) = self.load_phase_four_breaker_from(&loaded)?;
+        Ok(ResumableTurnPlan {
+            messages,
+            turn,
+            breaker,
+            records: Vec::new(),
+        })
     }
 
-    fn adopt_recovery_checkpoint_unlocked(
+    fn prepare_recovery_checkpoint_unlocked(
         &self,
         mut loaded: LoadedSession,
         checkpoint: RecoveryCheckpoint,
-    ) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
+    ) -> Result<ResumableTurnPlan> {
         let shaped_messages = shape_recovery_messages(&checkpoint.messages)?;
         let recovery_messages = canonical_recovery_messages(&shaped_messages)?;
         validate_recovery_provider_boundary(recovery_messages)?;
@@ -625,9 +655,13 @@ impl Session {
         if loaded.messages() != recovery_messages {
             bail!("recovery checkpoint suffix does not reconstruct the saved model state");
         }
-        let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
-        self.append_records_unlocked(&records)?;
-        Ok((shaped_messages, turn, state))
+        let (turn, breaker) = self.load_phase_four_breaker_from(&loaded)?;
+        Ok(ResumableTurnPlan {
+            messages: shaped_messages,
+            turn,
+            breaker,
+            records,
+        })
     }
 
     pub(crate) fn load_phase_four_breaker(&self) -> Result<(u64, PhaseFourBreakerState)> {
@@ -1646,6 +1680,14 @@ mod tests {
             .persist_recovery_checkpoint(&checkpoint_messages, 1, &breaker)
             .unwrap();
         let before = std::fs::read(&session.path).unwrap();
+        let sidecar_before = std::fs::read(session.recovery_checkpoint_path()).unwrap();
+
+        assert!(session.resumable_turn_available().unwrap());
+        assert_eq!(std::fs::read(&session.path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(session.recovery_checkpoint_path()).unwrap(),
+            sidecar_before
+        );
 
         let (messages, turn, restored_breaker) = session.load_resumable_turn().unwrap();
 
@@ -1653,6 +1695,45 @@ mod tests {
         assert_eq!(turn, 1);
         assert_eq!(restored_breaker, breaker);
         assert_eq!(std::fs::read(&session.path).unwrap(), before);
+    }
+
+    #[test]
+    fn resumable_probe_tracks_durable_turn_boundaries_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("inspect")).unwrap();
+        assert!(!session.resumable_turn_available().unwrap());
+
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            }],
+            responses_items: Vec::new(),
+        });
+        let mut buffer = RecordBuffer::default();
+        buffer.record(&session, &assistant).unwrap();
+        buffer
+            .record(&session, &Message::tool("call_1", "read_file", "contents"))
+            .unwrap();
+        let resumable_bytes = std::fs::read(&session.path).unwrap();
+
+        assert!(session.resumable_turn_available().unwrap());
+        assert_eq!(std::fs::read(&session.path).unwrap(), resumable_bytes);
+
+        buffer
+            .record(
+                &session,
+                &Message::assistant(AssistantMessage::text("done")),
+            )
+            .unwrap();
+        let completed_bytes = std::fs::read(&session.path).unwrap();
+        assert!(!session.resumable_turn_available().unwrap());
+        assert_eq!(std::fs::read(&session.path).unwrap(), completed_bytes);
     }
 
     #[test]
