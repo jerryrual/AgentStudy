@@ -1519,7 +1519,7 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

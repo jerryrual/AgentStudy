@@ -411,7 +411,9 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 }
             }
             if !sink.has_unsaved_messages() {
-                session.clear_recovery_checkpoint()?;
+                if let Err(error) = session.clear_recovery_checkpoint() {
+                    eprintln!("warning: failed to clear recovery checkpoint: {error:#}");
+                }
             }
             if options.json {
                 let payload = json!({

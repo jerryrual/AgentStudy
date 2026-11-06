@@ -858,7 +858,8 @@ impl App {
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
         let (phase_four_turn, phase_four_state) = phase_four;
-        let persistence_gate = Arc::new(AtomicBool::new(!self.unsaved_messages));
+        let recovery_enabled = !self.unsaved_messages;
+        let persistence_gate = Arc::new(AtomicBool::new(recovery_enabled));
         self.persistence_gate = Some(persistence_gate.clone());
         let sink: Arc<dyn EventSink> = Arc::new(TuiSink {
             tx: tx.clone(),
@@ -866,6 +867,7 @@ impl App {
             session: self.session.clone(),
             recorder: self.recorder.clone(),
             persistence_gate,
+            recovery_enabled,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn,
@@ -1591,6 +1593,7 @@ struct TuiSink {
     session: Session,
     recorder: Arc<Mutex<RecordBuffer>>,
     persistence_gate: Arc<AtomicBool>,
+    recovery_enabled: bool,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
     phase_four_turn: u64,
@@ -1621,6 +1624,9 @@ impl EventSink for TuiSink {
     }
 
     fn persist_recovery_checkpoint(&self, messages: &[Message]) -> anyhow::Result<bool> {
+        if !self.recovery_enabled {
+            return Ok(false);
+        }
         if !self.persistence_gate.load(Ordering::SeqCst) {
             anyhow::bail!("turn was cancelled before the recovery checkpoint");
         }
@@ -1913,6 +1919,7 @@ mod tests {
             session: session.clone(),
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
+            recovery_enabled: true,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: turn,
@@ -1955,6 +1962,7 @@ mod tests {
             session: session.clone(),
             recorder: recorder.clone(),
             persistence_gate: Arc::new(AtomicBool::new(true)),
+            recovery_enabled: true,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2010,6 +2018,7 @@ mod tests {
             session: session.clone(),
             recorder: recorder.clone(),
             persistence_gate: gate.clone(),
+            recovery_enabled: true,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2114,6 +2123,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
+            recovery_enabled: false,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2122,6 +2132,9 @@ mod tests {
 
         assert!(!sink
             .persist_compression(&CompressionBatch::default())
+            .unwrap());
+        assert!(!sink
+            .persist_recovery_checkpoint(&[Message::user("unsaved")])
             .unwrap());
     }
 
@@ -2137,6 +2150,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: Arc::new(AtomicBool::new(false)),
+            recovery_enabled: true,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
@@ -2167,6 +2181,7 @@ mod tests {
             session,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             persistence_gate: gate.clone(),
+            recovery_enabled: true,
             archive_pointer: Mutex::new(None),
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
