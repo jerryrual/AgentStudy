@@ -68,6 +68,11 @@ impl PhaseFourBreakerState {
         self.tail_override = true;
         self.disabled = self.disabled || self.consecutive_no_progress >= 2;
     }
+
+    pub(crate) fn record_failure(&mut self, disable: bool) {
+        self.record_progress(false);
+        self.disabled = self.disabled || disable;
+    }
 }
 
 /// Serializes breaker transitions for one logical user turn.
@@ -108,6 +113,20 @@ impl PhaseFourBreaker {
             .lock()
             .map_err(|_| anyhow::anyhow!("Phase 4 breaker lock is poisoned"))?;
         let committed = persist(&current, meaningful)?
+            .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
+        *current = committed;
+        Ok(())
+    }
+
+    pub(crate) fn record_failure_and_persist<F>(&self, disable: bool, persist: F) -> Result<()>
+    where
+        F: FnOnce(&PhaseFourBreakerState, bool) -> Result<Option<PhaseFourBreakerState>>,
+    {
+        let mut current = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Phase 4 breaker lock is poisoned"))?;
+        let committed = persist(&current, disable)?
             .ok_or_else(|| anyhow::anyhow!("Phase 4 breaker checkpoint was declined"))?;
         *current = committed;
         Ok(())
@@ -167,6 +186,21 @@ mod tests {
         assert!(!spent.enter_round(100));
         assert!(spent.disabled);
         assert_eq!(spent.attempts, 0);
+    }
+
+    #[test]
+    fn failure_strikes_support_immediate_budget_disable() {
+        let mut generation = PhaseFourBreakerState::default();
+        generation.record_failure(false);
+        assert_eq!(generation.consecutive_no_progress, 1);
+        assert!(generation.tail_override);
+        assert!(!generation.disabled);
+
+        let mut budget = PhaseFourBreakerState::default();
+        budget.record_failure(true);
+        assert_eq!(budget.consecutive_no_progress, 1);
+        assert!(budget.tail_override);
+        assert!(budget.disabled);
     }
 
     #[test]

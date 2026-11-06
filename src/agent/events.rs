@@ -35,6 +35,11 @@ pub trait EventSink: Send + Sync {
         anyhow::bail!("Phase 4 progress persistence is unavailable")
     }
 
+    /// Durably record a failed Phase 4 attempt, optionally disabling immediately.
+    fn record_phase_four_failure(&self, _disable: bool) -> anyhow::Result<()> {
+        anyhow::bail!("Phase 4 failure persistence is unavailable")
+    }
+
     /// Charge one imminent Phase 4 provider attempt against this turn's input budget.
     fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
         true
@@ -113,5 +118,6 @@ mod tests {
     #[test]
     fn default_progress_checkpoint_fails_closed() {
         assert!(NullSink.record_phase_four_progress(true).is_err());
+        assert!(NullSink.record_phase_four_failure(false).is_err());
     }
 }

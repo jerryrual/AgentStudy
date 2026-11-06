@@ -206,6 +206,7 @@ pub struct RecordingSink {
     pub events: Mutex<Vec<String>>,
     pub projections: Mutex<Vec<icode::compaction::ContextProjection>>,
     pub progress: Mutex<Vec<bool>>,
+    pub failures: Mutex<Vec<bool>>,
 }
 
 impl RecordingSink {
@@ -219,6 +220,11 @@ impl RecordingSink {
 }
 
 impl icode::agent::EventSink for RecordingSink {
+    fn record_phase_four_failure(&self, disable: bool) -> anyhow::Result<()> {
+        self.failures.lock().unwrap().push(disable);
+        Ok(())
+    }
+
     fn record_phase_four_progress(&self, meaningful: bool) -> anyhow::Result<()> {
         self.progress.lock().unwrap().push(meaningful);
         Ok(())

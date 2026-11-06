@@ -72,12 +72,17 @@ struct PhaseFourSkipped {
 
 enum PhaseFourPrepareError {
     Skipped(PhaseFourSkipped),
+    SideCallBudget(PhaseFourSkipped),
     Fatal(anyhow::Error),
 }
 
 impl PhaseFourPrepareError {
     fn skipped(error: anyhow::Error, usage: Usage) -> Self {
         Self::Skipped(PhaseFourSkipped { error, usage })
+    }
+
+    fn side_call_budget(error: anyhow::Error, usage: Usage) -> Self {
+        Self::SideCallBudget(PhaseFourSkipped { error, usage })
     }
 }
 
@@ -211,7 +216,10 @@ impl ModelClient {
                         auxiliary_usage: phase_four_usage,
                     });
                 }
-                Err(PhaseFourPrepareError::Skipped(skipped)) => {
+                Err(
+                    PhaseFourPrepareError::Skipped(skipped)
+                    | PhaseFourPrepareError::SideCallBudget(skipped),
+                ) => {
                     auxiliary_usage.add(skipped.usage);
                     sink.info(&format!("Last Words skipped: {:#}", skipped.error));
                 }
@@ -260,7 +268,10 @@ impl ModelClient {
                                 auxiliary_usage,
                             });
                         }
-                        Err(PhaseFourPrepareError::Skipped(skipped)) => {
+                        Err(
+                            PhaseFourPrepareError::Skipped(skipped)
+                            | PhaseFourPrepareError::SideCallBudget(skipped),
+                        ) => {
                             auxiliary_usage.add(skipped.usage);
                             sink.info(&format!("Last Words skipped: {:#}", skipped.error));
                         }
@@ -335,9 +346,25 @@ impl ModelClient {
             .projected(messages)
             .map_err(PhaseFourPrepareError::Fatal)?;
         let prior_manifest = sink.current_turn_archive_manifest(file_read_available);
-        let generated = self
+        let generated = match self
             .generate_last_words(&historical, prior_manifest.as_deref(), sink)
-            .await?;
+            .await
+        {
+            Ok(generated) => generated,
+            Err(PhaseFourPrepareError::SideCallBudget(skipped)) => {
+                sink.record_phase_four_failure(true)
+                    .map_err(PhaseFourPrepareError::Fatal)?;
+                return Err(PhaseFourPrepareError::Skipped(skipped));
+            }
+            Err(PhaseFourPrepareError::Skipped(skipped)) => {
+                sink.record_phase_four_failure(false)
+                    .map_err(PhaseFourPrepareError::Fatal)?;
+                return Err(PhaseFourPrepareError::Skipped(skipped));
+            }
+            Err(PhaseFourPrepareError::Fatal(error)) => {
+                return Err(PhaseFourPrepareError::Fatal(error));
+            }
+        };
         let user = historical
             .iter()
             .rposition(|message| matches!(message, Message::User { .. }))
@@ -477,7 +504,7 @@ impl ModelClient {
                     .checkpoint_phase_four_side_call(estimate)
                     .map_err(ClientError::Fatal)?;
                 if !admitted {
-                    return Err(ClientError::Fatal(anyhow!(
+                    return Err(ClientError::SideCallBudget(anyhow!(
                         "Phase 4 side-call input-token budget exhausted for this turn"
                     )));
                 }
@@ -485,6 +512,7 @@ impl ModelClient {
             match self.send_once(body, sink).await {
                 Ok(completion) => return Ok(completion),
                 Err(error @ ClientError::ContextOverflow { .. }) => return Err(error),
+                Err(error @ ClientError::SideCallBudget(_)) => return Err(error),
                 Err(ClientError::Fatal(error)) => return Err(ClientError::Fatal(error)),
                 Err(ClientError::Retryable(error)) => {
                     last_error = Some(error);
@@ -719,7 +747,12 @@ impl ModelClient {
                     Some((usage_sink, estimated_input)),
                 )
                 .await
-                .map_err(|error| PhaseFourPrepareError::skipped(error.into_error(), usage))?;
+                .map_err(|error| match error {
+                    ClientError::SideCallBudget(error) => {
+                        PhaseFourPrepareError::side_call_budget(error, usage)
+                    }
+                    error => PhaseFourPrepareError::skipped(error.into_error(), usage),
+                })?;
             usage.add(completion.usage);
             usage_sink.usage(&completion.usage);
             match validate_last_words(messages, &completion) {
@@ -1283,15 +1316,17 @@ enum ClientError {
         error: anyhow::Error,
         named_limit: Option<u32>,
     },
+    SideCallBudget(anyhow::Error),
     Fatal(anyhow::Error),
 }
 
 impl ClientError {
     fn into_error(self) -> anyhow::Error {
         match self {
-            Self::Retryable(error) | Self::ContextOverflow { error, .. } | Self::Fatal(error) => {
-                error
-            }
+            Self::Retryable(error)
+            | Self::ContextOverflow { error, .. }
+            | Self::SideCallBudget(error)
+            | Self::Fatal(error) => error,
         }
     }
 }
