@@ -18,7 +18,7 @@ use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, ApprovalDecision, ApprovalRequest, Approver, Asker, DenyAll};
 use crate::model::{Message, ModelClient, Usage};
 use crate::phase4_breaker::{PhaseFourBreaker, PhaseFourBreakerState};
-use crate::session::{Record, RecordBuffer, Session, SessionStore};
+use crate::session::{Record, RecordBuffer, Session, SessionRunLease, SessionStore};
 use crate::theme::Theme;
 use crate::tools::{truncate_output, ToolRegistry};
 use crate::APP_NAME;
@@ -131,6 +131,7 @@ pub struct App {
     pub theme: Theme,
     pub store: SessionStore,
     pub session: Session,
+    session_run_lease: SessionRunLease,
     recorder: Arc<Mutex<RecordBuffer>>,
     pub(crate) unsaved_messages: bool,
     pub(crate) requires_session_reload: bool,
@@ -172,13 +173,14 @@ impl App {
         let asker: Arc<dyn Asker> = Arc::new(TuiAsker {
             tx: events_tx.clone(),
         });
-        let (session, messages, view) = match options.resume.as_deref() {
+        let (session, session_run_lease, messages, view) = match options.resume.as_deref() {
             Some(id) => {
+                let lease = options.store.try_acquire_run_lease(id)?;
                 let loaded = options.store.load(id)?;
                 let messages = loaded.messages();
                 let view = view_from_records(&loaded.records);
                 let session = options.store.reopen(id)?;
-                (session, messages, view)
+                (session, lease, messages, view)
             }
             None => {
                 let session = options.store.create(
@@ -186,7 +188,8 @@ impl App {
                     &options.profile.model,
                     options.agent.as_str(),
                 )?;
-                (session, Vec::new(), welcome())
+                let lease = options.store.try_acquire_run_lease(session.id())?;
+                (session, lease, Vec::new(), welcome())
             }
         };
         Ok(Self {
@@ -198,6 +201,7 @@ impl App {
             theme: options.theme,
             store: options.store,
             session,
+            session_run_lease,
             recorder: Arc::new(Mutex::new(RecordBuffer::default())),
             unsaved_messages: false,
             requires_session_reload: false,
@@ -1203,32 +1207,7 @@ impl App {
                     self.view
                         .push(ViewItem::Error("Usage: /resume <session-id>".to_string()));
                 } else {
-                    match self.store.load(argument) {
-                        Ok(loaded) => {
-                            self.messages = loaded.messages();
-                            self.view = view_from_records(&loaded.records);
-                            self.cwd = PathBuf::from(&loaded.meta.cwd);
-                            self.session = match self.store.reopen(argument) {
-                                Ok(session) => session,
-                                Err(error) => {
-                                    self.view.push(ViewItem::Error(format!(
-                                        "cannot resume session: {error:#}"
-                                    )));
-                                    return;
-                                }
-                            };
-                            self.reset_recorder();
-                            self.unsaved_messages = false;
-                            self.requires_session_reload = false;
-                            self.view.push(ViewItem::Info(format!(
-                                "Resumed session {} ({}).",
-                                loaded.meta.id, loaded.meta.cwd
-                            )));
-                        }
-                        Err(error) => self
-                            .view
-                            .push(ViewItem::Error(format!("cannot resume: {error:#}"))),
-                    }
+                    self.resume_session(argument);
                 }
             }
             "/cwd" => {
@@ -1260,24 +1239,83 @@ impl App {
         }
     }
 
+    fn resume_session(&mut self, id: &str) {
+        let replacement_lease = if id == self.session.id() {
+            None
+        } else {
+            match self.store.try_acquire_run_lease(id) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    self.view
+                        .push(ViewItem::Error(format!("cannot resume: {error:#}")));
+                    return;
+                }
+            }
+        };
+        let loaded = match self.store.load(id) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.view
+                    .push(ViewItem::Error(format!("cannot resume: {error:#}")));
+                return;
+            }
+        };
+        let session = match self.store.reopen(id) {
+            Ok(session) => session,
+            Err(error) => {
+                self.view
+                    .push(ViewItem::Error(format!("cannot resume session: {error:#}")));
+                return;
+            }
+        };
+
+        self.messages = loaded.messages();
+        self.view = view_from_records(&loaded.records);
+        self.cwd = PathBuf::from(&loaded.meta.cwd);
+        self.session = session;
+        if let Some(lease) = replacement_lease {
+            self.session_run_lease = lease;
+        }
+        self.reset_recorder();
+        self.unsaved_messages = false;
+        self.requires_session_reload = false;
+        self.view.push(ViewItem::Info(format!(
+            "Resumed session {} ({}).",
+            loaded.meta.id, loaded.meta.cwd
+        )));
+    }
+
     fn new_session(&mut self) {
-        self.messages.clear();
-        self.view = welcome();
-        match self.store.create(
+        let session = match self.store.create(
             &self.cwd.display().to_string(),
             &self.profile.model,
             self.agent_kind.as_str(),
         ) {
-            Ok(session) => {
-                self.session = session;
-                self.reset_recorder();
-                self.unsaved_messages = false;
-                self.requires_session_reload = false;
+            Ok(session) => session,
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "failed to create session: {error:#}"
+                )));
+                return;
             }
-            Err(error) => self.view.push(ViewItem::Error(format!(
-                "failed to create session: {error:#}"
-            ))),
-        }
+        };
+        let lease = match self.store.try_acquire_run_lease(session.id()) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "failed to lease new session: {error:#}"
+                )));
+                return;
+            }
+        };
+
+        self.session = session;
+        self.session_run_lease = lease;
+        self.messages.clear();
+        self.view = welcome();
+        self.reset_recorder();
+        self.unsaved_messages = false;
+        self.requires_session_reload = false;
         self.view
             .push(ViewItem::Info("Started a new session.".to_string()));
     }

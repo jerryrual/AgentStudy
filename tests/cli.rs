@@ -306,10 +306,7 @@ fn headless_run_lease_blocks_a_second_owner_before_provider_io() {
         .unwrap();
     assert!(!blocked.status.success());
     let stderr = String::from_utf8_lossy(&blocked.stderr);
-    assert!(
-        stderr.contains("active in another headless process"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("active in another process"), "{stderr}");
     assert_eq!(server.request_count(), 0);
     assert_eq!(
         std::fs::read_to_string(&transcript_path)

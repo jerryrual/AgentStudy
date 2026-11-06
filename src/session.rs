@@ -865,7 +865,7 @@ impl SessionStore {
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(SessionRunLease { _file: file }),
             Err(error) if is_lock_contended(&error) => {
-                anyhow::bail!("session {id} is active in another headless process")
+                anyhow::bail!("session {id} is active in another process")
             }
             Err(error) => Err(error)
                 .with_context(|| format!("failed to acquire session run lease {}", path.display())),
@@ -1152,9 +1152,7 @@ mod tests {
 
         let lease = store.try_acquire_run_lease(session.id()).unwrap();
         let error = other_store.try_acquire_run_lease(session.id()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("active in another headless process"));
+        assert!(error.to_string().contains("active in another process"));
         session
             .append_message(&Message::user("still writable"))
             .unwrap();
