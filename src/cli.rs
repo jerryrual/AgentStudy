@@ -62,6 +62,15 @@ pub enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Resume an interrupted user turn from a complete durable checkpoint.
+    ResumeTurn {
+        /// Emit one JSON object instead of streamed text.
+        #[arg(long)]
+        json: bool,
+        /// Session to resume; use global --continue for the latest session.
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// List the configured model profiles.
     Models,
 }
@@ -108,6 +117,32 @@ pub fn execute(cli: Cli) -> Result<()> {
     let store = SessionStore::open();
 
     match cli.command {
+        Some(Command::ResumeTurn { json, session }) => {
+            let session = match session {
+                Some(id) => id,
+                None if cli.continue_session => store
+                    .latest()
+                    .context("failed to find the latest session")?
+                    .context("no session is available to resume")?,
+                None => bail!("resume-turn requires --session <id> or --continue"),
+            };
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to start the async runtime")?;
+            runtime.block_on(run::execute(RunOptions {
+                settings,
+                profile,
+                agent,
+                cwd,
+                task: String::new(),
+                approval,
+                json,
+                session: Some(session),
+                resume_turn: true,
+                store,
+            }))
+        }
         Some(Command::Models) => run::list_models(&settings),
         Some(Command::Run {
             task,
@@ -134,6 +169,7 @@ pub fn execute(cli: Cli) -> Result<()> {
                 approval,
                 json,
                 session,
+                resume_turn: false,
                 store,
             }))
         }
