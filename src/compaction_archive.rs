@@ -1513,13 +1513,13 @@ fn safe_existing_directory(path: &Path) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1590,6 +1590,21 @@ pub(crate) fn open_append_private_nofollow(path: &Path) -> std::io::Result<File>
 }
 
 #[cfg(unix)]
+pub(crate) fn open_append_existing_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_append_existing_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).append(true).open(path)
+}
+
+#[cfg(unix)]
 pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -1641,7 +1656,7 @@ fn replace_path(temporary: &Path, destination: &Path) -> std::io::Result<()> {
     }
 }
 
-fn replace_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn replace_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("tmp");
     let _ = std::fs::remove_file(&temporary);
     let mut file = open_new_private(&temporary)?;

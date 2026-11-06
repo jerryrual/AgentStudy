@@ -908,6 +908,41 @@ mod tests {
     }
 
     #[test]
+    fn clean_turn_clears_recovery_but_failed_turn_preserves_it() {
+        use crate::agent::TurnResult;
+        use crate::phase4_breaker::PhaseFourBreakerState;
+        use crate::tui::app::UiEvent;
+
+        let mut app = test_app();
+        let user = Message::user("recover me");
+        app.session.append_message(&user).unwrap();
+        app.session
+            .persist_recovery_checkpoint(
+                std::slice::from_ref(&user),
+                1,
+                &PhaseFourBreakerState::default(),
+            )
+            .unwrap();
+        app.running = true;
+        app.push_event(UiEvent::TurnFinished(
+            Err("provider failed".to_string()),
+            vec![user.clone()],
+            false,
+        ));
+        app.pump();
+        assert!(app.session.load_recovery_checkpoint().unwrap().is_some());
+
+        app.running = true;
+        app.push_event(UiEvent::TurnFinished(
+            Ok(TurnResult::default()),
+            vec![user],
+            false,
+        ));
+        app.pump();
+        assert!(app.session.load_recovery_checkpoint().unwrap().is_none());
+    }
+
+    #[test]
     fn forced_compression_reloads_persisted_history_before_planning() {
         use crate::agent::TurnResult;
         use crate::compaction::plan_forced_compression;

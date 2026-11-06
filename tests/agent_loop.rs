@@ -12,6 +12,14 @@ use icode::interaction::{AllowAll, ApprovalDecision, DenyAll, NoAsker, ScriptedA
 use icode::model::{AssistantMessage, Message, ModelClient};
 use icode::tools::ToolRegistry;
 
+struct FailedRecoverySink;
+
+impl EventSink for FailedRecoverySink {
+    fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
+        anyhow::bail!("simulated recovery checkpoint failure")
+    }
+}
+
 struct FailedCheckpointSink {
     entries: AtomicUsize,
     checkpoints: AtomicUsize,
@@ -128,6 +136,29 @@ fn context_overflow_response() -> MockResponse {
         400,
         r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 140000 tokens."}}"#,
     )
+}
+
+#[tokio::test]
+async fn recovery_checkpoint_failure_prevents_provider_io() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("must not run"), &done_chunk("stop")])
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let agent = build_agent(&server, directory.path(), Arc::new(AllowAll));
+    let mut messages = vec![Message::user("do not send")];
+
+    let error = agent
+        .run(&mut messages, &FailedRecoverySink)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("simulated recovery checkpoint failure"),
+        "{error:#}"
+    );
+    assert_eq!(server.request_count(), 0);
 }
 
 #[tokio::test]
