@@ -94,7 +94,12 @@ async fn read_file_retrieves_an_archived_record_through_its_catalog() {
         .unwrap();
     let entry: Value = serde_json::from_str(catalog_line).unwrap();
     let relative_path = entry["relative_path"].as_str().unwrap();
-    let record_path = archive_root.join(relative_path);
+    let pointer_root = std::path::Path::new(catalog_path)
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+        .expect("catalog pointer uses the session archive layout");
+    let record_path = pointer_root.join(relative_path);
     let record = run(
         &registry,
         "read_file",
