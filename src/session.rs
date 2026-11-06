@@ -70,6 +70,11 @@ pub enum Record {
     ContextProjection {
         projection: ContextProjection,
     },
+    /// Legacy PR #25 checkpoint; new writes use the breaker sidecar.
+    PhaseFourBreaker {
+        turn: u64,
+        state: serde_json::Value,
+    },
 }
 
 impl Record {
@@ -123,8 +128,9 @@ impl Session {
     }
 
     fn lock_exclusive(&self) -> Result<std::fs::File> {
-        let lock_file = open_append_private_nofollow(&self.path)
-            .with_context(|| format!("failed to open session lock {}", self.path.display()))?;
+        let lock_path = self.path.with_extension("lock");
+        let lock_file = open_append_private_nofollow(&lock_path)
+            .with_context(|| format!("failed to open session lock {}", lock_path.display()))?;
         FileExt::lock_exclusive(&lock_file)
             .with_context(|| format!("failed to lock session {}", self.meta.id))?;
         Ok(lock_file)
@@ -339,7 +345,15 @@ impl Session {
     }
 
     fn load_phase_four_breaker_unlocked(&self) -> Result<(u64, PhaseFourBreakerState)> {
-        let turn = load_session_file(&self.path, &self.meta.id)?.user_turn_count();
+        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let turn = loaded.user_turn_count();
+        let legacy_state = loaded.records.iter().rev().find_map(|record| match record {
+            Record::PhaseFourBreaker {
+                turn: checkpoint_turn,
+                state,
+            } if *checkpoint_turn == turn => PhaseFourBreakerState::from_value(state),
+            _ => None,
+        });
         ensure_private_directory(&self.archive_root).with_context(|| {
             format!(
                 "failed to prepare session archive {}",
@@ -350,18 +364,26 @@ impl Session {
         let file = match open_read_nofollow(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((turn, PhaseFourBreakerState::default()));
+                return Ok((turn, legacy_state.unwrap_or_default()));
             }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("failed to open breaker state {}", path.display()));
             }
         };
-        let checkpoints = BufReader::new(file)
-            .lines()
-            .map_while(std::result::Result::ok)
-            .filter_map(|line| serde_json::from_str::<PhaseFourBreakerCheckpoint>(&line).ok())
-            .collect::<Vec<_>>();
+        let mut checkpoints = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line =
+                line.with_context(|| format!("failed to read breaker state {}", path.display()))?;
+            match serde_json::from_str::<PhaseFourBreakerCheckpoint>(&line) {
+                Ok(checkpoint) => checkpoints.push(checkpoint),
+                Err(_) => {
+                    serde_json::from_str::<serde_json::Value>(&line).with_context(|| {
+                        format!("invalid breaker state JSON {}", path.display())
+                    })?;
+                }
+            }
+        }
         let state = checkpoints
             .into_iter()
             .rev()
@@ -370,7 +392,7 @@ impl Session {
                     .then(|| PhaseFourBreakerState::from_value(&checkpoint.state))
                     .flatten()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| legacy_state.unwrap_or_default());
         Ok((turn, state))
     }
 
@@ -547,7 +569,7 @@ impl LoadedSession {
                         pending = candidate_pending;
                     }
                 }
-                Record::Meta { .. } | Record::Usage { .. } => {}
+                Record::Meta { .. } | Record::Usage { .. } | Record::PhaseFourBreaker { .. } => {}
             }
         }
         flush(&mut messages, &mut pending);
@@ -1738,6 +1760,12 @@ mod tests {
         );
         let transcript = std::fs::read_to_string(store.path(session.id())).unwrap();
         assert!(!transcript.contains("phase_four_breaker"));
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: first_turn,
+                state: serde_json::to_value(&proposed).unwrap(),
+            })
+            .unwrap();
         assert_eq!(store.load(session.id()).unwrap().messages().len(), 1);
 
         session
@@ -1771,6 +1799,57 @@ mod tests {
             (2, PhaseFourBreakerState::default())
         );
         assert_eq!(store.load(session.id()).unwrap().messages().len(), 2);
+    }
+
+    #[test]
+    fn phase_four_breaker_migrates_legacy_transcript_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let mut legacy = PhaseFourBreakerState::default();
+        legacy.side_call_tokens = 40;
+        session
+            .append(&Record::PhaseFourBreaker {
+                turn: 1,
+                state: serde_json::to_value(&legacy).unwrap(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            session.load_phase_four_breaker().unwrap(),
+            (1, legacy.clone())
+        );
+        let mut proposed = legacy.clone();
+        proposed.side_call_tokens = 50;
+        assert_eq!(
+            session
+                .append_phase_four_breaker_if(1, &legacy, &proposed, || true)
+                .unwrap(),
+            Some(proposed.clone())
+        );
+        assert_eq!(session.load_phase_four_breaker().unwrap(), (1, proposed));
+    }
+
+    #[test]
+    fn phase_four_breaker_rejects_corrupt_sidecar_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+        let previous = PhaseFourBreakerState::default();
+        let mut proposed = previous.clone();
+        proposed.side_call_tokens = 40;
+        session
+            .append_phase_four_breaker_if(1, &previous, &proposed, || true)
+            .unwrap();
+        let mut sidecar = open_append_private_nofollow(&session.phase_four_breaker_path()).unwrap();
+        sidecar.write_all(b"{broken\n").unwrap();
+
+        assert!(session.load_phase_four_breaker().is_err());
+        assert!(session
+            .append_phase_four_breaker_if(1, &proposed, &proposed, || true)
+            .is_err());
     }
 
     #[test]
