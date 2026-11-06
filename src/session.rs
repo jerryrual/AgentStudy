@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::{CompressionBatch, CompressionFold, ContextProjection};
 use crate::compaction_archive::{
-    ensure_private_directory, open_append_private_nofollow, open_read_nofollow, ArchiveStore,
-    ArchivedContextProjection,
+    ensure_private_directory, open_append_private_nofollow, open_read_nofollow,
+    replace_private_file, sync_directory, ArchiveStore, ArchivedContextProjection,
 };
 use crate::model::{AssistantMessage, Message, ToolCall};
 use crate::phase4_breaker::PhaseFourBreakerState;
@@ -101,6 +101,18 @@ impl Record {
             }),
         }
     }
+}
+
+const RECOVERY_CHECKPOINT_VERSION: u32 = 1;
+const MAX_RECOVERY_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RecoveryCheckpoint {
+    version: u32,
+    session_id: String,
+    turn: u64,
+    messages: Vec<Message>,
+    phase_four_breaker: PhaseFourBreakerState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +355,107 @@ impl Session {
         })?;
         let turn = load_session_file(&self.path, &self.meta.id)?.user_turn_count();
         Ok((turn, PhaseFourBreakerState::default()))
+    }
+
+    pub(crate) fn persist_recovery_checkpoint(
+        &self,
+        messages: &[Message],
+        turn: u64,
+        phase_four_breaker: &PhaseFourBreakerState,
+    ) -> Result<()> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
+        if turn == 0 || turn != current_turn {
+            bail!("recovery checkpoint turn {turn} does not match current turn {current_turn}");
+        }
+        ensure_private_directory(&self.archive_root).with_context(|| {
+            format!(
+                "failed to prepare session archive {}",
+                self.archive_root.display()
+            )
+        })?;
+        let checkpoint = RecoveryCheckpoint {
+            version: RECOVERY_CHECKPOINT_VERSION,
+            session_id: self.id().to_string(),
+            turn,
+            messages: messages.to_vec(),
+            phase_four_breaker: phase_four_breaker.clone(),
+        };
+        let payload = serde_json::to_vec(&checkpoint)?;
+        replace_private_file(&self.recovery_checkpoint_path(), &payload).with_context(|| {
+            format!(
+                "failed to persist recovery checkpoint {}",
+                self.recovery_checkpoint_path().display()
+            )
+        })?;
+        match self.load_recovery_checkpoint_unlocked()? {
+            Some(persisted) if persisted == checkpoint => Ok(()),
+            _ => bail!("recovery checkpoint read-back did not match the written snapshot"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_recovery_checkpoint(&self) -> Result<Option<RecoveryCheckpoint>> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        self.load_recovery_checkpoint_unlocked()
+    }
+
+    fn load_recovery_checkpoint_unlocked(&self) -> Result<Option<RecoveryCheckpoint>> {
+        let path = self.recovery_checkpoint_path();
+        let file = match open_read_nofollow(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to open {}", path.display()))
+            }
+        };
+        if file.metadata()?.len() > MAX_RECOVERY_CHECKPOINT_BYTES {
+            bail!("recovery checkpoint {} is too large", path.display());
+        }
+        let checkpoint: RecoveryCheckpoint = serde_json::from_reader(file)
+            .with_context(|| format!("failed to parse recovery checkpoint {}", path.display()))?;
+        let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
+        if checkpoint.version != RECOVERY_CHECKPOINT_VERSION
+            || checkpoint.session_id != self.id()
+            || checkpoint.turn == 0
+            || checkpoint.turn != current_turn
+            || checkpoint.messages.is_empty()
+            || PhaseFourBreakerState::from_value(&serde_json::to_value(
+                &checkpoint.phase_four_breaker,
+            )?)
+            .is_none()
+        {
+            bail!("recovery checkpoint {} is invalid or stale", path.display());
+        }
+        Ok(Some(checkpoint))
+    }
+
+    pub(crate) fn clear_recovery_checkpoint(&self) -> Result<()> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let path = self.recovery_checkpoint_path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_directory(&self.archive_root),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
+        }
+    }
+
+    fn recovery_checkpoint_path(&self) -> PathBuf {
+        self.archive_root.join("session.recovery.json")
     }
 
     pub(crate) fn load_resumable_turn(&self) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
@@ -1061,6 +1174,113 @@ mod tests {
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn recovery_checkpoint_round_trips_replaces_and_clears() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("continue work"))
+            .unwrap();
+        let first_messages = vec![Message::user("continue work")];
+        let mut first_breaker = PhaseFourBreakerState::default();
+        first_breaker.attempts = 1;
+        session
+            .persist_recovery_checkpoint(&first_messages, 1, &first_breaker)
+            .unwrap();
+        let first = session.load_recovery_checkpoint().unwrap().unwrap();
+        assert_eq!(first.messages, first_messages);
+        assert_eq!(first.phase_four_breaker, first_breaker);
+
+        let second_messages = vec![
+            Message::user("continue work"),
+            Message::assistant(AssistantMessage {
+                content: Some("newer snapshot".into()),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                responses_items: Vec::new(),
+            }),
+        ];
+        let mut second_breaker = first_breaker.clone();
+        second_breaker.attempts = 2;
+        session
+            .persist_recovery_checkpoint(&second_messages, 1, &second_breaker)
+            .unwrap();
+        let second = session.load_recovery_checkpoint().unwrap().unwrap();
+        assert_eq!(second.messages, second_messages);
+        assert_eq!(second.phase_four_breaker, second_breaker);
+        assert!(!session
+            .recovery_checkpoint_path()
+            .with_extension("tmp")
+            .exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(session.recovery_checkpoint_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        session.clear_recovery_checkpoint().unwrap();
+        assert!(session.load_recovery_checkpoint().unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_checkpoint_rejects_stale_and_malformed_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("first")).unwrap();
+        session
+            .persist_recovery_checkpoint(
+                &[Message::user("first")],
+                1,
+                &PhaseFourBreakerState::default(),
+            )
+            .unwrap();
+        session.append_message(&Message::user("second")).unwrap();
+        assert!(session.load_recovery_checkpoint().is_err());
+
+        replace_private_file(&session.recovery_checkpoint_path(), b"{truncated").unwrap();
+        assert!(session.load_recovery_checkpoint().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_checkpoint_does_not_follow_a_destination_symlink() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("work")).unwrap();
+        ensure_private_directory(&session.archive_root).unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::write(&outside, "sentinel").unwrap();
+        symlink(&outside, session.recovery_checkpoint_path()).unwrap();
+
+        session
+            .persist_recovery_checkpoint(
+                &[Message::user("work")],
+                1,
+                &PhaseFourBreakerState::default(),
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "sentinel");
+        assert!(
+            !std::fs::symlink_metadata(session.recovery_checkpoint_path())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

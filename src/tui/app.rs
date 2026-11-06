@@ -437,6 +437,13 @@ impl App {
                                 ))),
                             }
                         }
+                        if !self.unsaved_messages {
+                            if let Err(error) = self.session.clear_recovery_checkpoint() {
+                                self.view.push(ViewItem::Error(format!(
+                                    "failed to clear recovery checkpoint: {error:#}"
+                                )));
+                            }
+                        }
                         if turn.tool_calls > 0 {
                             self.view.push(ViewItem::Info(format!(
                                 "Done in {:.1}s · {} tool call(s) · {} model calls",
@@ -1611,6 +1618,19 @@ impl EventSink for TuiSink {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             CurrentTurnArchiveManifest::default();
+    }
+
+    fn persist_recovery_checkpoint(&self, messages: &[Message]) -> anyhow::Result<bool> {
+        if !self.persistence_gate.load(Ordering::SeqCst) {
+            anyhow::bail!("turn was cancelled before the recovery checkpoint");
+        }
+        let breaker = self.phase_four_breaker.snapshot()?;
+        self.session
+            .persist_recovery_checkpoint(messages, self.phase_four_turn, &breaker)?;
+        if !self.persistence_gate.load(Ordering::SeqCst) {
+            anyhow::bail!("turn was cancelled during the recovery checkpoint");
+        }
+        Ok(true)
     }
 
     fn enter_phase_four_round(&self) -> anyhow::Result<bool> {

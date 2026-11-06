@@ -25,6 +25,11 @@ pub trait EventSink: Send + Sync {
         None
     }
 
+    /// Durably snapshot the recoverable turn immediately before provider work.
+    fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Durably enter one Phase 4 recovery round before planning or provider work.
     fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
         Ok(true)

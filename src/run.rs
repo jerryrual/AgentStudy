@@ -81,6 +81,18 @@ impl EventSink for RunSink {
             CurrentTurnArchiveManifest::default();
     }
 
+    fn persist_recovery_checkpoint(&self, messages: &[Message]) -> anyhow::Result<bool> {
+        let breaker = self.phase_four_breaker.snapshot()?;
+        let recorded = self
+            .recorded
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
+        recorded
+            .session
+            .persist_recovery_checkpoint(messages, self.phase_four_turn, &breaker)?;
+        Ok(true)
+    }
+
     fn enter_phase_four_round(&self) -> anyhow::Result<bool> {
         let result = self.phase_four_breaker.enter_round_and_persist(|_, limit| {
             let recorded = self
@@ -397,6 +409,9 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                         }
                     }
                 }
+            }
+            if !sink.has_unsaved_messages() {
+                session.clear_recovery_checkpoint()?;
             }
             if options.json {
                 let payload = json!({

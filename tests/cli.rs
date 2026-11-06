@@ -73,7 +73,13 @@ fn run_json_returns_a_machine_readable_result() {
     assert_eq!(payload["tool_calls"], 0);
     assert_eq!(payload["rounds"], 1);
     assert!(payload["usage"]["total_tokens"].as_u64().unwrap() > 0);
-    assert!(!payload["session_id"].as_str().unwrap().is_empty());
+    let session_id = payload["session_id"].as_str().unwrap();
+    assert!(!session_id.is_empty());
+    assert!(!home
+        .path()
+        .join("sessions")
+        .join(format!("{session_id}/session.recovery.json"))
+        .exists());
 
     let sessions: Vec<_> = std::fs::read_dir(home.path().join("sessions"))
         .unwrap()
@@ -92,6 +98,47 @@ fn run_json_returns_a_machine_readable_result() {
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[1]["content"], "hello");
     assert!(!requests[0]["tools"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn failed_run_preserves_the_pre_provider_recovery_snapshot() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::json(
+            401,
+            r#"{"error":{"message":"simulated provider rejection"}}"#,
+        )
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args(["run", "recover me", "--cwd", work.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(server.request_count(), 1);
+    let transcript = std::fs::read_dir(home.path().join("sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .unwrap();
+    let id = transcript.file_stem().unwrap().to_str().unwrap();
+    let sidecar = home
+        .path()
+        .join("sessions")
+        .join(format!("{id}/session.recovery.json"));
+    let checkpoint: Value = serde_json::from_slice(&std::fs::read(sidecar).unwrap()).unwrap();
+    assert_eq!(checkpoint["version"], 1);
+    assert_eq!(checkpoint["session_id"], id);
+    assert_eq!(checkpoint["turn"], 1);
+    assert_eq!(checkpoint["messages"][1]["role"], "user");
+    assert_eq!(checkpoint["messages"][1]["content"], "recover me");
 }
 
 #[test]

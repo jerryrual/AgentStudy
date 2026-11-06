@@ -221,6 +221,7 @@ impl Agent {
             }
             rounds += 1;
 
+            sink.persist_recovery_checkpoint(messages)?;
             let persistent = self
                 .client
                 .complete_persistent(messages, &self.visible_specs(), sink)

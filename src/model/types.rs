@@ -63,7 +63,8 @@ impl AssistantMessage {
 }
 
 /// A message in the model conversation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     System {
         content: String,

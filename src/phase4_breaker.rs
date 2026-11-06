@@ -90,6 +90,13 @@ impl PhaseFourBreaker {
         }
     }
 
+    pub(crate) fn snapshot(&self) -> Result<PhaseFourBreakerState> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| anyhow::anyhow!("Phase 4 breaker lock is poisoned"))
+    }
+
     pub(crate) fn enter_round_and_persist<F>(&self, persist: F) -> Result<bool>
     where
         F: FnOnce(&PhaseFourBreakerState, i64) -> Result<Option<(PhaseFourBreakerState, bool)>>,
