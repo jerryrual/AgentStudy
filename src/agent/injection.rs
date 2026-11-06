@@ -142,8 +142,8 @@ impl InjectionSource {
     /// Reserve the pending message for the next provider request.
     ///
     /// Dropping the reservation rolls it back into the slot. Call `commit`
-    /// only once the caller has incorporated the message into its request
-    /// boundary and recovery state.
+    /// after the transcript sink accepts the message; the agent crosses its
+    /// strict recovery barrier immediately afterward.
     pub(crate) fn reserve(&self) -> Option<InjectionReservation> {
         let mut state = self.inner.lock();
         let message = match std::mem::replace(&mut state.slot, Slot::Reserved) {
@@ -171,6 +171,22 @@ impl InjectionSource {
         }
         state.accepting = false;
         true
+    }
+
+    pub(crate) fn seal_on_drop(&self) -> SealOnDrop<'_> {
+        SealOnDrop(self)
+    }
+
+    fn seal(&self) {
+        self.inner.lock().accepting = false;
+    }
+}
+
+pub(crate) struct SealOnDrop<'a>(&'a InjectionSource);
+
+impl Drop for SealOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.seal();
     }
 }
 
@@ -330,6 +346,24 @@ mod tests {
             "already accepted",
         );
         assert!(source.try_finish());
+    }
+
+    #[test]
+    fn dropping_the_source_guard_seals_admission_and_preserves_pending_input() {
+        let (queue, source) = channel();
+        queue.enqueue("inject-1", "already accepted").unwrap();
+
+        drop(source.seal_on_drop());
+
+        assert!(matches!(
+            queue.enqueue("inject-2", "too late"),
+            Err(EnqueueError::Closed(_))
+        ));
+        assert_injection(
+            source.reserve().unwrap().message(),
+            "inject-1",
+            "already accepted",
+        );
     }
 
     #[test]

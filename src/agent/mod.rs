@@ -212,6 +212,7 @@ impl Agent {
         sink: &dyn EventSink,
         injections: &injection::InjectionSource,
     ) -> Result<TurnResult> {
+        let _seal_injections = injections.seal_on_drop();
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut tool_calls = 0usize;
@@ -868,6 +869,15 @@ mod tests {
         assert_eq!(*sink.order.lock().unwrap(), ["injection"]);
         assert!(!messages.iter().any(
             |message| matches!(message, Message::InjectedUser { injection_id, .. } if injection_id == "inject-1")
+        ));
+        let rejected = queue
+            .enqueue("inject-late", "must be retained by the caller")
+            .expect_err("an exited run must seal its injection source");
+        assert!(matches!(rejected, injection::EnqueueError::Closed(_)));
+        assert!(matches!(
+            rejected.into_message(),
+            Message::InjectedUser { injection_id, content }
+                if injection_id == "inject-late" && content == "must be retained by the caller"
         ));
         let reservation = source.reserve().expect("failed persistence must roll back");
         assert!(matches!(
