@@ -655,6 +655,33 @@ mod tests {
         (format!("http://{address}/v1"), handle)
     }
 
+    type BlockedOneShotServer = (
+        String,
+        std_mpsc::Receiver<()>,
+        std_mpsc::Sender<()>,
+        std::thread::JoinHandle<serde_json::Value>,
+    );
+
+    fn blocked_one_shot_model_server() -> BlockedOneShotServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_seen_tx, request_seen_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_model_request(&mut stream);
+            request_seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            request
+        });
+        (
+            format!("http://{address}/v1"),
+            request_seen_rx,
+            release_tx,
+            handle,
+        )
+    }
+
     type BlockedServer = (
         String,
         std_mpsc::Receiver<()>,
@@ -891,6 +918,53 @@ mod tests {
             listener.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_in_flight_run_seals_admission_and_preserves_pending_input() {
+        let (base_url, request_seen, release_request, server) = blocked_one_shot_model_server();
+        let agent = injection_test_agent(base_url);
+        let sink = InjectionOrderSink::new(false);
+        let (queue, source) = injection::channel();
+        let mut messages = vec![Message::user("original request")];
+        let request_seen = tokio::task::spawn_blocking(move || request_seen.recv().unwrap());
+        let mut run = Box::pin(agent.run_with_injections(&mut messages, &sink, &source));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                observed = request_seen => observed.unwrap(),
+                result = &mut run => panic!("turn finished before cancellation: {result:?}"),
+            }
+        })
+        .await
+        .expect("the provider request was not observed");
+        queue
+            .enqueue("inject-pending", "retain after cancel")
+            .unwrap();
+
+        drop(run);
+
+        let rejected = queue
+            .enqueue("inject-late", "too late")
+            .expect_err("dropping the run must seal admission");
+        assert!(matches!(rejected, injection::EnqueueError::Closed(_)));
+        assert!(matches!(
+            rejected.into_message(),
+            Message::InjectedUser { injection_id, content }
+                if injection_id == "inject-late" && content == "too late"
+        ));
+        let reservation = source
+            .reserve()
+            .expect("accepted input must remain pending");
+        assert!(matches!(
+            reservation.message(),
+            Message::InjectedUser { injection_id, content }
+                if injection_id == "inject-pending" && content == "retain after cancel"
+        ));
+        drop(reservation);
+
+        release_request.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[tokio::test]
