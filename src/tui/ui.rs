@@ -431,6 +431,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         ("/models, /model <name>", "list or switch model profiles"),
         ("/approval ask|auto|deny", "change the approval mode"),
         ("/sessions, /resume <id>", "list or resume sessions"),
+        ("/continue-turn", "continue a durable interrupted turn"),
         ("/compact", "summarize the conversation to free context"),
         ("/cwd <path>", "change the working directory"),
         ("!<command>", "run a shell command"),
@@ -460,7 +461,8 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
         "  Esc closes this panel.",
         Style::default().fg(app.theme.dim),
     )));
-    let popup = centered(area, 70, 17);
+    let height = (lines.len() as u16 + 2).min(area.height.max(1));
+    let popup = centered(area, 70, height);
     frame.render_widget(Clear, popup);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -484,7 +486,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentKind;
     use crate::config::{ApprovalMode, ModelProfile, Settings};
-    use crate::model::Message;
+    use crate::model::{AssistantMessage, Message, ToolCall};
     use crate::session::SessionStore;
     use crate::tui::app::{App, AppOptions};
     use ratatui::backend::TestBackend;
@@ -535,6 +537,41 @@ mod tests {
             output.push('\n');
         }
         output
+    }
+
+    fn make_resumable_checkpoint(app: &mut App) {
+        app.session
+            .append_message(&Message::user("continue work"))
+            .unwrap();
+        app.session
+            .append_message(&Message::assistant(AssistantMessage {
+                content: None,
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"a.txt\"}".to_string(),
+                }],
+                responses_items: Vec::new(),
+            }))
+            .unwrap();
+        app.session
+            .append_message(&Message::tool("call_1", "read_file", "durable result"))
+            .unwrap();
+        app.session
+            .enter_phase_four_round_if(1, -1, || true)
+            .unwrap()
+            .unwrap();
+        app.messages = app.session.load_messages().unwrap();
+        app.view.push(ViewItem::User("continue work".to_string()));
+        app.view.push(ViewItem::Tool {
+            name: "read_file".to_string(),
+            summary: "read_file a.txt".to_string(),
+            status: ToolStatus::Done,
+            output: "durable result".to_string(),
+            ok: Some(true),
+            duration: Some(std::time::Duration::default()),
+        });
     }
 
     #[test]
@@ -951,12 +988,13 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_compaction_without_clipping_the_close_hint() {
+    fn help_lists_recovery_and_compaction_without_clipping_the_close_hint() {
         let mut app = test_app();
         app.modal = Some(Modal::Help);
 
         let output = render(&mut app, 100, 24);
 
+        assert!(output.contains("/continue-turn"), "{output}");
         assert!(output.contains("/compact"), "{output}");
         assert!(output.contains("Esc closes this panel."), "{output}");
     }
@@ -1152,6 +1190,69 @@ mod tests {
                 .replace(&target_id, "<TARGET_SESSION>")
                 .replace(&current_id, "<CURRENT_SESSION>")
         );
+    }
+
+    #[test]
+    fn continue_turn_reuses_the_durable_user_and_breaker() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        make_resumable_checkpoint(&mut app);
+        let transcript = app.store.path(app.session.id());
+        let before = std::fs::read(&transcript).unwrap();
+        app.input = "/continue-turn".to_string();
+        app.cursor = app.input.len();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        let output = render(&mut app, 100, 24);
+
+        assert!(app.running);
+        assert_eq!(app.approval_mode, ApprovalMode::Ask);
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message, Message::User { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read(&transcript).unwrap(), before);
+        assert!(
+            output.contains("Continuing the current user turn"),
+            "{output}"
+        );
+        assert!(!output.contains("Unknown command"), "{output}");
+        assert!(!output.contains("❯ /continue-turn"), "{output}");
+        println!("AFTER (TUI continue-turn):\n{output}");
+        app.cancel();
+    }
+
+    #[test]
+    fn continue_turn_failure_does_not_start_or_mutate_the_turn() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        app.session
+            .append_message(&Message::user("ambiguous work"))
+            .unwrap();
+        app.messages = app.session.load_messages().unwrap();
+        let transcript = app.store.path(app.session.id());
+        let before = std::fs::read(&transcript).unwrap();
+        app.input = "/continue-turn".to_string();
+        app.cursor = app.input.len();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+
+        assert!(!app.running);
+        assert_eq!(std::fs::read(&transcript).unwrap(), before);
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Error(message))
+                if message.contains("no complete tool or Last Words checkpoint")
+        ));
     }
 
     #[test]
