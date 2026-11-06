@@ -1524,7 +1524,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn ensure_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match std::fs::symlink_metadata(path) {
         Ok(_) if safe_existing_directory(path)? => return Ok(()),
@@ -1542,7 +1542,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) if safe_existing_directory(path)? => return Ok(()),
         Ok(_) => bail!("unsafe archive directory {}", path.display()),
@@ -1569,7 +1569,7 @@ fn open_new_private(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
         .read(true)
@@ -1581,7 +1581,7 @@ fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .read(true)
         .append(true)
@@ -1590,7 +1590,7 @@ fn open_append_private_nofollow(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
         .read(true)
@@ -1599,7 +1599,7 @@ fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().read(true).open(path)
 }
 

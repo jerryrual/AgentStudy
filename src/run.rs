@@ -80,17 +80,20 @@ impl EventSink for RunSink {
     }
 
     fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
-        let result = self
-            .phase_four_breaker
-            .charge_and_persist(estimated_input, |state| {
-                let recorded = self
-                    .recorded
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
-                recorded
-                    .session
-                    .append_phase_four_breaker_if(self.phase_four_turn, state, || true)
-            });
+        let result =
+            self.phase_four_breaker
+                .charge_and_persist(estimated_input, |previous, proposed| {
+                    let recorded = self
+                        .recorded
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
+                    recorded.session.append_phase_four_breaker_if(
+                        self.phase_four_turn,
+                        previous,
+                        proposed,
+                        || true,
+                    )
+                });
         if result.is_err() {
             self.save_failed.store(true, Ordering::Relaxed);
         }
@@ -247,8 +250,8 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         anyhow::bail!("the task prompt must not be empty");
     }
     messages.push(Message::user(task.clone()));
-    session.append(&Record::User { text: task.clone() })?;
-    let (phase_four_turn, phase_four_state) = session.load_phase_four_breaker()?;
+    let (phase_four_turn, phase_four_state) =
+        session.append_user_and_load_phase_four_breaker(&task)?;
 
     let approver: std::sync::Arc<dyn Approver> = match options.approval {
         ApprovalMode::Deny => std::sync::Arc::new(DenyAll),
@@ -440,12 +443,9 @@ mod tests {
         let (_, restored) = session.load_phase_four_breaker().unwrap();
         assert_eq!(restored.side_call_tokens, 100);
         assert_eq!(
-            store
-                .load(session.id())
+            std::fs::read_to_string(session.phase_four_breaker_path())
                 .unwrap()
-                .records
-                .iter()
-                .filter(|record| matches!(record, Record::PhaseFourBreaker { .. }))
+                .lines()
                 .count(),
             2
         );
