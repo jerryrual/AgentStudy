@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::injection::{self, InjectionQueue};
+use crate::agent::injection::{self, EnqueueError, InjectionQueue};
 use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{Compaction, CompressionBatch, ContextProjection};
 use crate::compaction_archive::{ArchivedContextProjection, CurrentTurnArchiveManifest};
@@ -132,6 +132,12 @@ pub struct AppOptions {
     pub approval: ApprovalMode,
 }
 
+#[derive(Debug, Clone)]
+struct PendingInjection {
+    id: String,
+    raw: String,
+}
+
 pub struct App {
     pub settings: Settings,
     pub profile: ModelProfile,
@@ -168,6 +174,9 @@ pub struct App {
     events_tx: mpsc::UnboundedSender<UiEvent>,
     cancel_handle: Option<tokio::task::JoinHandle<()>>,
     injection_queue: Option<InjectionQueue>,
+    pending_injection: Option<PendingInjection>,
+    deferred_submission: bool,
+    next_injection_id: u64,
     persistence_gate: Option<Arc<AtomicBool>>,
     recovery_writer: Option<RecoveryCheckpointWriter>,
     pub approver: Arc<dyn Approver>,
@@ -251,6 +260,9 @@ impl App {
             events_tx,
             cancel_handle: None,
             injection_queue: None,
+            pending_injection: None,
+            deferred_submission: false,
+            next_injection_id: 0,
             persistence_gate: None,
             recovery_writer: None,
             approver,
@@ -402,6 +414,28 @@ impl App {
                     .map_err(|error| format!("failed to save injected user message: {error:#}"));
                 if result.is_err() {
                     self.unsaved_messages = true;
+                } else if let Message::InjectedUser {
+                    injection_id,
+                    content,
+                } = &message
+                {
+                    let matching = self
+                        .pending_injection
+                        .as_ref()
+                        .is_some_and(|pending| pending.id == *injection_id);
+                    let display = if matching {
+                        self.pending_injection
+                            .take()
+                            .map(|pending| pending.raw)
+                            .unwrap_or_else(|| content.clone())
+                    } else {
+                        content.clone()
+                    };
+                    self.view.push(ViewItem::User(display));
+                    if matching && self.pending_ask.is_none() {
+                        self.input.clear();
+                        self.cursor = 0;
+                    }
                 }
                 let _ = reply.send(result);
             }
@@ -437,6 +471,10 @@ impl App {
             }
             UiEvent::Ask { question, reply } => {
                 self.pending_ask = Some(reply);
+                if self.pending_injection.is_some() {
+                    self.input.clear();
+                    self.cursor = 0;
+                }
                 self.view
                     .push(ViewItem::Info(format!("The assistant asks: {question}")));
                 self.view.push(ViewItem::Info(
@@ -445,6 +483,13 @@ impl App {
             }
             UiEvent::TurnFinished(result, messages, force_compression) => {
                 self.injection_queue = None;
+                if let Some(pending) = self.pending_injection.take() {
+                    if self.pending_ask.is_none() {
+                        self.input = pending.raw;
+                        self.cursor = self.char_len();
+                    }
+                }
+                let submit_deferred = std::mem::take(&mut self.deferred_submission);
                 let mut recovery_writer = self.recovery_writer.take();
                 self.persistence_gate = None;
                 self.messages = messages;
@@ -524,6 +569,9 @@ impl App {
                     }
                 }
                 self.refresh_continue_available(false);
+                if submit_deferred {
+                    self.submit();
+                }
             }
             UiEvent::CompactionFinished { result, duration } => {
                 self.running = false;
@@ -627,6 +675,60 @@ impl App {
 
     // ----- input handling -------------------------------------------------
 
+    fn injection_editor_locked(&self) -> bool {
+        self.pending_ask.is_none() && (self.pending_injection.is_some() || self.deferred_submission)
+    }
+
+    fn queue_injection(&mut self) {
+        let raw = self.input.trim().to_string();
+        if raw.is_empty() || self.pending_injection.is_some() || self.deferred_submission {
+            return;
+        }
+        let Some(queue) = self.injection_queue.clone() else {
+            return;
+        };
+        self.next_injection_id = self.next_injection_id.wrapping_add(1);
+        let id = format!(
+            "{}-{}-{}",
+            self.session.id(),
+            self.turn_id,
+            self.next_injection_id
+        );
+        let content = self.expand_mentions(&raw);
+        match queue.enqueue(id.clone(), content) {
+            Ok(()) => {
+                self.history.push(raw.clone());
+                self.history_index = None;
+                self.pending_injection = Some(PendingInjection { id, raw });
+            }
+            Err(EnqueueError::Closed(_)) => {
+                self.deferred_submission = true;
+            }
+            Err(EnqueueError::Full(_)) => self.view.push(ViewItem::Error(
+                "Another injected message is already pending.".to_string(),
+            )),
+        }
+    }
+
+    fn withdraw_pending_injection(&mut self) -> bool {
+        if self.deferred_submission {
+            self.deferred_submission = false;
+            return true;
+        }
+        let Some(pending) = self.pending_injection.as_ref() else {
+            return false;
+        };
+        let cancelled = self
+            .injection_queue
+            .as_ref()
+            .and_then(|queue| queue.cancel(&pending.id));
+        if cancelled.is_some() {
+            self.pending_injection = None;
+            return true;
+        }
+        false
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, screen: Rect) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -656,6 +758,8 @@ impl App {
             KeyCode::Esc => {
                 if self.pending_ask.is_some() {
                     self.answer_question(String::new());
+                } else if self.withdraw_pending_injection() {
+                    // The first Escape only withdraws queued input.
                 } else if self.running {
                     self.cancel();
                 } else {
@@ -668,25 +772,44 @@ impl App {
                     let answer = std::mem::take(&mut self.input);
                     self.cursor = 0;
                     self.answer_question(answer);
-                } else if !self.running && self.continue_available && self.input.trim().is_empty() {
+                } else if self.running {
+                    let trimmed = self.input.trim_start();
+                    if !self.injection_editor_locked()
+                        && (trimmed.starts_with('/') || trimmed.starts_with('!'))
+                    {
+                        self.submit();
+                    } else if !self.injection_editor_locked()
+                        && self.injection_queue.is_none()
+                        && !trimmed.is_empty()
+                    {
+                        self.view.push(ViewItem::Info(
+                            "A turn is already running; wait for it or press Esc to cancel."
+                                .to_string(),
+                        ));
+                    } else {
+                        self.queue_injection();
+                    }
+                } else if self.continue_available && self.input.trim().is_empty() {
                     self.continue_turn();
-                } else if !self.running {
+                } else {
                     self.submit();
                 }
             }
-            KeyCode::Char(character) => {
+            KeyCode::Char(character) if !self.injection_editor_locked() => {
                 self.insert_char(character);
             }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => {
+            KeyCode::Backspace if !self.injection_editor_locked() => self.backspace(),
+            KeyCode::Delete if !self.injection_editor_locked() => self.delete(),
+            KeyCode::Left if !self.injection_editor_locked() => {
+                self.cursor = self.cursor.saturating_sub(1)
+            }
+            KeyCode::Right if !self.injection_editor_locked() => {
                 self.cursor = (self.cursor + 1).min(self.char_len());
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.char_len(),
-            KeyCode::Up => self.history_previous(),
-            KeyCode::Down => self.history_next(),
+            KeyCode::Home if !self.injection_editor_locked() => self.cursor = 0,
+            KeyCode::End if !self.injection_editor_locked() => self.cursor = self.char_len(),
+            KeyCode::Up if !self.injection_editor_locked() => self.history_previous(),
+            KeyCode::Down if !self.injection_editor_locked() => self.history_next(),
             KeyCode::PageUp => {
                 self.scroll_back = self.scroll_back.saturating_add(10);
                 self.follow = false;
@@ -697,7 +820,7 @@ impl App {
                     self.follow = true;
                 }
             }
-            KeyCode::Tab => self.complete_command(),
+            KeyCode::Tab if !self.injection_editor_locked() => self.complete_command(),
             _ => {}
         }
     }
@@ -1061,6 +1184,14 @@ impl App {
         if !self.running {
             return;
         }
+        if self.pending_ask.is_some() {
+            if let Some(pending) = self.pending_injection.as_ref() {
+                self.input = pending.raw.clone();
+                self.cursor = self.char_len();
+            }
+        }
+        self.pending_injection = None;
+        self.deferred_submission = false;
         let preserve = self
             .recovery_writer
             .as_ref()
@@ -1129,6 +1260,13 @@ impl App {
     fn answer_question(&mut self, answer: String) {
         if let Some(reply) = self.pending_ask.take() {
             let _ = reply.send(answer);
+        }
+        if let Some(pending) = self.pending_injection.as_ref() {
+            self.input = pending.raw.clone();
+            self.cursor = self.char_len();
+        } else {
+            self.input.clear();
+            self.cursor = 0;
         }
     }
 
@@ -1597,6 +1735,9 @@ impl App {
         }
         if self.running {
             status.push_str("· working ");
+            if self.pending_injection.is_some() || self.deferred_submission {
+                status.push_str("· queued ");
+            }
         } else if self.elapsed > Duration::ZERO {
             status.push_str(&format!("· {:.1}s ", self.elapsed.as_secs_f64()));
         }
@@ -2171,6 +2312,237 @@ impl Asker for TuiAsker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn injection_input_test_app() -> App {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_path_buf();
+        std::mem::forget(directory);
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        std::mem::forget(runtime);
+        App::new(
+            handle,
+            AppOptions {
+                settings: Settings::default(),
+                profile,
+                agent: AgentKind::Code,
+                cwd: PathBuf::from("/tmp/project"),
+                store: SessionStore::with_root(path.join("sessions")),
+                resume: None,
+                theme: Theme::default(),
+                approval: ApprovalMode::Ask,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn running_enter_queues_one_locked_draft_and_escape_withdraws_first() {
+        let mut app = injection_input_test_app();
+        let (queue, _source) = injection::channel();
+        app.injection_queue = Some(queue);
+        app.running = true;
+        app.turn_id = 1;
+        app.input = "Also check the tests".to_string();
+        app.cursor = app.char_len();
+        let screen = Rect::new(0, 0, 80, 24);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+
+        assert!(app.pending_injection.is_some());
+        assert!(app.status_line().contains("queued"));
+        let locked = app.input.clone();
+        let cursor = app.cursor;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            screen,
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            screen,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        assert_eq!(app.input, locked);
+        assert_eq!(app.cursor, cursor);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), screen);
+        assert!(app.running);
+        assert!(app.pending_injection.is_none());
+        assert_eq!(app.input, locked);
+        assert!(!app.status_line().contains("queued"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), screen);
+        assert!(!app.running);
+        assert_eq!(app.input, locked);
+    }
+
+    #[test]
+    fn running_local_commands_are_dispatched_instead_of_injected() {
+        let mut app = injection_input_test_app();
+        let (queue, source) = injection::channel();
+        app.injection_queue = Some(queue);
+        app.running = true;
+        app.input = "!echo local".to_string();
+        app.cursor = app.char_len();
+        let screen = Rect::new(0, 0, 80, 24);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+
+        assert!(app.pending_injection.is_none());
+        assert!(source.reserve().is_none());
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Info(text)) if text.contains("already running")
+        ));
+
+        app.input = "/help".to_string();
+        app.cursor = app.char_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+
+        assert!(matches!(app.modal, Some(Modal::Help)));
+        assert!(app.pending_injection.is_none());
+        assert!(source.reserve().is_none());
+
+        app.modal = None;
+        app.injection_queue = None;
+        app.input = "/help".to_string();
+        app.cursor = app.char_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        assert!(matches!(app.modal, Some(Modal::Help)));
+
+        app.modal = None;
+        app.input = "keep this draft".to_string();
+        app.cursor = app.char_len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        assert_eq!(app.input, "keep this draft");
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Info(text)) if text.contains("already running")
+        ));
+    }
+
+    #[test]
+    fn consumed_injection_renders_raw_text_and_clears_its_owned_draft() {
+        let mut app = injection_input_test_app();
+        app.session
+            .append_message(&Message::user("original request"))
+            .unwrap();
+        let (queue, _source) = injection::channel();
+        app.injection_queue = Some(queue);
+        app.running = true;
+        app.turn_id = 2;
+        app.input = "same-turn direction".to_string();
+        app.cursor = app.char_len();
+        let screen = Rect::new(0, 0, 80, 24);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        let injection_id = app.pending_injection.as_ref().unwrap().id.clone();
+        let (reply, response) = std::sync::mpsc::channel();
+
+        app.apply(UiEvent::PersistInjectedUser {
+            message: Message::injected_user(injection_id, "same-turn direction"),
+            reply,
+        });
+
+        response.recv().unwrap().unwrap();
+        assert!(app.pending_injection.is_none());
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::User(text)) if text == "same-turn direction"
+        ));
+        let loaded = app.store.load(app.session.id()).unwrap();
+        assert_eq!(
+            loaded
+                .records
+                .iter()
+                .filter(|record| matches!(record, Record::InjectedUser { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ask_editor_does_not_overwrite_a_queued_injection() {
+        let mut app = injection_input_test_app();
+        app.session
+            .append_message(&Message::user("original request"))
+            .unwrap();
+        let (queue, _source) = injection::channel();
+        app.injection_queue = Some(queue);
+        app.running = true;
+        app.turn_id = 3;
+        app.input = "queued constraint".to_string();
+        app.cursor = app.char_len();
+        let screen = Rect::new(0, 0, 80, 24);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        let injection_id = app.pending_injection.as_ref().unwrap().id.clone();
+        let (ask_reply, mut ask_response) = oneshot::channel();
+        app.apply(UiEvent::Ask {
+            question: "Proceed?".to_string(),
+            reply: ask_reply,
+        });
+        assert!(app.input.is_empty());
+        for character in "yes".chars() {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                screen,
+            );
+        }
+        let (persist_reply, persist_response) = std::sync::mpsc::channel();
+        app.apply(UiEvent::PersistInjectedUser {
+            message: Message::injected_user(injection_id, "queued constraint"),
+            reply: persist_reply,
+        });
+        persist_response.recv().unwrap().unwrap();
+        assert_eq!(app.input, "yes");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+
+        assert_eq!(ask_response.try_recv().unwrap(), "yes");
+        assert!(app.input.is_empty());
+        assert!(app.pending_injection.is_none());
+    }
+
+    #[test]
+    fn input_racing_a_sealed_turn_is_submitted_once_after_terminal_state() {
+        let mut app = injection_input_test_app();
+        let (queue, source) = injection::channel();
+        assert!(source.try_finish());
+        app.injection_queue = Some(queue);
+        app.running = true;
+        app.turn_id = 4;
+        app.input = "fresh follow-up".to_string();
+        app.cursor = app.char_len();
+        let screen = Rect::new(0, 0, 80, 24);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
+        assert!(app.deferred_submission);
+        let messages = app.messages.clone();
+        app.apply(UiEvent::TurnFinished(
+            Ok(TurnResult::default()),
+            messages,
+            false,
+        ));
+
+        assert!(app.running);
+        assert!(!app.deferred_submission);
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|message| matches!(message, Message::User { content } if content == "fresh follow-up"))
+                .count(),
+            1
+        );
+        app.cancel();
+    }
 
     #[test]
     fn automatic_compaction_records_do_not_change_the_visible_transcript() {
