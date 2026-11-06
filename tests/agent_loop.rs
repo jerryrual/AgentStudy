@@ -477,6 +477,7 @@ async fn generates_last_words_before_retrying_a_large_current_tool_turn() {
     assert_eq!(turn.rounds, 1);
     assert_eq!(turn.usage.total_tokens, 25);
     assert_eq!(sink.projections.lock().unwrap().len(), 1);
+    assert_eq!(*sink.progress.lock().unwrap(), vec![true]);
     assert!(matches!(messages[2], Message::LastWords { .. }));
     assert!(matches!(
         messages.last(),

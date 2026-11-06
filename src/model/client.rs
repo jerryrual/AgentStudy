@@ -403,6 +403,17 @@ impl ModelClient {
                 "Last Words manifest retry left an uncommitted historical fold"
             )));
         }
+        let context_window = self.context_window.ok_or_else(|| {
+            PhaseFourPrepareError::Fatal(anyhow!(
+                "Phase 4 progress requires a configured context window"
+            ))
+        })?;
+        sink.record_phase_four_progress(meaningful_phase_four_progress(
+            prepared.estimated_input,
+            retry.estimated_input,
+            context_window,
+        ))
+        .map_err(PhaseFourPrepareError::Fatal)?;
         Ok((retry, generated.usage))
     }
 
@@ -989,6 +1000,10 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn meaningful_phase_four_progress(before: u32, after: u32, context_window: u32) -> bool {
+    u64::from(before.saturating_sub(after)) * 20 >= u64::from(context_window)
+}
+
 fn validate_last_words(messages: &[Message], completion: &Completion) -> Result<String> {
     if completion.finish_reason.as_deref() != Some("stop") {
         anyhow::bail!("Last Words response did not finish normally");
@@ -1573,6 +1588,13 @@ mod tests {
             assert!(body.contains("001_grep_deadbeef.md"));
             assert!(body.contains("<system-reminder>"));
         }
+    }
+
+    #[test]
+    fn phase_four_progress_uses_absolute_context_percentage_points() {
+        assert!(!meaningful_phase_four_progress(900, 851, 1000));
+        assert!(meaningful_phase_four_progress(900, 850, 1000));
+        assert!(meaningful_phase_four_progress(u32::MAX, 0, u32::MAX));
     }
 
     #[test]

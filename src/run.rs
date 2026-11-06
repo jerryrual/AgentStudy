@@ -95,6 +95,26 @@ impl EventSink for RunSink {
         result
     }
 
+    fn record_phase_four_progress(&self, meaningful: bool) -> anyhow::Result<()> {
+        let result =
+            self.phase_four_breaker
+                .record_progress_and_persist(meaningful, |_, meaningful| {
+                    let recorded = self
+                        .recorded
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
+                    recorded.session.record_phase_four_progress_if(
+                        self.phase_four_turn,
+                        meaningful,
+                        || true,
+                    )
+                });
+        if result.is_err() {
+            self.save_failed.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn checkpoint_phase_four_side_call(&self, estimated_input: u64) -> anyhow::Result<bool> {
         let result =
             self.phase_four_breaker

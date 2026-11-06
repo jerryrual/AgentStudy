@@ -30,6 +30,11 @@ pub trait EventSink: Send + Sync {
         Ok(true)
     }
 
+    /// Durably record whether a committed Phase 4 retry freed five context points.
+    fn record_phase_four_progress(&self, _meaningful: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Charge one imminent Phase 4 provider attempt against this turn's input budget.
     fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
         true

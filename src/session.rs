@@ -419,6 +419,29 @@ impl Session {
         Ok(Some((committed, admitted)))
     }
 
+    pub(crate) fn record_phase_four_progress_if<F>(
+        &self,
+        turn: u64,
+        meaningful: bool,
+        should_append: F,
+    ) -> Result<Option<PhaseFourBreakerState>>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
+        let _file_guard = self.lock_exclusive()?;
+        let (persisted_turn, mut committed) = self.load_phase_four_breaker_unlocked()?;
+        if persisted_turn != turn || !should_append() {
+            return Ok(None);
+        }
+        committed.record_progress(meaningful);
+        self.append_phase_four_breaker_unlocked(turn, &committed)?;
+        Ok(Some(committed))
+    }
+
     pub(crate) fn append_phase_four_breaker_if<F>(
         &self,
         turn: u64,
@@ -1873,6 +1896,29 @@ mod tests {
         assert!(session
             .append_phase_four_breaker_if(1, &proposed, &proposed, || true)
             .is_err());
+    }
+
+    #[test]
+    fn phase_four_progress_transitions_persist_for_current_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session.append_message(&Message::user("current")).unwrap();
+
+        let first = session
+            .record_phase_four_progress_if(1, false, || true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.consecutive_no_progress, 1);
+        assert!(first.tail_override);
+        assert!(!first.disabled);
+        let second = session
+            .record_phase_four_progress_if(1, false, || true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.consecutive_no_progress, 2);
+        assert!(second.disabled);
+        assert_eq!(session.load_phase_four_breaker().unwrap().1, second);
     }
 
     #[test]

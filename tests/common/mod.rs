@@ -205,6 +205,7 @@ pub fn tool_context(cwd: &std::path::Path) -> icode::tools::ToolContext {
 pub struct RecordingSink {
     pub events: Mutex<Vec<String>>,
     pub projections: Mutex<Vec<icode::compaction::ContextProjection>>,
+    pub progress: Mutex<Vec<bool>>,
 }
 
 impl RecordingSink {
@@ -218,6 +219,11 @@ impl RecordingSink {
 }
 
 impl icode::agent::EventSink for RecordingSink {
+    fn record_phase_four_progress(&self, meaningful: bool) -> anyhow::Result<()> {
+        self.progress.lock().unwrap().push(meaningful);
+        Ok(())
+    }
+
     fn persist_context_projection(
         &self,
         _source: &[icode::model::Message],
