@@ -484,6 +484,7 @@ mod tests {
     use super::*;
     use crate::agent::AgentKind;
     use crate::config::{ApprovalMode, ModelProfile, Settings};
+    use crate::model::Message;
     use crate::session::SessionStore;
     use crate::tui::app::{App, AppOptions};
     use ratatui::backend::TestBackend;
@@ -1039,6 +1040,118 @@ mod tests {
         assert_eq!(wrap_line(line, 4).len(), 1);
         let line = Line::from(Span::raw(""));
         assert_eq!(wrap_line(line, 4).len(), 1);
+    }
+
+    #[test]
+    fn tui_holds_its_session_lease_until_drop() {
+        let mut app = test_app();
+        let store = app.store.clone();
+        let id = app.session.id().to_string();
+        assert!(store.try_acquire_run_lease(&id).is_err());
+        app.running = true;
+        app.cancel();
+        assert!(store.try_acquire_run_lease(&id).is_err());
+
+        drop(app);
+        let _lease = store.try_acquire_run_lease(&id).unwrap();
+    }
+
+    #[test]
+    fn tui_startup_rejects_an_already_leased_session() {
+        let app = test_app();
+        let target = app
+            .store
+            .create(
+                "/tmp/leased-target",
+                &app.profile.model,
+                app.agent_kind.as_str(),
+            )
+            .unwrap();
+        let target_id = target.id().to_string();
+        let _blocker = app.store.try_acquire_run_lease(&target_id).unwrap();
+        let options = AppOptions {
+            settings: app.settings.clone(),
+            profile: app.profile.clone(),
+            agent: app.agent_kind,
+            cwd: app.cwd.clone(),
+            store: app.store.clone(),
+            resume: Some(target_id),
+            theme: app.theme,
+            approval: app.approval_mode,
+        };
+
+        let error = App::new(app.runtime.clone(), options).err().unwrap();
+        assert!(
+            error.to_string().contains("active in another process"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn new_session_hands_off_the_tui_run_lease() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        let store = app.store.clone();
+        let old_id = app.session.id().to_string();
+        app.input = "/new".to_string();
+        app.cursor = app.input.len();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+
+        assert_ne!(app.session.id(), old_id);
+        let _old_lease = store.try_acquire_run_lease(&old_id).unwrap();
+        assert!(store.try_acquire_run_lease(app.session.id()).is_err());
+    }
+
+    #[test]
+    fn contended_resume_preserves_current_tui_session() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        let current_id = app.session.id().to_string();
+        let current_cwd = app.cwd.clone();
+        app.view.push(ViewItem::Assistant {
+            text: "CURRENT SESSION REMAINS".to_string(),
+            reasoning: String::new(),
+            streaming: false,
+        });
+        let target = app
+            .store
+            .create(
+                "/tmp/leased-target",
+                &app.profile.model,
+                app.agent_kind.as_str(),
+            )
+            .unwrap();
+        target
+            .append_message(&Message::user("TARGET SESSION MUST NOT LOAD"))
+            .unwrap();
+        let target_id = target.id().to_string();
+        let _target_lease = app.store.try_acquire_run_lease(&target_id).unwrap();
+        app.input = format!("/resume {target_id}");
+        app.cursor = app.input.len();
+        let before = render(&mut app, 100, 24);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ratatui::layout::Rect::new(0, 0, 100, 24),
+        );
+        let after = render(&mut app, 100, 24);
+
+        assert_eq!(app.session.id(), current_id);
+        assert_eq!(app.cwd, current_cwd);
+        assert!(app.store.try_acquire_run_lease(&current_id).is_err());
+        assert!(before.contains("CURRENT SESSION REMAINS"), "{before}");
+        assert!(after.contains("CURRENT SESSION REMAINS"), "{after}");
+        assert!(after.contains("active in another process"), "{after}");
+        assert!(!after.contains("TARGET SESSION MUST NOT LOAD"), "{after}");
+        println!(
+            "AFTER (TUI lease):\n{}",
+            after
+                .replace(&target_id, "<TARGET_SESSION>")
+                .replace(&current_id, "<CURRENT_SESSION>")
+        );
     }
 
     #[test]
