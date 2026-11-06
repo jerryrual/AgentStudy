@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{approval_layout, App, Modal, ToolStatus, ViewItem};
+use super::app::{approval_hint, approval_layout, App, Modal, ToolStatus, ViewItem};
 use crate::markdown;
 use crate::theme::Theme;
 
@@ -26,9 +26,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_prompt(frame, app, layout[1]);
     draw_status(frame, app, layout[2]);
     match &app.modal {
-        Some(Modal::Approval { request, .. }) => {
-            draw_approval(frame, area, app, &request.tool, &request.summary)
-        }
+        Some(Modal::Approval {
+            request,
+            allow_always,
+            recovery,
+            ..
+        }) => draw_approval(
+            frame,
+            area,
+            app,
+            &request.tool,
+            &request.summary,
+            *allow_always,
+            *recovery,
+        ),
         Some(Modal::Help) => draw_help(frame, area, app),
         None => {}
     }
@@ -382,12 +393,25 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: &str) {
+fn draw_approval(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    tool: &str,
+    summary: &str,
+    allow_always: bool,
+    recovery: bool,
+) {
+    let title = if recovery {
+        " Recovery approval required "
+    } else {
+        " Approval required "
+    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(app.theme.warning))
         .title(Span::styled(
-            " Approval required ",
+            title,
             Style::default()
                 .fg(app.theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -395,7 +419,7 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: 
     // Grow the dialog so the complete command stays reviewable. The summary is
     // wrapped here (not by Paragraph) because commands are often a single long
     // word that Paragraph does not break.
-    let layout = approval_layout(area, tool, summary);
+    let layout = approval_layout(area, tool, summary, allow_always);
     let interior = layout.interior;
     let clipped = layout.clipped;
     let mut lines = Vec::new();
@@ -419,7 +443,7 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, tool: &str, summary: 
         lines.push(Line::default());
         lines.extend(wrap_line(
             Line::from(Span::styled(
-                "  y allow once · a always allow · n deny · esc deny",
+                approval_hint(allow_always),
                 Style::default().fg(app.theme.dim),
             )),
             interior,
@@ -1050,10 +1074,50 @@ mod tests {
         app.modal = Some(Modal::Approval {
             request: crate::interaction::ApprovalRequest::new("bash", "cargo test"),
             reply,
+            allow_always: true,
+            recovery: false,
         });
         let output = render(&mut app, 100, 24);
         assert!(output.contains("Approval required"), "{output}");
         assert!(output.contains("y allow once"), "{output}");
+    }
+
+    #[test]
+    fn renders_recovery_approval_without_always_allow() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        let (reply, mut rx) = tokio::sync::oneshot::channel();
+        app.modal = Some(Modal::Approval {
+            request: crate::interaction::ApprovalRequest::new(
+                "write_file",
+                "replace src/config.rs",
+            ),
+            reply,
+            allow_always: false,
+            recovery: true,
+        });
+
+        let output = render(&mut app, 100, 24);
+        println!("AFTER (recovered mutation confirmation, 100x24):\n{output}");
+        assert!(output.contains("Recovery approval required"), "{output}");
+        assert!(output.contains("y allow once"), "{output}");
+        assert!(!output.contains("always allow"), "{output}");
+
+        let screen = ratatui::layout::Rect::new(0, 0, 100, 24);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            screen,
+        );
+        assert!(app.modal.is_some());
+        assert!(rx.try_recv().is_err());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            screen,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::interaction::ApprovalDecision::AllowOnce
+        );
     }
 
     #[test]
@@ -1064,6 +1128,8 @@ mod tests {
         app.modal = Some(Modal::Approval {
             request: crate::interaction::ApprovalRequest::new("bash", &command),
             reply,
+            allow_always: true,
+            recovery: false,
         });
         let output = render(&mut app, 100, 30);
         assert!(output.contains("THE-END-MARKER"), "{output}");
@@ -1078,6 +1144,8 @@ mod tests {
         app.modal = Some(Modal::Approval {
             request: crate::interaction::ApprovalRequest::new("bash", &command),
             reply,
+            allow_always: true,
+            recovery: false,
         });
         let screen = ratatui::layout::Rect::new(0, 0, 60, 9);
         app.handle_key(
@@ -1099,6 +1167,8 @@ mod tests {
         app.modal = Some(Modal::Approval {
             request: crate::interaction::ApprovalRequest::new("bash", "cargo test"),
             reply,
+            allow_always: true,
+            recovery: false,
         });
         let screen = ratatui::layout::Rect::new(0, 0, 100, 30);
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), screen);
