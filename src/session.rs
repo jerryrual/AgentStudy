@@ -342,10 +342,7 @@ impl Session {
         let _file_guard = self.lock_exclusive()?;
         let loaded = load_session_file(&self.path, &self.meta.id)?;
         let messages = loaded.resumable_turn_messages()?;
-        let (turn, state) = self.load_phase_four_breaker_unlocked()?;
-        if turn != loaded.user_turn_count() {
-            anyhow::bail!("session changed while preparing same-turn resume");
-        }
+        let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
         Ok((messages, turn, state))
     }
 
@@ -361,6 +358,13 @@ impl Session {
 
     fn load_phase_four_breaker_unlocked(&self) -> Result<(u64, PhaseFourBreakerState)> {
         let loaded = load_session_file(&self.path, &self.meta.id)?;
+        self.load_phase_four_breaker_from(&loaded)
+    }
+
+    fn load_phase_four_breaker_from(
+        &self,
+        loaded: &LoadedSession,
+    ) -> Result<(u64, PhaseFourBreakerState)> {
         let turn = loaded.user_turn_count();
         let legacy_state = loaded.records.iter().rev().find_map(|record| match record {
             Record::PhaseFourBreaker {
