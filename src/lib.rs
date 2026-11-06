@@ -22,6 +22,7 @@ pub mod markdown;
 pub mod memory;
 pub mod model;
 pub(crate) mod phase4_breaker;
+pub(crate) mod recovery_writer;
 pub mod run;
 pub mod session;
 pub mod theme;

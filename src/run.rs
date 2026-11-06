@@ -15,6 +15,7 @@ use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
 use crate::model::{Message, ModelClient};
 use crate::phase4_breaker::PhaseFourBreaker;
+use crate::recovery_writer::{RecoveryCheckpointHandle, RecoveryCheckpointWriter};
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
 use crate::tools::ToolRegistry;
 
@@ -43,6 +44,7 @@ struct RunSink {
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
     phase_four_turn: u64,
     phase_four_breaker: PhaseFourBreaker,
+    recovery_writer: RecoveryCheckpointHandle,
 }
 
 struct RecordedSession {
@@ -83,13 +85,21 @@ impl EventSink for RunSink {
 
     fn persist_recovery_checkpoint(&self, messages: &[Message]) -> anyhow::Result<bool> {
         let breaker = self.phase_four_breaker.snapshot()?;
-        let recorded = self
-            .recorded
-            .lock()
-            .map_err(|_| anyhow::anyhow!("recorded session lock is poisoned"))?;
-        recorded
-            .session
-            .persist_recovery_checkpoint(messages, self.phase_four_turn, &breaker)?;
+        let result = self.recovery_writer.barrier(messages, breaker);
+        if result.is_err() {
+            self.save_failed.store(true, Ordering::Relaxed);
+        }
+        result?;
+        Ok(true)
+    }
+
+    fn publish_recovery_checkpoint(&self, messages: Vec<Message>) -> anyhow::Result<bool> {
+        let breaker = self.phase_four_breaker.snapshot()?;
+        let result = self.recovery_writer.publish(messages, breaker);
+        if result.is_err() {
+            self.save_failed.store(true, Ordering::Relaxed);
+        }
+        result?;
         Ok(true)
     }
 
@@ -358,6 +368,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         },
     );
 
+    let mut recovery_writer = RecoveryCheckpointWriter::new(session.clone(), phase_four_turn)?;
     let sink = RunSink {
         json: options.json,
         recorded: Mutex::new(RecordedSession {
@@ -373,20 +384,25 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             options.settings.phase4_side_call_token_budget,
             phase_four_state,
         ),
+        recovery_writer: recovery_writer.handle(),
     };
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
     let result = tokio::select! {
-        result = run.as_mut() => result,
-        _ = tokio::signal::ctrl_c() => {
-            if !options.json {
-                eprintln!();
-            }
-            eprintln!("✗ Interrupted");
-            std::process::exit(130);
-        }
+        result = run.as_mut() => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
     };
     drop(run);
+    let Some(result) = result else {
+        if let Err(error) = recovery_writer.preserve() {
+            eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
+        }
+        if !options.json {
+            eprintln!();
+        }
+        eprintln!("✗ Interrupted");
+        std::process::exit(130);
+    };
 
     match result {
         Ok(turn) => {
@@ -411,9 +427,11 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 }
             }
             if !sink.has_unsaved_messages() {
-                if let Err(error) = session.clear_recovery_checkpoint() {
+                if let Err(error) = recovery_writer.clear() {
                     eprintln!("warning: failed to clear recovery checkpoint: {error:#}");
                 }
+            } else if let Err(error) = recovery_writer.preserve() {
+                eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
             }
             if options.json {
                 let payload = json!({
@@ -446,6 +464,9 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             Ok(())
         }
         Err(error) => {
+            if let Err(persist_error) = recovery_writer.preserve() {
+                eprintln!("warning: failed to preserve recovery checkpoint: {persist_error:#}");
+            }
             if options.json {
                 let payload = json!({
                     "ok": false,
@@ -517,6 +538,7 @@ mod tests {
         let session = store.create("/tmp", "model", "code").unwrap();
         session.append_message(&Message::user("current")).unwrap();
         let (turn, state) = session.load_phase_four_breaker().unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
         let sink = RunSink {
             json: true,
             recorded: Mutex::new(RecordedSession {
@@ -529,6 +551,7 @@ mod tests {
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: turn,
             phase_four_breaker: PhaseFourBreaker::new(100, state),
+            recovery_writer: recovery_writer.handle(),
         };
 
         assert!(sink.checkpoint_phase_four_side_call(40).unwrap());
@@ -550,6 +573,7 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
         std::fs::remove_dir_all(directory.path()).unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
         let sink = RunSink {
             json: true,
             recorded: Mutex::new(RecordedSession {
@@ -562,6 +586,7 @@ mod tests {
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
             phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+            recovery_writer: recovery_writer.handle(),
         };
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
@@ -580,6 +605,7 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
         session.append_message(&Message::user("current")).unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
         let sink = RunSink {
             json: true,
             recorded: Mutex::new(RecordedSession {
@@ -592,6 +618,7 @@ mod tests {
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
             phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+            recovery_writer: recovery_writer.handle(),
         };
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
@@ -701,6 +728,7 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
         session.append_message(&Message::user("current")).unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
         let sink = RunSink {
             json: true,
             recorded: Mutex::new(RecordedSession {
@@ -713,6 +741,7 @@ mod tests {
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
             phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+            recovery_writer: recovery_writer.handle(),
         };
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
@@ -757,6 +786,7 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
         std::fs::remove_dir_all(directory.path()).unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
         let sink = RunSink {
             json: true,
             recorded: Mutex::new(RecordedSession {
@@ -769,6 +799,7 @@ mod tests {
             current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
             phase_four_turn: 0,
             phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
+            recovery_writer: recovery_writer.handle(),
         };
 
         assert!(sink

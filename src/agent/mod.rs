@@ -357,7 +357,7 @@ impl Agent {
         let mut checkpoint = Vec::with_capacity(message_prefix.len() + tool_results.len());
         checkpoint.extend_from_slice(message_prefix);
         checkpoint.extend(tool_results.iter().filter_map(Clone::clone));
-        sink.persist_recovery_checkpoint(&checkpoint)
+        sink.publish_recovery_checkpoint(checkpoint)
             .context("failed to checkpoint completed tool results")?;
         Ok(())
     }
@@ -509,8 +509,8 @@ mod tests {
     }
 
     impl EventSink for RecordingCheckpointSink {
-        fn persist_recovery_checkpoint(&self, messages: &[Message]) -> Result<bool> {
-            self.snapshots.lock().unwrap().push(messages.to_vec());
+        fn publish_recovery_checkpoint(&self, messages: Vec<Message>) -> Result<bool> {
+            self.snapshots.lock().unwrap().push(messages);
             Ok(true)
         }
     }
@@ -521,8 +521,8 @@ mod tests {
     }
 
     impl EventSink for SignalingCheckpointSink {
-        fn persist_recovery_checkpoint(&self, messages: &[Message]) -> Result<bool> {
-            self.snapshots.lock().unwrap().push(messages.to_vec());
+        fn publish_recovery_checkpoint(&self, messages: Vec<Message>) -> Result<bool> {
+            self.snapshots.lock().unwrap().push(messages);
             self.published.notify_waiters();
             Ok(true)
         }

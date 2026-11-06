@@ -401,6 +401,7 @@ impl Session {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn persist_recovery_checkpoint(
         &self,
         messages: &[Message],
@@ -410,6 +411,15 @@ impl Session {
         self.persist_recovery_checkpoint_if(messages, turn, phase_four_breaker, || true)?
             .then_some(())
             .ok_or_else(|| anyhow::anyhow!("recovery checkpoint was declined"))
+    }
+
+    pub(crate) fn persist_recovery_checkpoint_candidate(
+        &self,
+        messages: &[Message],
+        turn: u64,
+        phase_four_breaker: &PhaseFourBreakerState,
+    ) -> Result<bool> {
+        self.persist_recovery_checkpoint_if(messages, turn, phase_four_breaker, || true)
     }
 
     pub(crate) fn persist_recovery_checkpoint_if<F>(
@@ -430,9 +440,15 @@ impl Session {
         if !should_persist() {
             return Ok(false);
         }
-        let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
+        let loaded = load_session_file(&self.path, self.id())?;
+        let current_turn = loaded.user_turn_count();
         if turn == 0 || turn != current_turn {
             bail!("recovery checkpoint turn {turn} does not match current turn {current_turn}");
+        }
+        let shaped_messages = shape_recovery_messages(messages)?;
+        let recovery_messages = canonical_recovery_messages(&shaped_messages)?;
+        if !recovery_messages.starts_with(&loaded.messages()) {
+            return Ok(false);
         }
         let transcript = open_append_existing_nofollow(&self.path)
             .with_context(|| format!("failed to open session {}", self.path.display()))?;
@@ -614,7 +630,6 @@ impl Session {
         Ok((shaped_messages, turn, state))
     }
 
-    #[cfg(test)]
     pub(crate) fn load_phase_four_breaker(&self) -> Result<(u64, PhaseFourBreakerState)> {
         let _guard = self
             .append_lock
@@ -1562,6 +1577,52 @@ mod tests {
 
         session.clear_recovery_checkpoint().unwrap();
         assert!(session.load_recovery_checkpoint().unwrap().is_none());
+    }
+
+    #[test]
+    fn delayed_partial_checkpoint_cannot_rebase_onto_newer_transcript() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let user = Message::user("inspect");
+        session.append_message(&user).unwrap();
+        session
+            .persist_recovery_checkpoint(std::slice::from_ref(&user), 1, &Default::default())
+            .unwrap();
+        let original_sidecar = std::fs::read(session.recovery_checkpoint_path()).unwrap();
+        let assistant = Message::assistant(AssistantMessage {
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+            ..AssistantMessage::default()
+        });
+        let first = Message::tool("call_1", "read_file", "first");
+        let second = Message::tool("call_2", "read_file", "second");
+        let mut buffer = RecordBuffer::default();
+        buffer.record(&session, &assistant).unwrap();
+        buffer.record(&session, &first).unwrap();
+        buffer.record(&session, &second).unwrap();
+
+        assert!(!session
+            .persist_recovery_checkpoint_candidate(
+                &[user, assistant, first],
+                1,
+                &Default::default(),
+            )
+            .unwrap());
+        assert_eq!(
+            std::fs::read(session.recovery_checkpoint_path()).unwrap(),
+            original_sidecar
+        );
     }
 
     #[test]
