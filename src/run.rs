@@ -314,9 +314,15 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         (messages, turn, state)
     };
 
-    let approver: std::sync::Arc<dyn Approver> = match options.approval {
-        ApprovalMode::Deny => std::sync::Arc::new(DenyAll),
-        ApprovalMode::Ask | ApprovalMode::Auto => std::sync::Arc::new(AllowAll),
+    let approver: std::sync::Arc<dyn Approver> = if options.resume_turn {
+        // The prior process may have exited after a mutating tool took effect but
+        // before its result reached the durable transcript. Never replay writes.
+        std::sync::Arc::new(DenyAll)
+    } else {
+        match options.approval {
+            ApprovalMode::Deny => std::sync::Arc::new(DenyAll),
+            ApprovalMode::Ask | ApprovalMode::Auto => std::sync::Arc::new(AllowAll),
+        }
     };
     let agent = Agent::new(
         client,

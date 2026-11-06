@@ -63,6 +63,7 @@ pub enum Command {
         session: Option<String>,
     },
     /// Resume an interrupted user turn after confirming its original process exited.
+    /// Mutating tools are denied because prior unrecorded effects are uncertain.
     ResumeTurn {
         /// Emit one JSON object instead of streamed text.
         #[arg(long)]

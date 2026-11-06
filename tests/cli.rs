@@ -1,6 +1,8 @@
 mod common;
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use common::*;
 use serde_json::{json, Value};
@@ -258,12 +260,21 @@ fn run_continue_uses_the_latest_session() {
 }
 
 #[test]
-fn resume_turn_continues_only_from_a_complete_tool_checkpoint() {
-    let server = MockServer::new(|_path, _body| {
-        MockResponse::sse(&[&text_chunk("resumed"), &done_chunk("stop")])
-    });
+fn resume_turn_restores_a_complete_checkpoint_but_denies_mutating_tools() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let rounds_for_server = rounds.clone();
+    let server = MockServer::new(move |_path, _body| {
+        if rounds_for_server.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write","function":{"name":"write_file","arguments":"{\"path\":\"blocked.txt\",\"content\":\"must not write\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                &done_chunk("tool_calls"),
+            ])
+        } else {
+            MockResponse::sse(&[&text_chunk("resumed"), &done_chunk("stop")])
+        }
+    });
     write_settings(home.path(), &server.base_url());
     let sessions = home.path().join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
@@ -332,6 +343,19 @@ fn resume_turn_continues_only_from_a_complete_tool_checkpoint() {
         .collect();
     assert!(contents.contains(&"inspect the result"), "{contents:?}");
     assert!(contents.contains(&"durable result"), "{contents:?}");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let resumed_contents: Vec<&str> = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect();
+    assert!(
+        resumed_contents.contains(&"Error: the user denied this operation."),
+        "{resumed_contents:?}"
+    );
+    assert!(!work.path().join("blocked.txt").exists());
 
     let persisted = std::fs::read_to_string(path).unwrap();
     assert_eq!(
