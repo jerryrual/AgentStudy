@@ -878,31 +878,32 @@ fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
         }
 
         let complete = results.len() == assistant.tool_calls.len();
-        if !complete && next != messages.len() {
+        if complete {
+            shaped.extend(messages[index..next].iter().cloned());
+            index = next;
+            continue;
+        }
+        if next != messages.len() {
             bail!("recovery checkpoint has a non-trailing incomplete tool-call group");
         }
-        if !complete && !assistant.responses_items.is_empty() {
+        if !assistant.responses_items.is_empty() {
             bail!("cannot shape an incomplete native Responses tool-call group");
         }
-        let retained_calls = assistant
-            .tool_calls
-            .iter()
-            .filter(|call| results.contains_key(call.id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut retained_calls = Vec::new();
+        let mut retained_results = Vec::new();
+        for call in &assistant.tool_calls {
+            if let Some(result) = results.remove(call.id.as_str()) {
+                retained_calls.push(call.clone());
+                retained_results.push(result);
+            }
+        }
         if retained_calls.is_empty() {
             bail!("recovery checkpoint has no completed tool results to retain");
         }
         let mut retained_assistant = assistant.clone();
-        retained_assistant.tool_calls = retained_calls.clone();
+        retained_assistant.tool_calls = retained_calls;
         shaped.push(Message::assistant(retained_assistant));
-        for call in retained_calls {
-            shaped.push(
-                results
-                    .remove(call.id.as_str())
-                    .expect("retained calls have matching results"),
-            );
-        }
+        shaped.extend(retained_results);
         index = next;
     }
     Ok(shaped)
@@ -1589,6 +1590,50 @@ mod tests {
                 checkpoint_messages[3].clone(),
             ]
         );
+    }
+
+    #[test]
+    fn recovery_checkpoint_preserves_a_complete_durable_group_result_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let user = Message::user("inspect");
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "call_c".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+            responses_items: Vec::new(),
+        });
+        let tool_c = Message::tool("call_c", "grep", "C result");
+        let tool_a = Message::tool("call_a", "read_file", "A result");
+        for message in [&user, &assistant, &tool_c, &tool_a] {
+            session.append_message(message).unwrap();
+        }
+        let checkpoint = vec![
+            Message::system("captured system"),
+            user,
+            assistant,
+            tool_c,
+            tool_a,
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint, 1, &Default::default())
+            .unwrap();
+        let before = std::fs::read(&session.path).unwrap();
+
+        assert_eq!(session.load_resumable_turn().unwrap().0, checkpoint);
+        assert_eq!(std::fs::read(&session.path).unwrap(), before);
     }
 
     #[test]
