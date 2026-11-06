@@ -587,7 +587,8 @@ impl Session {
         mut loaded: LoadedSession,
         checkpoint: RecoveryCheckpoint,
     ) -> Result<(Vec<Message>, u64, PhaseFourBreakerState)> {
-        let recovery_messages = canonical_recovery_messages(&checkpoint.messages)?;
+        let shaped_messages = shape_recovery_messages(&checkpoint.messages)?;
+        let recovery_messages = canonical_recovery_messages(&shaped_messages)?;
         validate_recovery_provider_boundary(recovery_messages)?;
         let durable_messages = loaded.messages();
         let suffix = recovery_messages
@@ -610,7 +611,7 @@ impl Session {
         }
         let (turn, state) = self.load_phase_four_breaker_from(&loaded)?;
         self.append_records_unlocked(&records)?;
-        Ok((checkpoint.messages, turn, state))
+        Ok((shaped_messages, turn, state))
     }
 
     #[cfg(test)]
@@ -827,6 +828,85 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.meta.id
     }
+}
+
+fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
+    let mut shaped = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let Message::Assistant { message: assistant } = &messages[index] else {
+            if matches!(messages[index], Message::Tool { .. }) {
+                bail!("recovery checkpoint has an orphan tool result");
+            }
+            shaped.push(messages[index].clone());
+            index += 1;
+            continue;
+        };
+        if assistant.tool_calls.is_empty() {
+            shaped.push(messages[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let mut calls = std::collections::BTreeMap::new();
+        for call in &assistant.tool_calls {
+            if calls.insert(call.id.as_str(), call).is_some() {
+                bail!("recovery checkpoint has duplicate tool-call IDs");
+            }
+        }
+        let mut results = std::collections::BTreeMap::new();
+        let mut next = index + 1;
+        while let Some(Message::Tool {
+            call_id,
+            name,
+            content: _,
+        }) = messages.get(next)
+        {
+            let Some(call) = calls.get(call_id.as_str()) else {
+                bail!("recovery checkpoint has an orphan tool result");
+            };
+            if name != &call.name {
+                bail!("recovery checkpoint tool result name does not match its call");
+            }
+            if results
+                .insert(call_id.as_str(), messages[next].clone())
+                .is_some()
+            {
+                bail!("recovery checkpoint has duplicate tool results");
+            }
+            next += 1;
+        }
+
+        let complete = results.len() == assistant.tool_calls.len();
+        if complete {
+            shaped.extend(messages[index..next].iter().cloned());
+            index = next;
+            continue;
+        }
+        if next != messages.len() {
+            bail!("recovery checkpoint has a non-trailing incomplete tool-call group");
+        }
+        if !assistant.responses_items.is_empty() {
+            bail!("cannot shape an incomplete native Responses tool-call group");
+        }
+        let mut retained_calls = Vec::new();
+        let mut retained_results = Vec::new();
+        for call in &assistant.tool_calls {
+            if let Some(result) = results.remove(call.id.as_str()) {
+                retained_calls.push(call.clone());
+                retained_results.push(result);
+            }
+        }
+        if retained_calls.is_empty() {
+            bail!("recovery checkpoint has no completed tool results to retain");
+        }
+        let mut retained_assistant = assistant.clone();
+        retained_assistant.tool_calls = retained_calls;
+        shaped.push(Message::assistant(retained_assistant));
+        shaped.extend(retained_results);
+        index = next;
+    }
+    Ok(shaped)
 }
 
 fn canonical_recovery_messages(messages: &[Message]) -> Result<&[Message]> {
@@ -1510,6 +1590,178 @@ mod tests {
                 checkpoint_messages[3].clone(),
             ]
         );
+    }
+
+    #[test]
+    fn recovery_checkpoint_preserves_a_complete_durable_group_result_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let user = Message::user("inspect");
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call_a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                ToolCall {
+                    id: "call_c".into(),
+                    name: "grep".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+            responses_items: Vec::new(),
+        });
+        let tool_c = Message::tool("call_c", "grep", "C result");
+        let tool_a = Message::tool("call_a", "read_file", "A result");
+        for message in [&user, &assistant, &tool_c, &tool_a] {
+            session.append_message(message).unwrap();
+        }
+        let checkpoint = vec![
+            Message::system("captured system"),
+            user,
+            assistant,
+            tool_c,
+            tool_a,
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint, 1, &Default::default())
+            .unwrap();
+        let before = std::fs::read(&session.path).unwrap();
+
+        assert_eq!(session.load_resumable_turn().unwrap().0, checkpoint);
+        assert_eq!(std::fs::read(&session.path).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_checkpoint_keeps_only_completed_calls_from_a_partial_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append_message(&Message::user("inspect three"))
+            .unwrap();
+        let calls = [
+            ToolCall {
+                id: "call_a".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "call_b".into(),
+                name: "write_file".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "call_c".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        let assistant = Message::assistant(AssistantMessage {
+            content: Some("I checked the available results.".into()),
+            reasoning: None,
+            tool_calls: calls.to_vec(),
+            responses_items: Vec::new(),
+        });
+        let checkpoint = vec![
+            Message::system("captured system"),
+            Message::user("inspect three"),
+            assistant,
+            Message::tool("call_c", "grep", "C result"),
+            Message::tool("call_a", "read_file", "A result"),
+        ];
+        session
+            .persist_recovery_checkpoint(&checkpoint, 1, &Default::default())
+            .unwrap();
+
+        let (messages, turn, _) = session.load_resumable_turn().unwrap();
+
+        assert_eq!(turn, 1);
+        let Message::Assistant { message } = &messages[2] else {
+            panic!("expected the shaped assistant tool group");
+        };
+        assert_eq!(
+            message.content.as_deref(),
+            Some("I checked the available results.")
+        );
+        assert_eq!(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["call_a", "call_c"]
+        );
+        assert!(
+            matches!(&messages[3], Message::Tool { call_id, content, .. }
+            if call_id == "call_a" && content == "A result")
+        );
+        assert!(
+            matches!(&messages[4], Message::Tool { call_id, content, .. }
+            if call_id == "call_c" && content == "C result")
+        );
+        assert_eq!(store.load(session.id()).unwrap().messages(), messages[1..]);
+        assert_eq!(session.load_resumable_turn().unwrap().0, messages[1..]);
+    }
+
+    #[test]
+    fn partial_recovery_without_completed_results_or_with_native_items_fails_closed() {
+        let assistant = AssistantMessage {
+            content: Some("visible text".into()),
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            responses_items: Vec::new(),
+        };
+        assert!(shape_recovery_messages(&[
+            Message::user("inspect"),
+            Message::assistant(assistant.clone()),
+        ])
+        .is_err());
+
+        let mut native = assistant;
+        native
+            .responses_items
+            .push(serde_json::json!({"type": "function_call"}));
+        assert!(
+            shape_recovery_messages(&[Message::user("inspect"), Message::assistant(native),])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn partial_recovery_rejects_orphan_duplicate_and_mismatched_results() {
+        let assistant = Message::assistant(AssistantMessage {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
+            responses_items: Vec::new(),
+        });
+        for messages in [
+            vec![Message::tool("orphan", "read_file", "result")],
+            vec![
+                assistant.clone(),
+                Message::tool("call_1", "read_file", "first"),
+                Message::tool("call_1", "read_file", "duplicate"),
+            ],
+            vec![
+                assistant.clone(),
+                Message::tool("call_1", "grep", "wrong tool"),
+            ],
+        ] {
+            assert!(shape_recovery_messages(&messages).is_err());
+        }
     }
 
     #[test]

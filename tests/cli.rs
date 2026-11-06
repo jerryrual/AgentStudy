@@ -580,6 +580,135 @@ fn resume_turn_restores_a_complete_checkpoint_but_denies_mutating_tools() {
 }
 
 #[test]
+fn resume_turn_shapes_partial_sidecar_without_replaying_missing_calls() {
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let rounds_for_server = rounds.clone();
+    let server = MockServer::new(move |_path, _body| {
+        if rounds_for_server.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockResponse::sse(&[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_new_write","function":{"name":"write_file","arguments":"{\"path\":\"new-write.txt\",\"content\":\"blocked\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                &done_chunk("tool_calls"),
+            ])
+        } else {
+            MockResponse::sse(&[&text_chunk("continued"), &done_chunk("stop")])
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let sessions = home.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let id = "1a1a0000000-00004";
+    let records = [
+        json!({
+            "type": "meta",
+            "meta": {
+                "id": id,
+                "created_ms": 4,
+                "cwd": work.path(),
+                "model": "mock-model",
+                "agent": "code"
+            }
+        }),
+        json!({"type": "user", "text": "inspect safely"}),
+    ];
+    let transcript = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let transcript_path = sessions.join(format!("{id}.jsonl"));
+    std::fs::write(&transcript_path, format!("{transcript}\n")).unwrap();
+    let archive = sessions.join(id);
+    std::fs::create_dir_all(&archive).unwrap();
+    let sidecar = json!({
+        "version": 2,
+        "session_id": id,
+        "turn": 1,
+        "transcript_bytes": std::fs::metadata(&transcript_path).unwrap().len(),
+        "messages": [
+            {"role": "system", "content": "captured system"},
+            {"role": "user", "content": "inspect safely"},
+            {"role": "assistant", "message": {
+                "content": "partial inspection",
+                "tool_calls": [
+                    {"id": "call_a", "name": "read_file", "arguments": "{}"},
+                    {"id": "call_missing_write", "name": "write_file", "arguments": "{\"path\":\"missing-write.txt\",\"content\":\"must not run\"}"},
+                    {"id": "call_c", "name": "grep", "arguments": "{}"}
+                ]
+            }},
+            {"role": "tool", "call_id": "call_c", "name": "grep", "content": "C result"},
+            {"role": "tool", "call_id": "call_a", "name": "read_file", "content": "A result"}
+        ],
+        "phase_four_breaker": {
+            "version": 1,
+            "attempts": 0,
+            "consecutive_no_progress": 0,
+            "tail_override": false,
+            "disabled": false,
+            "side_call_tokens": 0
+        }
+    });
+    std::fs::write(
+        archive.join("session.recovery.json"),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "resume-turn",
+            "--session",
+            id,
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let first_messages = requests[0]["messages"].as_array().unwrap();
+    let recovered_assistant = first_messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        recovered_assistant["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| call["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["call_a", "call_c"]
+    );
+    assert_eq!(
+        first_messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["tool_call_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["call_a", "call_c"]
+    );
+    assert!(!work.path().join("missing-write.txt").exists());
+    assert!(!work.path().join("new-write.txt").exists());
+    assert!(requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .any(|content| content == "Error: the user denied this operation."));
+    assert!(!archive.join("session.recovery.json").exists());
+}
+
+#[test]
 fn resume_turn_rejects_an_ambiguous_user_only_tail() {
     let server = MockServer::new(|_path, _body| panic!("provider must not be called"));
     let home = tempfile::tempdir().unwrap();
