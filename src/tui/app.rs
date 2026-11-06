@@ -742,6 +742,7 @@ impl App {
             "/approval",
             "/sessions",
             "/resume",
+            "/continue-turn",
             "/cwd",
             "/compact",
         ];
@@ -827,10 +828,14 @@ impl App {
             reasoning: String::new(),
             streaming: true,
         });
-        self.start_agent(phase_four);
+        self.start_agent(phase_four, self.approver.clone());
     }
 
-    fn start_agent(&mut self, phase_four: (u64, PhaseFourBreakerState)) {
+    fn start_agent(
+        &mut self,
+        phase_four: (u64, PhaseFourBreakerState),
+        approver: Arc<dyn Approver>,
+    ) {
         self.running = true;
         self.turn_id = self.turn_id.wrapping_add(1);
         let turn_id = self.turn_id;
@@ -842,7 +847,6 @@ impl App {
         let cwd = self.cwd.clone();
         let max_rounds = self.settings.max_tool_rounds;
         let phase_four_side_call_token_budget = self.settings.phase4_side_call_token_budget;
-        let approver = self.approver.clone();
         let asker = self.asker.clone();
         let tools = self.tools.clone();
         let mut messages = self.messages.clone();
@@ -1116,7 +1120,12 @@ impl App {
         let mut parts = raw.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
         let argument = parts.next().unwrap_or_default().trim();
-        if self.running && matches!(command, "/new" | "/clear" | "/resume" | "/compact") {
+        if self.running
+            && matches!(
+                command,
+                "/new" | "/clear" | "/resume" | "/continue-turn" | "/compact"
+            )
+        {
             self.view.push(ViewItem::Info(
                 "Cancel the running turn (Esc) before changing the session.".to_string(),
             ));
@@ -1210,6 +1219,14 @@ impl App {
                     self.resume_session(argument);
                 }
             }
+            "/continue-turn" => {
+                if argument.is_empty() {
+                    self.continue_turn();
+                } else {
+                    self.view
+                        .push(ViewItem::Error("Usage: /continue-turn".to_string()));
+                }
+            }
             "/cwd" => {
                 if argument.is_empty() {
                     self.view.push(ViewItem::Info(format!(
@@ -1237,6 +1254,37 @@ impl App {
                 "Unknown command {command:?}; use /help for the command list."
             ))),
         }
+    }
+
+    fn continue_turn(&mut self) {
+        if self.unsaved_messages {
+            self.view.push(ViewItem::Error(
+                "Cannot continue: some conversation messages were not saved.".to_string(),
+            ));
+            return;
+        }
+        let (messages, turn, breaker) = match self.session.load_resumable_turn() {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.view.push(ViewItem::Error(format!(
+                    "cannot continue current turn: {error:#}"
+                )));
+                return;
+            }
+        };
+
+        self.messages = messages;
+        self.reset_recorder();
+        self.requires_session_reload = false;
+        self.view.push(ViewItem::Info(
+            "Continuing the current user turn with mutating tools denied.".to_string(),
+        ));
+        self.view.push(ViewItem::Assistant {
+            text: String::new(),
+            reasoning: String::new(),
+            streaming: true,
+        });
+        self.start_agent((turn, breaker), Arc::new(DenyAll));
     }
 
     fn resume_session(&mut self, id: &str) {
