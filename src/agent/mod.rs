@@ -2,6 +2,7 @@
 //! asks for, feed the results back, and repeat until it answers.
 
 pub mod events;
+pub mod injection;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -200,6 +201,17 @@ impl Agent {
         messages: &mut Vec<Message>,
         sink: &dyn EventSink,
     ) -> Result<TurnResult> {
+        let (_queue, injections) = injection::channel();
+        self.run_with_injections(messages, sink, &injections).await
+    }
+
+    /// Run one user turn while accepting same-turn user injections.
+    pub async fn run_with_injections(
+        &self,
+        messages: &mut Vec<Message>,
+        sink: &dyn EventSink,
+        injections: &injection::InjectionSource,
+    ) -> Result<TurnResult> {
         let started = Instant::now();
         let mut usage = Usage::default();
         let mut tool_calls = 0usize;
@@ -221,6 +233,10 @@ impl Agent {
             }
             rounds += 1;
 
+            if let Some(reservation) = injections.reserve() {
+                sink.persist_injected_user(reservation.message())?;
+                messages.push(reservation.commit());
+            }
             sink.persist_recovery_checkpoint(messages)?;
             let persistent = self
                 .client
@@ -252,6 +268,9 @@ impl Agent {
             sink.message_added(&assistant);
 
             if calls.is_empty() {
+                if !injections.try_finish() {
+                    continue;
+                }
                 let result = TurnResult {
                     text: text.unwrap_or_default(),
                     usage,
@@ -493,7 +512,9 @@ pub fn client_from_profile(profile: &crate::config::ModelProfile) -> Result<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{mpsc as std_mpsc, Arc, Mutex as StdMutex};
 
     use anyhow::{bail, Result};
     use async_trait::async_trait;
@@ -526,6 +547,143 @@ mod tests {
             self.published.notify_waiters();
             Ok(true)
         }
+    }
+
+    struct InjectionOrderSink {
+        order: Arc<StdMutex<Vec<&'static str>>>,
+        persisted: StdMutex<Vec<Message>>,
+        checkpoints: StdMutex<Vec<Vec<Message>>>,
+        fail_persistence: bool,
+    }
+
+    impl InjectionOrderSink {
+        fn new(fail_persistence: bool) -> Self {
+            Self {
+                order: Arc::new(StdMutex::new(Vec::new())),
+                persisted: StdMutex::new(Vec::new()),
+                checkpoints: StdMutex::new(Vec::new()),
+                fail_persistence,
+            }
+        }
+    }
+
+    impl EventSink for InjectionOrderSink {
+        fn persist_injected_user(&self, message: &Message) -> Result<()> {
+            self.order.lock().unwrap().push("injection");
+            if self.fail_persistence {
+                bail!("simulated injected-user persistence failure");
+            }
+            self.persisted.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn persist_recovery_checkpoint(&self, messages: &[Message]) -> Result<bool> {
+            self.order.lock().unwrap().push("checkpoint");
+            self.checkpoints.lock().unwrap().push(messages.to_vec());
+            Ok(true)
+        }
+    }
+
+    fn injection_test_agent(base_url: String) -> Agent {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = base_url;
+        profile.model = "mock-model".to_string();
+        profile.max_tokens = None;
+        let client = Arc::new(ModelClient::from_profile(&profile).unwrap());
+        Agent::new(
+            client,
+            Arc::new(ToolRegistry::with_tools(Vec::new())),
+            Arc::new(AllowAll),
+            Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, "/tmp"),
+        )
+    }
+
+    fn read_model_request(stream: &mut TcpStream) -> serde_json::Value {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn write_model_response(stream: &mut TcpStream, text: &str) {
+        let text_chunk = json!({"choices": [{"delta": {"content": text}}]}).to_string();
+        let done_chunk = json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })
+        .to_string();
+        let response_body = format!("data: {text_chunk}\n\ndata: {done_chunk}\n\ndata: [DONE]\n\n");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn one_shot_model_server(
+        order: Arc<StdMutex<Vec<&'static str>>>,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            order.lock().unwrap().push("provider");
+            let request = read_model_request(&mut stream);
+            write_model_response(&mut stream, "done");
+            request
+        });
+        (format!("http://{address}/v1"), handle)
+    }
+
+    type BlockedServer = (
+        String,
+        std_mpsc::Receiver<()>,
+        std_mpsc::Sender<()>,
+        std::thread::JoinHandle<Vec<serde_json::Value>>,
+    );
+
+    fn blocked_two_shot_model_server() -> BlockedServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_seen_tx, first_seen_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first = read_model_request(&mut first_stream);
+            first_seen_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            write_model_response(&mut first_stream, "first answer");
+
+            let (mut second_stream, _) = listener.accept().unwrap();
+            let second = read_model_request(&mut second_stream);
+            write_model_response(&mut second_stream, "second answer");
+            vec![first, second]
+        });
+        (
+            format!("http://{address}/v1"),
+            first_seen_rx,
+            release_tx,
+            handle,
+        )
     }
 
     struct ParallelProbe {
@@ -589,6 +747,140 @@ mod tests {
             asker: Arc::new(NoAsker),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn prequeued_injection_is_persisted_and_checkpointed_before_provider_io() {
+        let sink = InjectionOrderSink::new(false);
+        let (base_url, server) = one_shot_model_server(sink.order.clone());
+        let agent = injection_test_agent(base_url);
+        let (queue, source) = injection::channel();
+        queue.enqueue("inject-1", "additional direction").unwrap();
+        let mut messages = vec![Message::user("original request")];
+
+        let result = agent
+            .run_with_injections(&mut messages, &sink, &source)
+            .await
+            .unwrap();
+        let request = server.join().unwrap();
+
+        assert_eq!(result.text, "done");
+        assert_eq!(
+            *sink.order.lock().unwrap(),
+            ["injection", "checkpoint", "provider"]
+        );
+        assert!(matches!(
+            sink.persisted.lock().unwrap().as_slice(),
+            [Message::InjectedUser { injection_id, content }]
+                if injection_id == "inject-1" && content == "additional direction"
+        ));
+        let checkpoints = sink.checkpoints.lock().unwrap();
+        assert!(matches!(
+            checkpoints[0].last(),
+            Some(Message::InjectedUser { injection_id, content })
+                if injection_id == "inject-1" && content == "additional direction"
+        ));
+        let provider_messages = request["messages"].as_array().unwrap();
+        assert!(provider_messages.iter().any(|message| {
+            message["role"] == "user" && message["content"] == "additional direction"
+        }));
+    }
+
+    #[tokio::test]
+    async fn tool_free_response_racing_an_injection_runs_a_second_logical_round() {
+        let (base_url, first_seen, release_first, server) = blocked_two_shot_model_server();
+        let agent = injection_test_agent(base_url);
+        let sink = InjectionOrderSink::new(false);
+        let (queue, source) = injection::channel();
+        let mut messages = vec![Message::user("original request")];
+        let first_seen = tokio::task::spawn_blocking(move || first_seen.recv().unwrap());
+        let mut run = Box::pin(agent.run_with_injections(&mut messages, &sink, &source));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                observed = first_seen => observed.unwrap(),
+                result = &mut run => panic!("turn finished before the injection race: {result:?}"),
+            }
+        })
+        .await
+        .expect("the first provider request was not observed");
+        queue.enqueue("inject-race", "late direction").unwrap();
+        release_first.send(()).unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the injected follow-up round did not finish")
+            .unwrap();
+        let requests = server.join().unwrap();
+        let injection_count = |request: &serde_json::Value| {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["role"] == "user" && message["content"] == "late direction"
+                })
+                .count()
+        };
+
+        assert_eq!(result.text, "second answer");
+        assert_eq!(result.rounds, 2);
+        assert_eq!(requests.len(), 2);
+        assert_eq!(injection_count(&requests[0]), 0);
+        assert_eq!(injection_count(&requests[1]), 1);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::InjectedUser { injection_id, content }
+                            if injection_id == "inject-race" && content == "late direction"
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(sink.persisted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn injected_user_persistence_failure_blocks_provider_and_rolls_back_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let agent = injection_test_agent(format!("http://{address}/v1"));
+        let sink = InjectionOrderSink::new(true);
+        let (queue, source) = injection::channel();
+        queue.enqueue("inject-1", "must remain queued").unwrap();
+        let mut messages = vec![Message::user("original request")];
+
+        let error = agent
+            .run_with_injections(&mut messages, &sink, &source)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated injected-user persistence failure"),
+            "{error:#}"
+        );
+        assert_eq!(*sink.order.lock().unwrap(), ["injection"]);
+        assert!(!messages.iter().any(
+            |message| matches!(message, Message::InjectedUser { injection_id, .. } if injection_id == "inject-1")
+        ));
+        let reservation = source.reserve().expect("failed persistence must roll back");
+        assert!(matches!(
+            reservation.message(),
+            Message::InjectedUser { injection_id, content }
+                if injection_id == "inject-1" && content == "must remain queued"
+        ));
+        drop(reservation);
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[tokio::test]

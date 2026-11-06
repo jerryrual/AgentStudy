@@ -25,6 +25,14 @@ pub trait EventSink: Send + Sync {
         None
     }
 
+    /// Synchronously persist one consumed same-turn user injection.
+    ///
+    /// A successful return guarantees that the transcript record is complete;
+    /// the caller must still pass the strict recovery barrier before provider I/O.
+    fn persist_injected_user(&self, _message: &Message) -> anyhow::Result<()> {
+        anyhow::bail!("injected user persistence is unavailable")
+    }
+
     /// Durably snapshot the exact recoverable turn before provider work.
     fn persist_recovery_checkpoint(&self, _messages: &[Message]) -> anyhow::Result<bool> {
         Ok(false)
@@ -130,6 +138,13 @@ impl EventSink for NullSink {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_injected_user_persistence_fails_closed() {
+        let message = Message::injected_user("injection-1", "additional direction");
+
+        assert!(NullSink.persist_injected_user(&message).is_err());
+    }
 
     #[test]
     fn default_progress_checkpoint_fails_closed() {
