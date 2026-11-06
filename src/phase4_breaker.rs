@@ -35,7 +35,7 @@ impl Default for PhaseFourBreakerState {
 
 impl PhaseFourBreakerState {
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
-        let state: Self = serde_json::from_value(value.clone()).ok()?;
+        let state = Self::deserialize(value).ok()?;
         (state.version == BREAKER_STATE_VERSION
             && state.attempts <= STATE_INTEGER_MAX
             && state.consecutive_no_progress <= STATE_INTEGER_MAX
