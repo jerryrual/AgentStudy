@@ -1536,6 +1536,16 @@ impl EventSink for TuiSink {
         })
     }
 
+    fn record_phase_four_failure(&self, disable: bool) -> anyhow::Result<()> {
+        self.phase_four_breaker
+            .record_failure_and_persist(disable, |_, disable| {
+                self.session
+                    .record_phase_four_failure_if(self.phase_four_turn, disable, || {
+                        self.persistence_gate.load(Ordering::SeqCst)
+                    })
+            })
+    }
+
     fn record_phase_four_progress(&self, meaningful: bool) -> anyhow::Result<()> {
         self.phase_four_breaker
             .record_progress_and_persist(meaningful, |_, meaningful| {

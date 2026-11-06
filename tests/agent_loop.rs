@@ -23,6 +23,10 @@ impl EventSink for FailedCheckpointSink {
         Ok(true)
     }
 
+    fn record_phase_four_failure(&self, _disable: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn checkpoint_phase_four_side_call(&self, _estimated_input: u64) -> anyhow::Result<bool> {
         self.checkpoints.fetch_add(1, Ordering::SeqCst);
         anyhow::bail!("simulated checkpoint failure")
@@ -34,6 +38,7 @@ struct SideCallQuotaSink {
     charged_attempts: AtomicUsize,
     events: std::sync::Mutex<Vec<String>>,
     projections: std::sync::Mutex<Vec<ContextProjection>>,
+    failures: std::sync::Mutex<Vec<bool>>,
 }
 
 impl SideCallQuotaSink {
@@ -43,6 +48,7 @@ impl SideCallQuotaSink {
             charged_attempts: AtomicUsize::new(0),
             events: std::sync::Mutex::new(Vec::new()),
             projections: std::sync::Mutex::new(Vec::new()),
+            failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -54,6 +60,11 @@ impl EventSink for SideCallQuotaSink {
 
     fn charge_phase_four_side_call(&self, _estimated_input: u64) -> bool {
         self.charged_attempts.fetch_add(1, Ordering::SeqCst) < self.allowed_attempts
+    }
+
+    fn record_phase_four_failure(&self, disable: bool) -> anyhow::Result<()> {
+        self.failures.lock().unwrap().push(disable);
+        Ok(())
     }
 
     fn record_phase_four_progress(&self, _meaningful: bool) -> anyhow::Result<()> {
@@ -414,6 +425,7 @@ async fn phase_four_quota_charges_each_physical_retry_before_provider_io() {
     assert_eq!(turn.text, "continued raw");
     assert_eq!(server.request_count(), 2, "denied retry never reached HTTP");
     assert_eq!(sink.charged_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(*sink.failures.lock().unwrap(), vec![true]);
     assert!(sink.projections.lock().unwrap().is_empty());
     assert!(sink
         .events
@@ -694,6 +706,7 @@ async fn overflow_falls_back_to_historical_compression_when_last_words_is_invali
     assert_eq!(turn.rounds, 1, "the retry is part of one model round");
     assert_eq!(turn.usage.total_tokens, 35);
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(*sink.failures.lock().unwrap(), vec![false]);
     let requests = server.requests();
     assert_eq!(requests.len(), 4, "overflow, two side calls, and one retry");
 
