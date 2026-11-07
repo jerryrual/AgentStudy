@@ -13,7 +13,7 @@ use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::compaction_archive::CurrentTurnArchiveManifest;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
-use crate::model::{Message, ModelClient};
+use crate::model::{Message, ModelClient, ToolCall, Usage};
 use crate::phase4_breaker::PhaseFourBreaker;
 use crate::recovery_writer::{RecoveryCheckpointHandle, RecoveryCheckpointWriter};
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
@@ -35,10 +35,87 @@ pub struct RunOptions {
     pub store: SessionStore,
 }
 
-struct RunSink {
+/// Synchronous presentation boundary around durable headless turn state.
+///
+/// Implementations must return quickly and serialize their own queue writes:
+/// parallel-safe tools can publish callbacks concurrently. Async transports
+/// should enqueue owned events here and perform I/O in a separate dispatcher.
+pub(crate) trait TurnObserver: Send + Sync {
+    fn text_delta(&self, _delta: &str) {}
+    fn reasoning_delta(&self, _delta: &str) {}
+    fn tool_started(&self, _call: &ToolCall, _summary: &str) {}
+    fn tool_finished(
+        &self,
+        _call: &ToolCall,
+        _ok: bool,
+        _duration: Duration,
+        _summary: &str,
+        _output: &str,
+    ) {
+    }
+    fn usage(&self, _usage: &Usage) {}
+    fn info(&self, _message: &str) {}
+    fn error(&self, _message: &str) {}
+    fn warning(&self, _message: &str) {}
+}
+
+struct ConsoleObserver {
     json: bool,
-    recorded: Mutex<RecordedSession>,
     wrote_text: AtomicBool,
+}
+
+impl ConsoleObserver {
+    fn text_written(&self) -> bool {
+        self.wrote_text.load(Ordering::Relaxed)
+    }
+}
+
+impl TurnObserver for ConsoleObserver {
+    fn text_delta(&self, delta: &str) {
+        if self.json {
+            return;
+        }
+        self.wrote_text.store(true, Ordering::Relaxed);
+        print!("{delta}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    fn tool_started(&self, call: &ToolCall, summary: &str) {
+        if !self.json {
+            eprintln!("→ {}  {summary}", call.name);
+        }
+    }
+
+    fn tool_finished(
+        &self,
+        call: &ToolCall,
+        ok: bool,
+        duration: Duration,
+        _summary: &str,
+        _output: &str,
+    ) {
+        if !self.json {
+            let mark = if ok { "✓" } else { "✗" };
+            eprintln!("  {mark} {} {:.1}s", call.name, duration.as_secs_f64());
+        }
+    }
+
+    fn info(&self, message: &str) {
+        eprintln!("  · {message}");
+    }
+
+    fn error(&self, message: &str) {
+        eprintln!("✗ {message}");
+    }
+
+    fn warning(&self, message: &str) {
+        eprintln!("warning: {message}");
+    }
+}
+
+pub(crate) struct PersistentTurnSink<O> {
+    observer: O,
+    recorded: Mutex<RecordedSession>,
     save_failed: AtomicBool,
     archive_pointer: Mutex<Option<String>>,
     current_turn_manifest: Mutex<CurrentTurnArchiveManifest>,
@@ -52,17 +129,51 @@ struct RecordedSession {
     buffer: RecordBuffer,
 }
 
-impl RunSink {
-    fn text_written(&self) -> bool {
-        self.wrote_text.load(Ordering::Relaxed)
+impl<O> PersistentTurnSink<O> {
+    pub(crate) fn new(
+        observer: O,
+        session: Session,
+        phase_four_turn: u64,
+        phase_four_side_call_token_budget: i64,
+        phase_four_state: crate::phase4_breaker::PhaseFourBreakerState,
+        recovery_writer: RecoveryCheckpointHandle,
+    ) -> Self {
+        Self {
+            observer,
+            recorded: Mutex::new(RecordedSession {
+                session,
+                buffer: RecordBuffer::default(),
+            }),
+            save_failed: AtomicBool::new(false),
+            archive_pointer: Mutex::new(None),
+            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+            phase_four_turn,
+            phase_four_breaker: PhaseFourBreaker::new(
+                phase_four_side_call_token_budget,
+                phase_four_state,
+            ),
+            recovery_writer,
+        }
     }
 
-    fn has_unsaved_messages(&self) -> bool {
+    pub(crate) fn has_unsaved_messages(&self) -> bool {
         self.save_failed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset_buffer(&self) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .buffer
+            .reset();
+    }
+
+    pub(crate) fn observer(&self) -> &O {
+        &self.observer
     }
 }
 
-impl EventSink for RunSink {
+impl<O: TurnObserver> EventSink for PersistentTurnSink<O> {
     fn turn_started(&self) {
         let pointer = self
             .recorded
@@ -247,50 +358,53 @@ impl EventSink for RunSink {
     }
 
     fn text_delta(&self, delta: &str) {
-        if self.json {
-            return;
-        }
-        self.wrote_text.store(true, Ordering::Relaxed);
-        print!("{delta}");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        self.observer.text_delta(delta);
     }
 
-    fn tool_started(&self, name: &str, summary: &str) {
-        if !self.json {
-            eprintln!("→ {name}  {summary}");
-        }
+    fn reasoning_delta(&self, delta: &str) {
+        self.observer.reasoning_delta(delta);
     }
 
-    fn tool_finished(
+    fn tool_call_started(&self, call: &ToolCall, summary: &str) {
+        self.observer.tool_started(call, summary);
+    }
+
+    fn tool_call_finished(
         &self,
-        name: &str,
+        call: &ToolCall,
         ok: bool,
         duration: Duration,
-        _summary: &str,
-        _output: &str,
+        summary: &str,
+        output: &str,
     ) {
-        if !self.json {
-            let mark = if ok { "✓" } else { "✗" };
-            eprintln!("  {mark} {name} {:.1}s", duration.as_secs_f64());
-        }
+        self.observer
+            .tool_finished(call, ok, duration, summary, output);
     }
 
     fn message_added(&self, message: &Message) {
-        if let Ok(mut recorded) = self.recorded.lock() {
+        let error = if let Ok(mut recorded) = self.recorded.lock() {
             let RecordedSession { session, buffer } = &mut *recorded;
-            if let Err(error) = buffer.record(session, message) {
-                self.save_failed.store(true, Ordering::Relaxed);
-                eprintln!("warning: failed to save session: {error:#}");
-            }
+            buffer.record(session, message).err()
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.save_failed.store(true, Ordering::Relaxed);
+            self.observer
+                .warning(&format!("failed to save session: {error:#}"));
         }
     }
 
+    fn usage(&self, usage: &Usage) {
+        self.observer.usage(usage);
+    }
+
     fn info(&self, message: &str) {
-        eprintln!("  · {message}");
+        self.observer.info(message);
     }
 
     fn error(&self, message: &str) {
-        eprintln!("✗ {message}");
+        self.observer.error(message);
     }
 }
 
@@ -369,23 +483,17 @@ pub async fn execute(options: RunOptions) -> Result<()> {
     );
 
     let mut recovery_writer = RecoveryCheckpointWriter::new(session.clone(), phase_four_turn)?;
-    let sink = RunSink {
-        json: options.json,
-        recorded: Mutex::new(RecordedSession {
-            session: session.clone(),
-            buffer: RecordBuffer::default(),
-        }),
-        wrote_text: AtomicBool::new(false),
-        save_failed: AtomicBool::new(false),
-        archive_pointer: Mutex::new(None),
-        current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
+    let sink = PersistentTurnSink::new(
+        ConsoleObserver {
+            json: options.json,
+            wrote_text: AtomicBool::new(false),
+        },
+        session.clone(),
         phase_four_turn,
-        phase_four_breaker: PhaseFourBreaker::new(
-            options.settings.phase4_side_call_token_budget,
-            phase_four_state,
-        ),
-        recovery_writer: recovery_writer.handle(),
-    };
+        options.settings.phase4_side_call_token_budget,
+        phase_four_state,
+        recovery_writer.handle(),
+    );
 
     let mut run = Box::pin(agent.run(&mut messages, &sink));
     let result = tokio::select! {
@@ -423,13 +531,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                         compacted_messages: Some(plan.compacted_messages),
                     };
                     match session.append(&checkpoint) {
-                        Ok(()) => {
-                            let mut recorded = sink
-                                .recorded
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            recorded.buffer.reset();
-                        }
+                        Ok(()) => sink.reset_buffer(),
                         Err(error) => {
                             eprintln!("warning: failed to save automatic compaction: {error:#}");
                         }
@@ -461,7 +563,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                if sink.text_written() {
+                if sink.observer().text_written() {
                     println!();
                 }
                 eprintln!(
@@ -540,6 +642,135 @@ fn truncate(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl TurnObserver for Arc<RecordingObserver> {
+        fn text_delta(&self, delta: &str) {
+            self.events.lock().unwrap().push(format!("text:{delta}"));
+        }
+
+        fn reasoning_delta(&self, delta: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("reasoning:{delta}"));
+        }
+
+        fn tool_started(&self, call: &ToolCall, summary: &str) {
+            self.events.lock().unwrap().push(format!(
+                "start:{}:{}:{}:{summary}",
+                call.id, call.name, call.arguments
+            ));
+        }
+
+        fn tool_finished(
+            &self,
+            call: &ToolCall,
+            ok: bool,
+            duration: Duration,
+            summary: &str,
+            output: &str,
+        ) {
+            self.events.lock().unwrap().push(format!(
+                "finish:{}:{}:{}:{ok}:{}:{summary}:{output}",
+                call.id,
+                call.name,
+                call.arguments,
+                duration.as_millis()
+            ));
+        }
+
+        fn usage(&self, usage: &Usage) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("usage:{}", usage.total_tokens));
+        }
+
+        fn info(&self, message: &str) {
+            self.events.lock().unwrap().push(format!("info:{message}"));
+        }
+
+        fn error(&self, message: &str) {
+            self.events.lock().unwrap().push(format!("error:{message}"));
+        }
+
+        fn warning(&self, message: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("warning:{message}"));
+        }
+    }
+
+    fn test_sink(
+        session: Session,
+        turn: u64,
+        budget: i64,
+        state: crate::phase4_breaker::PhaseFourBreakerState,
+        recovery_writer: RecoveryCheckpointHandle,
+    ) -> (
+        PersistentTurnSink<Arc<RecordingObserver>>,
+        Arc<RecordingObserver>,
+    ) {
+        let observer = Arc::new(RecordingObserver::default());
+        let sink = PersistentTurnSink::new(
+            observer.clone(),
+            session,
+            turn,
+            budget,
+            state,
+            recovery_writer,
+        );
+        (sink, observer)
+    }
+
+    #[test]
+    fn persistent_turn_sink_forwards_rich_observer_events_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
+        let (sink, observer) =
+            test_sink(session, 0, -1, Default::default(), recovery_writer.handle());
+        let call = ToolCall {
+            id: "call-7".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+        };
+
+        sink.text_delta("answer");
+        sink.reasoning_delta("thought");
+        sink.tool_call_started(&call, "src/lib.rs");
+        sink.tool_call_finished(
+            &call,
+            true,
+            Duration::from_millis(12),
+            "src/lib.rs",
+            "contents",
+        );
+        sink.usage(&Usage {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5,
+        });
+        sink.info("working");
+        sink.error("failed");
+
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events[0], "text:answer");
+        assert_eq!(events[1], "reasoning:thought");
+        assert!(events[2].starts_with("start:call-7:read_file:"));
+        assert!(events[2].contains(r#"{"path":"src/lib.rs"}"#));
+        assert!(events[3].starts_with("finish:call-7:read_file:"));
+        assert!(events[3].contains(":true:12:src/lib.rs:contents"));
+        assert_eq!(events[4..], ["usage:5", "info:working", "error:failed"]);
+    }
 
     #[test]
     fn run_sink_checkpoints_side_call_spend_before_admission() {
@@ -549,20 +780,8 @@ mod tests {
         session.append_message(&Message::user("current")).unwrap();
         let (turn, state) = session.load_phase_four_breaker().unwrap();
         let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
-        let sink = RunSink {
-            json: true,
-            recorded: Mutex::new(RecordedSession {
-                session: session.clone(),
-                buffer: RecordBuffer::default(),
-            }),
-            wrote_text: AtomicBool::new(false),
-            save_failed: AtomicBool::new(false),
-            archive_pointer: Mutex::new(None),
-            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_turn: turn,
-            phase_four_breaker: PhaseFourBreaker::new(100, state),
-            recovery_writer: recovery_writer.handle(),
-        };
+        let (sink, _observer) =
+            test_sink(session.clone(), turn, 100, state, recovery_writer.handle());
 
         assert!(sink.checkpoint_phase_four_side_call(40).unwrap());
         assert!(!sink.checkpoint_phase_four_side_call(60).unwrap());
@@ -584,20 +803,8 @@ mod tests {
         let session = store.create("/tmp", "model", "code").unwrap();
         std::fs::remove_dir_all(directory.path()).unwrap();
         let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
-        let sink = RunSink {
-            json: true,
-            recorded: Mutex::new(RecordedSession {
-                session,
-                buffer: RecordBuffer::default(),
-            }),
-            wrote_text: AtomicBool::new(false),
-            save_failed: AtomicBool::new(false),
-            archive_pointer: Mutex::new(None),
-            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_turn: 0,
-            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
-            recovery_writer: recovery_writer.handle(),
-        };
+        let (sink, observer) =
+            test_sink(session, 0, -1, Default::default(), recovery_writer.handle());
 
         sink.message_added(&Message::assistant(crate::model::AssistantMessage::text(
             "answer",
@@ -607,6 +814,9 @@ mod tests {
         assert!(!sink
             .persist_compression(&CompressionBatch::default())
             .unwrap());
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].starts_with("warning:failed to save session:"));
     }
 
     #[test]
@@ -616,20 +826,13 @@ mod tests {
         let session = store.create("/tmp", "model", "code").unwrap();
         session.append_message(&Message::user("current")).unwrap();
         let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
-        let sink = RunSink {
-            json: true,
-            recorded: Mutex::new(RecordedSession {
-                session: session.clone(),
-                buffer: RecordBuffer::default(),
-            }),
-            wrote_text: AtomicBool::new(false),
-            save_failed: AtomicBool::new(false),
-            archive_pointer: Mutex::new(None),
-            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_turn: 0,
-            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
-            recovery_writer: recovery_writer.handle(),
-        };
+        let (sink, _observer) = test_sink(
+            session.clone(),
+            0,
+            -1,
+            Default::default(),
+            recovery_writer.handle(),
+        );
         sink.message_added(&Message::assistant(crate::model::AssistantMessage {
             content: Some("assistant context".into()),
             reasoning: Some("private reasoning".into()),
@@ -739,20 +942,13 @@ mod tests {
         let session = store.create("/tmp", "model", "code").unwrap();
         session.append_message(&Message::user("current")).unwrap();
         let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
-        let sink = RunSink {
-            json: true,
-            recorded: Mutex::new(RecordedSession {
-                session: session.clone(),
-                buffer: RecordBuffer::default(),
-            }),
-            wrote_text: AtomicBool::new(false),
-            save_failed: AtomicBool::new(false),
-            archive_pointer: Mutex::new(None),
-            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_turn: 0,
-            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
-            recovery_writer: recovery_writer.handle(),
-        };
+        let (sink, _observer) = test_sink(
+            session.clone(),
+            0,
+            -1,
+            Default::default(),
+            recovery_writer.handle(),
+        );
         let assistant = Message::assistant(crate::model::AssistantMessage {
             tool_calls: vec![crate::model::ToolCall {
                 id: "call_1".into(),
@@ -797,20 +993,8 @@ mod tests {
         let session = store.create("/tmp", "model", "code").unwrap();
         std::fs::remove_dir_all(directory.path()).unwrap();
         let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), 1).unwrap();
-        let sink = RunSink {
-            json: true,
-            recorded: Mutex::new(RecordedSession {
-                session,
-                buffer: RecordBuffer::default(),
-            }),
-            wrote_text: AtomicBool::new(false),
-            save_failed: AtomicBool::new(false),
-            archive_pointer: Mutex::new(None),
-            current_turn_manifest: Mutex::new(CurrentTurnArchiveManifest::default()),
-            phase_four_turn: 0,
-            phase_four_breaker: PhaseFourBreaker::new(-1, Default::default()),
-            recovery_writer: recovery_writer.handle(),
-        };
+        let (sink, _observer) =
+            test_sink(session, 0, -1, Default::default(), recovery_writer.handle());
 
         assert!(sink
             .persist_compression(&CompressionBatch::default())
