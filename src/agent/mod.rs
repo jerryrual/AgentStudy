@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 pub use events::{EventSink, NullSink};
 
-use crate::interaction::{ApprovalDecision, ApprovalRequest, Approver, Asker};
+use crate::interaction::{ApprovalDecision, Approver, Asker};
 use crate::model::{Message, ModelClient, ToolDef, Usage};
 use crate::tools::{truncate_output, TodoItem, ToolContext, ToolRegistry};
 
@@ -333,7 +333,7 @@ impl Agent {
             for (offset, call) in calls[start..index].iter().enumerate() {
                 let call_index = start + offset;
                 let summary = self.tool_summary(call);
-                sink.tool_started(&call.name, &summary);
+                sink.tool_call_started(call, &summary);
                 executions.push(async move {
                     let execution = self.execute_tool_inner(call, context, &summary).await;
                     (call_index, call, summary, execution)
@@ -353,13 +353,7 @@ impl Agent {
                 let (ok, duration, summary, display) = finish.ok_or_else(|| {
                     anyhow::anyhow!("parallel tool ended without finish metadata")
                 })?;
-                sink.tool_finished(
-                    &calls[start + offset].name,
-                    ok,
-                    duration,
-                    &summary,
-                    &display,
-                );
+                sink.tool_call_finished(&calls[start + offset], ok, duration, &summary, &display);
             }
         }
         messages
@@ -402,10 +396,10 @@ impl Agent {
         sink: &dyn EventSink,
     ) -> String {
         let summary = self.tool_summary(call);
-        sink.tool_started(&call.name, &summary);
+        sink.tool_call_started(call, &summary);
         let (ok, duration, display, result) =
             self.execute_tool_inner(call, context, &summary).await;
-        sink.tool_finished(&call.name, ok, duration, &summary, &display);
+        sink.tool_call_finished(call, ok, duration, &summary, &display);
         result
     }
 
@@ -446,12 +440,11 @@ impl Agent {
             return (false, started.elapsed(), message.clone(), message);
         }
 
-        if tool.mutates() {
-            let request = ApprovalRequest::new(&call.name, summary);
-            if self.approver.approve(&request).await == ApprovalDecision::Deny {
-                let message = "Error: the user denied this operation.".to_string();
-                return (false, started.elapsed(), message.clone(), message);
-            }
+        if tool.mutates()
+            && self.approver.approve_tool(call, summary).await == ApprovalDecision::Deny
+        {
+            let message = "Error: the user denied this operation.".to_string();
+            return (false, started.elapsed(), message.clone(), message);
         }
 
         match tool.run(&arguments, context).await {
@@ -523,7 +516,8 @@ mod tests {
     use tokio::sync::{oneshot, Barrier, Notify};
 
     use crate::config::ModelProfile;
-    use crate::interaction::{AllowAll, NoAsker};
+    use crate::interaction::{AllowAll, ApprovalRequest, NoAsker};
+    use crate::model::ToolCall;
     use crate::tools::{Tool, ToolContext};
 
     struct RecordingCheckpointSink {
@@ -754,6 +748,73 @@ mod tests {
         }
     }
 
+    struct ToolIdentitySink {
+        starts: StdMutex<Vec<ToolCall>>,
+        finishes: StdMutex<Vec<ToolCall>>,
+    }
+
+    impl EventSink for ToolIdentitySink {
+        fn tool_call_started(&self, call: &ToolCall, _summary: &str) {
+            self.starts.lock().unwrap().push(call.clone());
+        }
+
+        fn tool_call_finished(
+            &self,
+            call: &ToolCall,
+            _ok: bool,
+            _duration: Duration,
+            _summary: &str,
+            _output: &str,
+        ) {
+            self.finishes.lock().unwrap().push(call.clone());
+        }
+    }
+
+    struct MutatingProbe;
+
+    #[async_trait]
+    impl Tool for MutatingProbe {
+        fn name(&self) -> &'static str {
+            "mutating_probe"
+        }
+
+        fn description(&self) -> &'static str {
+            "test mutating probe"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn mutates(&self) -> bool {
+            true
+        }
+
+        fn summarize(&self, raw: &str) -> String {
+            raw.to_string()
+        }
+
+        async fn run(&self, _arguments: &Value, _context: &ToolContext) -> Result<String> {
+            Ok("approved".to_string())
+        }
+    }
+
+    struct IdentityApprover {
+        calls: StdMutex<Vec<ToolCall>>,
+    }
+
+    #[async_trait]
+    impl Approver for IdentityApprover {
+        async fn approve(&self, _request: &ApprovalRequest) -> ApprovalDecision {
+            ApprovalDecision::Deny
+        }
+
+        async fn approve_tool(&self, call: &ToolCall, _summary: &str) -> ApprovalDecision {
+            self.calls.lock().unwrap().push(call.clone());
+            ApprovalDecision::AllowOnce
+        }
+    }
+
     fn test_agent(tool: Box<dyn Tool>) -> Agent {
         let mut profile = ModelProfile::builtin_deepseek();
         profile.api_key = "test-key".to_string();
@@ -775,6 +836,72 @@ mod tests {
             asker: Arc::new(NoAsker),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn structured_tool_events_keep_ids_and_arguments_in_provider_order() {
+        let barrier = Arc::new(Barrier::new(2));
+        let agent = test_agent(Box::new(ParallelProbe {
+            barrier,
+            completed: Arc::new(StdMutex::new(Vec::new())),
+        }));
+        let calls = vec![
+            ToolCall {
+                id: "call-a".to_string(),
+                name: "probe".to_string(),
+                arguments: r#"{"id":"a","delay_ms":20}"#.to_string(),
+            },
+            ToolCall {
+                id: "call-b".to_string(),
+                name: "probe".to_string(),
+                arguments: r#"{"id":"b","delay_ms":0}"#.to_string(),
+            },
+        ];
+        let sink = ToolIdentitySink {
+            starts: StdMutex::new(Vec::new()),
+            finishes: StdMutex::new(Vec::new()),
+        };
+
+        let results = agent
+            .execute_tool_batch(&calls, &test_context(), &[], &sink)
+            .await
+            .unwrap();
+
+        assert_eq!(*sink.starts.lock().unwrap(), calls);
+        assert_eq!(*sink.finishes.lock().unwrap(), calls);
+        assert!(matches!(
+            &results[..],
+            [Message::Tool { call_id: first, .. }, Message::Tool { call_id: second, .. }]
+                if first == "call-a" && second == "call-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_approval_receives_exact_tool_identity_and_arguments() {
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        let client = Arc::new(ModelClient::from_profile(&profile).unwrap());
+        let approver = Arc::new(IdentityApprover {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let agent = Agent::new(
+            client,
+            Arc::new(ToolRegistry::with_tools(vec![Box::new(MutatingProbe)])),
+            approver.clone(),
+            Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, "/tmp"),
+        );
+        let call = ToolCall {
+            id: "write-42".to_string(),
+            name: "mutating_probe".to_string(),
+            arguments: r#"{"path":"notes.txt"}"#.to_string(),
+        };
+
+        let output = agent.execute_tool(&call, &test_context(), &NullSink).await;
+
+        assert_eq!(output, "approved");
+        assert_eq!(*approver.calls.lock().unwrap(), vec![call]);
     }
 
     #[tokio::test]

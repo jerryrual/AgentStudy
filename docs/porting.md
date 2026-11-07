@@ -52,7 +52,7 @@
 
 ### 4. 集成 / 工作流
 
-1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。
+1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。Agent 已通过向后兼容的富工具事件与审批钩子向协议适配器保留 provider 分配的 `toolCallId` 和原始参数，重复或并行同名工具可稳定关联；stdio JSON-RPC、ACP 会话/取消、异步通知分发、权限请求与持久化 turn runner 仍未实现。
 2. 工作流（workflow）编排与节点可视化；依赖扩展协议和轨迹能力。
 
 ### 5. UX / 分发
