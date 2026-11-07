@@ -52,7 +52,7 @@
 
 ### 4. 集成 / 工作流
 
-1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。Agent 已通过向后兼容的富工具事件与审批钩子向协议适配器保留 provider 分配的 `toolCallId` 和原始参数，重复或并行同名工具可稳定关联；内部有序、非阻塞的 turn-event channel 已将同步 observer 回调桥接到异步消费边界，异步 dispatcher 现会排空有序 turn events，将其映射为官方稳定 ACP v1 `SessionNotification`，并按序准入同一 session 的 ACP connection 无界出站队列；准入成功不代表传输送达。stdio 入口、initialize/session handlers、取消、权限请求、prompt 完成、能力感知的 usage/notice 处理仍未实现。
+1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。Agent 已通过向后兼容的富工具事件与审批钩子向协议适配器保留 provider 分配的 `toolCallId` 和原始参数，重复或并行同名工具可稳定关联；内部有序、非阻塞的 turn-event channel 已将同步 observer 回调桥接到异步消费边界，异步 dispatcher 现会排空有序 turn events，将其映射为官方稳定 ACP v1 `SessionNotification`，并按序准入同一 session 的 ACP connection 无界出站队列；准入成功不代表传输送达。进程内 ACP session registry 现会创建或打开持久化本地会话，直接复用其 ID 作为强类型 ACP session ID，在注册项存续期间持有既有的跨进程 run lease，每个会话一次只允许一个 prompt，并提供协作式取消；发出取消后仍保持 busy，直到 prompt guard 退出。空闲注册项可显式关闭并释放 lease，活动 prompt 存在时关闭会失败。`initialize`、`new`、`load`、`prompt`、`cancel` 协议 handler 和 stdio 入口仍未实现，因此 ACP 服务尚不可用；权限请求、prompt 完成、能力感知的 usage/notice 处理也仍未实现。
 2. 工作流（workflow）编排与节点可视化；依赖扩展协议和轨迹能力。
 
 ### 5. UX / 分发
