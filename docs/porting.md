@@ -52,7 +52,7 @@
 
 ### 4. 集成 / 工作流
 
-1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。Agent 已通过向后兼容的富工具事件与审批钩子向协议适配器保留 provider 分配的 `toolCallId` 和原始参数，重复或并行同名工具可稳定关联；内部有序、非阻塞的 turn-event channel 已将同步 observer 回调桥接到异步消费边界，并已使用官方稳定 ACP v1 类型映射消息、思考与工具生命周期（含原始输入/输出和稳定调用 ID）。stdio JSON-RPC、ACP 会话/取消、权限请求、prompt 终止结果、能力感知的 usage/notice 处理及异步 dispatcher 仍未实现。
+1. ACP 服务（`icode acp` / `icode serve`）与编辑器集成。Agent 已通过向后兼容的富工具事件与审批钩子向协议适配器保留 provider 分配的 `toolCallId` 和原始参数，重复或并行同名工具可稳定关联；内部有序、非阻塞的 turn-event channel 已将同步 observer 回调桥接到异步消费边界，异步 dispatcher 现会排空有序 turn events，将其映射为官方稳定 ACP v1 `SessionNotification`，并通过 ACP connection 以同一 session 稳定发送。stdio 入口、initialize/session handlers、取消、权限请求、prompt 完成、能力感知的 usage/notice 处理仍未实现。
 2. 工作流（workflow）编排与节点可视化；依赖扩展协议和轨迹能力。
 
 ### 5. UX / 分发
