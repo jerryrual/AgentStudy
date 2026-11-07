@@ -1444,6 +1444,11 @@ impl SessionStore {
     /// Open an existing session for appending.
     pub fn reopen(&self, id: &str) -> Result<Session> {
         let loaded = self.load(id)?;
+        self.reopen_loaded(id, loaded)
+    }
+
+    /// Open a session from data already loaded under the caller's run lease.
+    pub(crate) fn reopen_loaded(&self, id: &str, loaded: LoadedSession) -> Result<Session> {
         let archive_root = self.archive_root(id)?;
         let session = Session {
             meta: loaded.meta,
