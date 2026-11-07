@@ -7,15 +7,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use super::error::{ControlError, ControlResult, InvalidSessionRequest};
+use super::sessions::{LoadError, PreparedLoad, SessionRegistry};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
     SessionNotification,
 };
-use anyhow::{ensure, Context, Result};
-
-use super::sessions::{PreparedLoad, SessionRegistry};
+use agent_client_protocol::Error as ProtocolError;
 
 /// Validated session creation and cancellation shared by future wire handlers.
 pub(crate) struct SessionControl {
@@ -54,32 +54,44 @@ impl SessionControl {
     }
 
     /// Validate all setup fields before creating any durable session state.
-    pub(crate) fn new_session(&self, request: &NewSessionRequest) -> Result<NewSessionResponse> {
-        ensure!(
-            request.additional_directories.is_empty(),
-            "ACP additional workspace roots are not supported"
-        );
-        ensure!(
-            request.mcp_servers.is_empty(),
-            "ACP MCP servers are not supported"
-        );
+    pub(crate) fn new_session(
+        &self,
+        request: &NewSessionRequest,
+    ) -> ControlResult<NewSessionResponse> {
+        if !request.additional_directories.is_empty() {
+            return Err(ControlError::invalid(
+                InvalidSessionRequest::AdditionalDirectories,
+            ));
+        }
+        if !request.mcp_servers.is_empty() {
+            return Err(ControlError::invalid(InvalidSessionRequest::McpServers));
+        }
         let cwd = validated_cwd(&request.cwd)?;
-        let session_id = self.sessions.create(cwd, &self.model, &self.agent)?;
+        let session_id = self
+            .sessions
+            .create(cwd, &self.model, &self.agent)
+            .map_err(ControlError::internal)?;
         Ok(NewSessionResponse::new(session_id))
     }
 
     /// Validate and project a load while its session remains hidden from prompts.
-    pub(crate) fn prepare_load(&self, request: &LoadSessionRequest) -> Result<LoadTransaction> {
-        ensure!(
-            request.additional_directories.is_empty(),
-            "ACP additional workspace roots are not supported"
-        );
-        ensure!(
-            request.mcp_servers.is_empty(),
-            "ACP MCP servers are not supported"
-        );
+    pub(crate) fn prepare_load(
+        &self,
+        request: &LoadSessionRequest,
+    ) -> ControlResult<LoadTransaction> {
+        if !request.additional_directories.is_empty() {
+            return Err(ControlError::invalid(
+                InvalidSessionRequest::AdditionalDirectories,
+            ));
+        }
+        if !request.mcp_servers.is_empty() {
+            return Err(ControlError::invalid(InvalidSessionRequest::McpServers));
+        }
         let cwd = validated_cwd(&request.cwd)?;
-        let prepared = self.sessions.prepare_load(&request.session_id, cwd)?;
+        let prepared = self
+            .sessions
+            .prepare_load(&request.session_id, cwd)
+            .map_err(|error| map_load_error(error, &request.session_id))?;
         Ok(LoadTransaction { prepared })
     }
 
@@ -93,34 +105,66 @@ impl LoadTransaction {
     /// Admit every replay notification before the response, committing only on success.
     pub(crate) fn complete_with(
         self,
-        mut notify: impl FnMut(SessionNotification) -> Result<()>,
-        respond: impl FnOnce(LoadSessionResponse) -> Result<()>,
-    ) -> Result<()> {
+        mut notify: impl FnMut(SessionNotification) -> Result<(), ProtocolError>,
+        respond: impl FnOnce(LoadSessionResponse) -> Result<(), ProtocolError>,
+    ) -> ControlResult<()> {
         let session_id = self.prepared.session_id();
         let updates = self.prepared.updates().to_vec();
-        let pending = self.prepared.activate()?;
+        let pending = self
+            .prepared
+            .activate()
+            .map_err(|error| map_load_error(error, &session_id))?;
         for update in updates {
-            notify(SessionNotification::new(session_id.clone(), update))?;
+            notify(SessionNotification::new(session_id.clone(), update))
+                .map_err(ControlError::Protocol)?;
         }
-        respond(LoadSessionResponse::new())?;
+        respond(LoadSessionResponse::new()).map_err(ControlError::Protocol)?;
         pending.commit();
         Ok(())
     }
 }
 
+fn map_load_error(
+    error: LoadError,
+    session_id: &agent_client_protocol::v1::schema::SessionId,
+) -> ControlError {
+    match error {
+        LoadError::InvalidSessionId => {
+            ControlError::invalid(InvalidSessionRequest::InvalidSessionId)
+        }
+        LoadError::SessionNotFound => ControlError::SessionNotFound(session_id.clone()),
+        LoadError::ActiveElsewhere => ControlError::invalid(InvalidSessionRequest::ActiveElsewhere),
+        LoadError::AlreadyRegistered => {
+            ControlError::invalid(InvalidSessionRequest::AlreadyRegistered)
+        }
+        LoadError::CwdMismatch => ControlError::invalid(InvalidSessionRequest::CwdMismatch),
+        LoadError::Internal(error) => ControlError::Internal(error),
+    }
+}
+
 /// Return the exact UTF-8 cwd after validating its durable session preconditions.
-fn validated_cwd(cwd: &Path) -> Result<&str> {
-    ensure!(cwd.is_absolute(), "ACP session cwd must be absolute");
+fn validated_cwd(cwd: &Path) -> ControlResult<&str> {
+    if !cwd.is_absolute() {
+        return Err(ControlError::invalid(InvalidSessionRequest::CwdNotAbsolute));
+    }
     let cwd = cwd
         .to_str()
-        .context("ACP session cwd must be valid UTF-8")?;
-    ensure!(!cwd.contains('\0'), "ACP session cwd must not contain NUL");
-    let metadata =
-        std::fs::metadata(cwd).with_context(|| format!("ACP session cwd does not exist: {cwd}"))?;
-    ensure!(
-        metadata.is_dir(),
-        "ACP session cwd is not a directory: {cwd}"
-    );
+        .ok_or_else(|| ControlError::invalid(InvalidSessionRequest::CwdNotUtf8))?;
+    if cwd.contains('\0') {
+        return Err(ControlError::invalid(InvalidSessionRequest::CwdContainsNul));
+    }
+    let metadata = std::fs::metadata(cwd).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ControlError::invalid(InvalidSessionRequest::CwdMissing),
+        std::io::ErrorKind::NotADirectory => {
+            ControlError::invalid(InvalidSessionRequest::CwdNotDirectory)
+        }
+        _ => ControlError::internal(error),
+    })?;
+    if !metadata.is_dir() {
+        return Err(ControlError::invalid(
+            InvalidSessionRequest::CwdNotDirectory,
+        ));
+    }
     Ok(cwd)
 }
 
@@ -171,19 +215,44 @@ mod tests {
         let file = directory.path().join("file.txt");
         std::fs::write(&file, "not a directory").unwrap();
         let cases = [
-            NewSessionRequest::new("relative/path"),
-            NewSessionRequest::new(directory.path().join("missing")),
-            NewSessionRequest::new(&file),
-            NewSessionRequest::new(directory.path())
-                .additional_directories(vec![directory.path().join("other")]),
-            NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
-                McpServerStdio::new("tools", "/bin/echo"),
-            )]),
+            (
+                NewSessionRequest::new("relative/path"),
+                InvalidSessionRequest::CwdNotAbsolute,
+            ),
+            (
+                NewSessionRequest::new(directory.path().join("missing")),
+                InvalidSessionRequest::CwdMissing,
+            ),
+            (
+                NewSessionRequest::new(&file),
+                InvalidSessionRequest::CwdNotDirectory,
+            ),
+            (
+                NewSessionRequest::new(directory.path())
+                    .additional_directories(vec![directory.path().join("other")]),
+                InvalidSessionRequest::AdditionalDirectories,
+            ),
+            (
+                NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
+                    McpServerStdio::new("tools", "/bin/echo"),
+                )]),
+                InvalidSessionRequest::McpServers,
+            ),
         ];
 
-        for request in cases {
-            assert!(control.new_session(&request).is_err());
+        for (request, reason) in cases {
+            assert!(matches!(
+                control.new_session(&request),
+                Err(ControlError::Invalid(actual)) if actual == reason
+            ));
         }
+        #[cfg(unix)]
+        assert!(matches!(
+            control.new_session(&NewSessionRequest::new(file.join("child"))),
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::CwdNotDirectory
+            ))
+        ));
         assert!(store.list().unwrap().is_empty());
     }
 
@@ -200,6 +269,44 @@ mod tests {
         }
         let session_id = SessionId::new(session.id());
         (session, session_id)
+    }
+
+    #[test]
+    fn load_classifies_client_identity_and_lease_failures() {
+        let (directory, store, control) = control();
+        let invalid_id = SessionId::new("../outside");
+        let invalid = LoadSessionRequest::new(invalid_id, directory.path());
+        assert!(matches!(
+            control.prepare_load(&invalid),
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::InvalidSessionId
+            ))
+        ));
+        assert!(!directory.path().join("outside.run.lock").exists());
+
+        let missing_id = SessionId::new("missing-session");
+        let missing = LoadSessionRequest::new(missing_id.clone(), directory.path());
+        let error = control.prepare_load(&missing).err().unwrap();
+        assert!(matches!(error, ControlError::SessionNotFound(_)));
+        let protocol: ProtocolError = error.into();
+        assert_eq!(
+            protocol.code,
+            agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
+        );
+        assert_eq!(
+            protocol.data,
+            Some(serde_json::json!({"sessionId": missing_id}))
+        );
+
+        let (session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let _lease = store.try_acquire_run_lease(session.id()).unwrap();
+        let active = LoadSessionRequest::new(session_id, directory.path());
+        assert!(matches!(
+            control.prepare_load(&active),
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::ActiveElsewhere
+            ))
+        ));
     }
 
     #[test]
@@ -309,10 +416,10 @@ mod tests {
         let other = TempDir::new().unwrap();
         let (_session, session_id) = persisted_session(&store, directory.path(), &[]);
         let wrong_cwd = LoadSessionRequest::new(session_id.clone(), other.path());
-        assert_eq!(
-            control.prepare_load(&wrong_cwd).err().unwrap().to_string(),
-            "ACP load cwd does not match persisted session cwd"
-        );
+        assert!(matches!(
+            control.prepare_load(&wrong_cwd),
+            Err(ControlError::Invalid(InvalidSessionRequest::CwdMismatch))
+        ));
         assert!(control.sessions.begin_prompt(&session_id).is_err());
         store
             .try_acquire_run_lease(&session_id.to_string())
@@ -337,10 +444,14 @@ mod tests {
         }];
         let (_corrupt, corrupt_id) = persisted_session(&store, directory.path(), &corrupt_records);
         let request = LoadSessionRequest::new(corrupt_id.clone(), directory.path());
+        let error = control.prepare_load(&request).err().unwrap();
+        assert!(matches!(error, ControlError::Internal(_)));
+        let protocol: ProtocolError = error.into();
         assert_eq!(
-            control.prepare_load(&request).err().unwrap().to_string(),
-            "duplicate ACP replay tool call ID: same"
+            protocol.code,
+            agent_client_protocol::ErrorCode::INTERNAL_ERROR
         );
+        assert_eq!(protocol.data, None);
         assert!(control.sessions.begin_prompt(&corrupt_id).is_err());
         store
             .try_acquire_run_lease(&corrupt_id.to_string())
@@ -380,14 +491,14 @@ mod tests {
                                 .to_string(),
                         );
                         if !fail_response && notification_count == 2 {
-                            anyhow::bail!("notification closed");
+                            return Err(ProtocolError::internal_error().data("notification closed"));
                         }
                         Ok(())
                     },
                     |_| {
                         events.borrow_mut().push("response".to_string());
                         if fail_response {
-                            anyhow::bail!("response closed");
+                            return Err(ProtocolError::internal_error().data("response closed"));
                         }
                         Ok(())
                     },
@@ -395,13 +506,15 @@ mod tests {
                 .err()
                 .unwrap();
 
+            let error: ProtocolError = error.into();
+            assert_eq!(error.code, agent_client_protocol::ErrorCode::INTERNAL_ERROR);
             assert_eq!(
-                error.to_string(),
-                if fail_response {
+                error.data,
+                Some(serde_json::json!(if fail_response {
                     "response closed"
                 } else {
                     "notification closed"
-                }
+                }))
             );
             let expected = if fail_response {
                 vec!["user_message_chunk", "agent_message_chunk", "response"]
