@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::compaction::{CompressionBatch, ContextProjection};
-use crate::model::{Message, Usage};
+use crate::model::{Message, ToolCall, Usage};
 
 use super::TurnResult;
 
@@ -80,8 +80,30 @@ pub trait EventSink: Send + Sync {
     /// A chunk of model reasoning arrived (DeepSeek `reasoning_content`).
     fn reasoning_delta(&self, _delta: &str) {}
 
+    /// A tool call started, including the provider identity and raw arguments.
+    ///
+    /// Existing sinks can keep implementing [`Self::tool_started`]; protocol
+    /// adapters override this method when they need stable call correlation.
+    fn tool_call_started(&self, call: &ToolCall, summary: &str) {
+        self.tool_started(&call.name, summary);
+    }
+
     /// A tool call started.
     fn tool_started(&self, _name: &str, _summary: &str) {}
+
+    /// A tool call finished, retaining the same provider call identity.
+    ///
+    /// Existing sinks can keep implementing [`Self::tool_finished`].
+    fn tool_call_finished(
+        &self,
+        call: &ToolCall,
+        ok: bool,
+        duration: Duration,
+        summary: &str,
+        output: &str,
+    ) {
+        self.tool_finished(&call.name, ok, duration, summary, output);
+    }
 
     /// A tool call finished; `output` is a shortened preview of its result.
     fn tool_finished(
@@ -138,6 +160,63 @@ impl EventSink for NullSink {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    struct LegacyToolSink {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl EventSink for LegacyToolSink {
+        fn tool_started(&self, name: &str, summary: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("start:{name}:{summary}"));
+        }
+
+        fn tool_finished(
+            &self,
+            name: &str,
+            ok: bool,
+            _duration: Duration,
+            summary: &str,
+            output: &str,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("finish:{name}:{ok}:{summary}:{output}"));
+        }
+    }
+
+    #[test]
+    fn structured_tool_callbacks_bridge_to_legacy_sinks() {
+        let sink = LegacyToolSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let call = ToolCall {
+            id: "call-7".to_string(),
+            name: "read_file".to_string(),
+            arguments: r#"{"path":"src/lib.rs"}"#.to_string(),
+        };
+
+        sink.tool_call_started(&call, "src/lib.rs");
+        sink.tool_call_finished(
+            &call,
+            true,
+            Duration::from_millis(3),
+            "src/lib.rs",
+            "contents",
+        );
+
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            vec![
+                "start:read_file:src/lib.rs",
+                "finish:read_file:true:src/lib.rs:contents"
+            ]
+        );
+    }
 
     #[test]
     fn default_injected_user_persistence_fails_closed() {

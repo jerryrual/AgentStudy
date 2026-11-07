@@ -3,6 +3,8 @@
 
 use async_trait::async_trait;
 
+use crate::model::ToolCall;
+
 /// A mutating operation that needs consent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalRequest {
@@ -34,7 +36,17 @@ pub enum ApprovalDecision {
 /// Decides whether a mutating tool call may run.
 #[async_trait]
 pub trait Approver: Send + Sync {
+    /// Decide using the legacy display-only approval request.
     async fn approve(&self, request: &ApprovalRequest) -> ApprovalDecision;
+
+    /// Decide one exact provider tool call.
+    ///
+    /// Existing approvers inherit the display-only behavior. Protocol adapters
+    /// can override this hook to retain the stable call id and raw arguments.
+    async fn approve_tool(&self, call: &ToolCall, summary: &str) -> ApprovalDecision {
+        self.approve(&ApprovalRequest::new(&call.name, summary))
+            .await
+    }
 }
 
 /// Approves everything, used by `icode run` (which mirrors iCode's bypass) and
@@ -124,5 +136,28 @@ impl Approver for ScriptedApprover {
             .ok()
             .and_then(|mut decisions| decisions.pop_front())
             .unwrap_or(ApprovalDecision::Deny)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn structured_approval_falls_back_to_the_legacy_request() {
+        let approver = ScriptedApprover::new([ApprovalDecision::AllowOnce]);
+        let call = ToolCall {
+            id: "call-9".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"cargo test"}"#.to_string(),
+        };
+
+        let decision = approver.approve_tool(&call, "cargo test").await;
+
+        assert_eq!(decision, ApprovalDecision::AllowOnce);
+        assert_eq!(
+            *approver.requests.lock().unwrap(),
+            vec![ApprovalRequest::new("bash", "cargo test")]
+        );
     }
 }
