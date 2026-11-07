@@ -153,12 +153,12 @@ fn validated_cwd(cwd: &Path) -> ControlResult<&str> {
     if cwd.contains('\0') {
         return Err(ControlError::invalid(InvalidSessionRequest::CwdContainsNul));
     }
-    let metadata = std::fs::metadata(cwd).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ControlError::invalid(InvalidSessionRequest::CwdMissing)
-        } else {
-            ControlError::internal(error)
+    let metadata = std::fs::metadata(cwd).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ControlError::invalid(InvalidSessionRequest::CwdMissing),
+        std::io::ErrorKind::NotADirectory => {
+            ControlError::invalid(InvalidSessionRequest::CwdNotDirectory)
         }
+        _ => ControlError::internal(error),
     })?;
     if !metadata.is_dir() {
         return Err(ControlError::invalid(
@@ -246,6 +246,13 @@ mod tests {
                 Err(ControlError::Invalid(actual)) if actual == reason
             ));
         }
+        #[cfg(unix)]
+        assert!(matches!(
+            control.new_session(&NewSessionRequest::new(file.join("child"))),
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::CwdNotDirectory
+            ))
+        ));
         assert!(store.list().unwrap().is_empty());
     }
 
