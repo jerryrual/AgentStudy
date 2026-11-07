@@ -48,6 +48,10 @@ impl SessionRegistry {
 
     /// Open and exclusively own an existing persistent session.
     pub(crate) fn open(&self, session_id: &SessionId) -> Result<()> {
+        ensure!(
+            !lock(&self.sessions).contains_key(session_id),
+            "ACP session {session_id} is already registered"
+        );
         let id = session_id.to_string();
         let run_lease = self.store.try_acquire_run_lease(&id)?;
         let session = self.store.reopen(&id)?;
@@ -75,7 +79,8 @@ impl SessionRegistry {
 
     /// Acquire the only active prompt slot for a session.
     pub(crate) fn begin_prompt(&self, session_id: &SessionId) -> Result<PromptGuard> {
-        let registered = lock(&self.sessions)
+        let sessions = lock(&self.sessions);
+        let registered = sessions
             .get(session_id)
             .cloned()
             .with_context(|| format!("unknown ACP session {session_id}"))?;
@@ -88,10 +93,24 @@ impl SessionRegistry {
             );
             *active_prompt = Some(cancel);
         }
+        drop(sessions);
         Ok(PromptGuard {
             registered,
             cancellation,
         })
+    }
+
+    /// Release an idle registered session and its run lease.
+    pub(crate) fn close(&self, session_id: &SessionId) -> bool {
+        let mut sessions = lock(&self.sessions);
+        let Some(registered) = sessions.get(session_id) else {
+            return false;
+        };
+        if lock(&registered.active_prompt).is_some() {
+            return false;
+        }
+        sessions.remove(session_id);
+        true
     }
 
     /// Request cancellation without marking the prompt idle before it exits.
@@ -191,7 +210,25 @@ mod tests {
 
         drop(external_lease);
         registry.open(&session_id).unwrap();
+        let duplicate = registry.open(&session_id).unwrap_err();
+        assert!(duplicate.to_string().contains("already registered"));
         registry.begin_prompt(&session_id).unwrap();
+    }
+
+    #[test]
+    fn close_refuses_an_active_prompt_then_releases_the_idle_run_lease() {
+        let (_directory, store, registry) = registry();
+        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let id = session_id.to_string();
+        let guard = registry.begin_prompt(&session_id).unwrap();
+
+        assert!(!registry.close(&session_id));
+        assert!(store.try_acquire_run_lease(&id).is_err());
+
+        drop(guard);
+        assert!(registry.close(&session_id));
+        store.try_acquire_run_lease(&id).unwrap();
+        assert!(!registry.close(&session_id));
     }
 
     #[test]
