@@ -32,8 +32,8 @@ struct RegisteredSession {
 /// A validated load whose replay is complete but whose session is not exposed.
 pub(crate) struct PreparedLoad {
     registry: Arc<SessionRegistry>,
-    session: Option<Session>,
-    run_lease: Option<SessionRunLease>,
+    session: Session,
+    run_lease: SessionRunLease,
     updates: Vec<SessionUpdate>,
 }
 
@@ -88,8 +88,8 @@ impl SessionRegistry {
         let session = self.store.reopen(&id)?;
         Ok(PreparedLoad {
             registry: Arc::clone(self),
-            session: Some(session),
-            run_lease: Some(run_lease),
+            session,
+            run_lease,
             updates,
         })
     }
@@ -177,12 +177,7 @@ impl SessionRegistry {
 impl PreparedLoad {
     /// Return the stable ACP session ID that will be registered on activation.
     pub(crate) fn session_id(&self) -> SessionId {
-        SessionId::new(
-            self.session
-                .as_ref()
-                .expect("prepared load owns its session until activation")
-                .id(),
-        )
+        SessionId::new(self.session.id())
     }
 
     /// Return the fully validated replay projection without exposing the session.
@@ -191,18 +186,16 @@ impl PreparedLoad {
     }
 
     /// Register this load as pending while its protocol response is admitted.
-    pub(crate) fn activate(mut self) -> Result<PendingLoad> {
-        let session = self
-            .session
-            .take()
-            .expect("prepared load owns its session until activation");
-        let run_lease = self
-            .run_lease
-            .take()
-            .expect("prepared load owns its run lease until activation");
-        let (session_id, registered) = self.registry.register(session, run_lease, false)?;
+    pub(crate) fn activate(self) -> Result<PendingLoad> {
+        let PreparedLoad {
+            registry,
+            session,
+            run_lease,
+            updates: _,
+        } = self;
+        let (session_id, registered) = registry.register(session, run_lease, false)?;
         Ok(PendingLoad {
-            registry: Arc::clone(&self.registry),
+            registry,
             session_id,
             registered,
             committed: false,
