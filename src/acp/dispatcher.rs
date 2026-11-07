@@ -1,4 +1,4 @@
-//! Ordered delivery of internal turn events as ACP session notifications.
+//! Ordered admission of internal turn events as ACP session notifications.
 
 use agent_client_protocol::v1::{
     schema::{SessionId, SessionNotification},
@@ -13,8 +13,7 @@ use super::event_mapping::session_update;
 
 /// Drain one turn's events and wrap every mappable update with one session ID.
 ///
-/// The first send error stops delivery so later updates cannot overtake an
-/// unreported failure.
+/// The first synchronous send error stops admission of later updates.
 async fn dispatch_with<E>(
     session_id: SessionId,
     mut events: UnboundedReceiver<TurnEvent>,
@@ -28,7 +27,9 @@ async fn dispatch_with<E>(
     Ok(())
 }
 
-/// Deliver one turn's notifications to an established stable ACP client connection.
+/// Admit one turn's notifications to an established stable ACP client connection.
+///
+/// Successful admission does not guarantee transport delivery.
 #[allow(dead_code, reason = "consumed by the upcoming ACP prompt handler")]
 pub(crate) async fn dispatch_to_client(
     session_id: SessionId,
