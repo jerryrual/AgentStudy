@@ -2,4 +2,5 @@
 
 pub(crate) mod dispatcher;
 pub(crate) mod event_mapping;
+pub(crate) mod prompt;
 pub(crate) mod sessions;
