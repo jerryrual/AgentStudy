@@ -12,26 +12,29 @@ use crate::model::Message;
 /// Convert baseline ACP prompt blocks into one internal user message.
 pub(crate) fn user_message(blocks: &[ContentBlock]) -> Result<Message> {
     let mut text = Vec::with_capacity(blocks.len());
+    let mut has_meaningful_content = false;
     for block in blocks {
         match block {
-            ContentBlock::Text(content) => text.push(content.text.clone()),
-            ContentBlock::ResourceLink(link) => text.push(format!(
-                "[resource: {} <{}>]",
-                link.title.as_deref().unwrap_or(&link.name),
-                link.uri
-            )),
+            ContentBlock::Text(content) => {
+                has_meaningful_content |= !content.text.trim().is_empty();
+                text.push(content.text.clone());
+            }
+            ContentBlock::ResourceLink(link) => {
+                let label = link.title.as_deref().unwrap_or(&link.name);
+                has_meaningful_content |= !label.trim().is_empty() || !link.uri.trim().is_empty();
+                text.push(format!("[resource: {label} <{}>]", link.uri));
+            }
             ContentBlock::Image(_) => bail!("unsupported ACP prompt content block: image"),
             ContentBlock::Audio(_) => bail!("unsupported ACP prompt content block: audio"),
             ContentBlock::Resource(_) => bail!("unsupported ACP prompt content block: resource"),
             _ => bail!("unsupported ACP prompt content block: unknown"),
         }
     }
-    let text = text.join("\n\n");
     ensure!(
-        !text.trim().is_empty(),
+        has_meaningful_content,
         "ACP prompt must contain non-empty content"
     );
-    Ok(Message::user(text))
+    Ok(Message::user(text.join("\n\n")))
 }
 
 #[cfg(test)]
@@ -84,11 +87,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_or_whitespace_only_text_prompts() {
+    fn rejects_prompts_without_meaningful_baseline_content() {
         for blocks in [
             Vec::new(),
             vec![ContentBlock::from("")],
             vec![ContentBlock::from(" \n"), ContentBlock::from("\t")],
+            vec![ContentBlock::ResourceLink(
+                ResourceLink::new("name is ignored", " \n").title("\t"),
+            )],
         ] {
             let error = user_message(&blocks).unwrap_err();
             assert_eq!(
@@ -96,6 +102,19 @@ mod tests {
                 "ACP prompt must contain non-empty content"
             );
         }
+    }
+
+    #[test]
+    fn retains_an_empty_link_projection_when_other_content_is_meaningful() {
+        let blocks = [
+            ContentBlock::from("kept"),
+            ContentBlock::ResourceLink(ResourceLink::new(" ", "\t")),
+        ];
+
+        assert_eq!(
+            user_message(&blocks).unwrap(),
+            Message::user("kept\n\n[resource:   <\t>]")
+        );
     }
 
     #[test]
