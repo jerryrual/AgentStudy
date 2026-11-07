@@ -24,6 +24,7 @@ pub(crate) struct SessionControl {
 }
 
 impl SessionControl {
+    /// Create a control boundary with defaults for newly persisted sessions.
     pub(crate) fn new(
         sessions: Arc<SessionRegistry>,
         model: impl Into<String>,
@@ -67,6 +68,7 @@ impl SessionControl {
     }
 }
 
+/// Return the exact UTF-8 cwd after validating its durable session preconditions.
 fn validated_cwd(cwd: &Path) -> Result<&str> {
     ensure!(cwd.is_absolute(), "ACP session cwd must be absolute");
     let cwd = cwd
