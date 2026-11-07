@@ -12,9 +12,42 @@ use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
 use anyhow::{ensure, Context, Result};
 use tokio::sync::watch;
 
-use crate::session::{Session, SessionRunLease, SessionStore};
+use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
 
 use super::history_replay::replay_updates;
+
+/// A classified failure while preparing or activating an ACP session load.
+#[derive(Debug)]
+pub(crate) enum LoadError {
+    InvalidSessionId,
+    SessionNotFound,
+    ActiveElsewhere,
+    AlreadyRegistered,
+    CwdMismatch,
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSessionId => f.write_str("invalid ACP session ID"),
+            Self::SessionNotFound => f.write_str("ACP session not found"),
+            Self::ActiveElsewhere => f.write_str("ACP session is active in another process"),
+            Self::AlreadyRegistered => f.write_str("ACP session is already registered"),
+            Self::CwdMismatch => f.write_str("ACP load cwd does not match persisted session cwd"),
+            Self::Internal(_) => f.write_str("internal ACP load error"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Internal(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// In-process ACP sessions backed by the existing persistent session store.
 pub(crate) struct SessionRegistry {
@@ -73,24 +106,44 @@ impl SessionRegistry {
         self: &Arc<Self>,
         session_id: &SessionId,
         expected_cwd: &str,
-    ) -> Result<PreparedLoad> {
-        ensure!(
-            !lock(&self.sessions).contains_key(session_id),
-            "ACP session {session_id} is already registered"
-        );
+    ) -> std::result::Result<PreparedLoad, LoadError> {
+        if lock(&self.sessions).contains_key(session_id) {
+            return Err(LoadError::AlreadyRegistered);
+        }
         let id = session_id.to_string();
-        let run_lease = self.store.try_acquire_run_lease(&id)?;
-        let loaded = self.store.load(&id)?;
-        ensure!(
-            loaded.meta.id == id,
-            "ACP load session id does not match persisted metadata"
-        );
-        ensure!(
-            loaded.meta.cwd == expected_cwd,
-            "ACP load cwd does not match persisted session cwd"
-        );
-        let updates = replay_updates(&loaded.records)?;
-        let session = self.store.reopen_loaded(&id, loaded)?;
+        let run_lease = self
+            .store
+            .try_acquire_run_lease(&id)
+            .map_err(|error| match error {
+                RunLeaseError::InvalidSessionId(_) => LoadError::InvalidSessionId,
+                RunLeaseError::SessionNotFound(_) => LoadError::SessionNotFound,
+                RunLeaseError::ActiveElsewhere { .. } => LoadError::ActiveElsewhere,
+                RunLeaseError::Internal(error) => LoadError::Internal(error),
+            })?;
+        let loaded = self.store.load(&id).map_err(|error| {
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            }) {
+                LoadError::SessionNotFound
+            } else {
+                LoadError::Internal(error)
+            }
+        })?;
+        if loaded.meta.id != id {
+            return Err(LoadError::Internal(anyhow::anyhow!(
+                "ACP load session id does not match persisted metadata"
+            )));
+        }
+        if loaded.meta.cwd != expected_cwd {
+            return Err(LoadError::CwdMismatch);
+        }
+        let updates = replay_updates(&loaded.records).map_err(LoadError::Internal)?;
+        let session = self
+            .store
+            .reopen_loaded(&id, loaded)
+            .map_err(LoadError::Internal)?;
         Ok(PreparedLoad {
             registry: Arc::clone(self),
             session,
@@ -191,14 +244,16 @@ impl PreparedLoad {
     }
 
     /// Register this load as pending while its protocol response is admitted.
-    pub(crate) fn activate(self) -> Result<PendingLoad> {
+    pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
         let PreparedLoad {
             registry,
             session,
             run_lease,
             updates: _,
         } = self;
-        let (session_id, registered) = registry.register(session, run_lease, false)?;
+        let (session_id, registered) = registry
+            .register(session, run_lease, false)
+            .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
             session_id,
@@ -303,7 +358,7 @@ mod tests {
         let id = session_id.to_string();
 
         let error = store.try_acquire_run_lease(&id).unwrap_err();
-        assert!(error.to_string().contains("active in another process"));
+        assert!(matches!(error, RunLeaseError::ActiveElsewhere { .. }));
 
         drop(registry);
         store.try_acquire_run_lease(&id).unwrap();
@@ -321,7 +376,7 @@ mod tests {
             .prepare_load(&session_id, "/workspace")
             .err()
             .unwrap();
-        assert!(error.to_string().contains("active in another process"));
+        assert!(matches!(error, LoadError::ActiveElsewhere));
         assert!(registry.begin_prompt(&session_id).is_err());
 
         drop(external_lease);
@@ -331,7 +386,7 @@ mod tests {
             .prepare_load(&session_id, "/workspace")
             .err()
             .unwrap();
-        assert!(duplicate.to_string().contains("already registered"));
+        assert!(matches!(duplicate, LoadError::AlreadyRegistered));
         assert!(registry.begin_prompt(&session_id).is_err());
         pending.commit();
         registry.begin_prompt(&session_id).unwrap();
@@ -361,10 +416,7 @@ mod tests {
             .prepare_load(&session_id, "/workspace")
             .err()
             .unwrap();
-        assert_eq!(
-            error.to_string(),
-            "ACP load session id does not match persisted metadata"
-        );
+        assert!(matches!(error, LoadError::Internal(_)));
         assert!(registry.begin_prompt(&session_id).is_err());
         store.try_acquire_run_lease(&id).unwrap();
     }

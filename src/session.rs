@@ -149,6 +149,38 @@ pub(crate) struct SessionRunLease {
     _file: std::fs::File,
 }
 
+#[derive(Debug)]
+pub(crate) enum RunLeaseError {
+    InvalidSessionId(anyhow::Error),
+    SessionNotFound(anyhow::Error),
+    ActiveElsewhere { id: String },
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for RunLeaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSessionId(_) => f.write_str("invalid session ID"),
+            Self::SessionNotFound(_) => f.write_str("session not found"),
+            Self::ActiveElsewhere { id } => {
+                write!(f, "session {id} is active in another process")
+            }
+            Self::Internal(_) => f.write_str("failed to acquire session run lease"),
+        }
+    }
+}
+
+impl std::error::Error for RunLeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSessionId(error)
+            | Self::SessionNotFound(error)
+            | Self::Internal(error) => Some(error.as_ref()),
+            Self::ActiveElsewhere { .. } => None,
+        }
+    }
+}
+
 fn is_lock_contended(error: &std::io::Error) -> bool {
     let expected = fs2::lock_contended_error();
     error.kind() == expected.kind()
@@ -1391,20 +1423,36 @@ impl SessionStore {
         &self.root
     }
 
-    pub(crate) fn try_acquire_run_lease(&self, id: &str) -> Result<SessionRunLease> {
-        validate_session_id(id)?;
+    pub(crate) fn try_acquire_run_lease(
+        &self,
+        id: &str,
+    ) -> std::result::Result<SessionRunLease, RunLeaseError> {
+        validate_session_id(id).map_err(RunLeaseError::InvalidSessionId)?;
         let transcript = self.path(id);
-        open_read_nofollow(&transcript).with_context(|| format!("failed to open session {id}"))?;
+        if let Err(error) =
+            open_read_nofollow(&transcript).with_context(|| format!("failed to open session {id}"))
+        {
+            let not_found = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            });
+            return Err(if not_found {
+                RunLeaseError::SessionNotFound(error)
+            } else {
+                RunLeaseError::Internal(error)
+            });
+        }
         let path = self.root.join(format!("{id}.run.lock"));
         let file = open_append_private_nofollow(&path)
-            .with_context(|| format!("failed to open session run lease {}", path.display()))?;
+            .with_context(|| format!("failed to open session run lease {}", path.display()))
+            .map_err(RunLeaseError::Internal)?;
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => Ok(SessionRunLease { _file: file }),
             Err(error) if is_lock_contended(&error) => {
-                anyhow::bail!("session {id} is active in another process")
+                Err(RunLeaseError::ActiveElsewhere { id: id.to_string() })
             }
-            Err(error) => Err(error)
-                .with_context(|| format!("failed to acquire session run lease {}", path.display())),
+            Err(error) => Err(RunLeaseError::Internal(error.into())),
         }
     }
 
