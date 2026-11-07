@@ -5,13 +5,16 @@
 )]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use agent_client_protocol::v1::schema::SessionId;
+use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
 use anyhow::{ensure, Context, Result};
 use tokio::sync::watch;
 
 use crate::session::{Session, SessionRunLease, SessionStore};
+
+use super::history_replay::replay_updates;
 
 /// In-process ACP sessions backed by the existing persistent session store.
 pub(crate) struct SessionRegistry {
@@ -22,7 +25,24 @@ pub(crate) struct SessionRegistry {
 struct RegisteredSession {
     session: Session,
     _run_lease: SessionRunLease,
+    ready: AtomicBool,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// A validated load whose replay is complete but whose session is not exposed.
+pub(crate) struct PreparedLoad {
+    registry: Arc<SessionRegistry>,
+    session: Option<Session>,
+    run_lease: Option<SessionRunLease>,
+    updates: Vec<SessionUpdate>,
+}
+
+/// A load registered as pending while its response is admitted.
+pub(crate) struct PendingLoad {
+    registry: Arc<SessionRegistry>,
+    session_id: SessionId,
+    registered: Arc<RegisteredSession>,
+    committed: bool,
 }
 
 /// Exclusive permission to run one prompt for a registered session.
@@ -43,38 +63,57 @@ impl SessionRegistry {
     pub(crate) fn create(&self, cwd: &str, model: &str, agent: &str) -> Result<SessionId> {
         let session = self.store.create(cwd, model, agent)?;
         let run_lease = self.store.try_acquire_run_lease(session.id())?;
-        self.register(session, run_lease)
+        self.register(session, run_lease, true)
+            .map(|(session_id, _)| session_id)
     }
 
-    /// Open and exclusively own an existing persistent session.
-    pub(crate) fn open(&self, session_id: &SessionId) -> Result<()> {
+    /// Validate and project a persisted session while holding its run lease.
+    pub(crate) fn prepare_load(
+        self: &Arc<Self>,
+        session_id: &SessionId,
+        expected_cwd: &str,
+    ) -> Result<PreparedLoad> {
         ensure!(
             !lock(&self.sessions).contains_key(session_id),
             "ACP session {session_id} is already registered"
         );
         let id = session_id.to_string();
         let run_lease = self.store.try_acquire_run_lease(&id)?;
+        let loaded = self.store.load(&id)?;
+        ensure!(
+            loaded.meta.cwd == expected_cwd,
+            "ACP load cwd does not match persisted session cwd"
+        );
+        let updates = replay_updates(&loaded.records)?;
         let session = self.store.reopen(&id)?;
-        self.register(session, run_lease)?;
-        Ok(())
+        Ok(PreparedLoad {
+            registry: Arc::clone(self),
+            session: Some(session),
+            run_lease: Some(run_lease),
+            updates,
+        })
     }
 
-    fn register(&self, session: Session, run_lease: SessionRunLease) -> Result<SessionId> {
+    fn register(
+        &self,
+        session: Session,
+        run_lease: SessionRunLease,
+        ready: bool,
+    ) -> Result<(SessionId, Arc<RegisteredSession>)> {
         let session_id = SessionId::new(session.id());
         let mut sessions = lock(&self.sessions);
         ensure!(
             !sessions.contains_key(&session_id),
             "ACP session {session_id} is already registered"
         );
-        sessions.insert(
-            session_id.clone(),
-            Arc::new(RegisteredSession {
-                session,
-                _run_lease: run_lease,
-                active_prompt: Mutex::new(None),
-            }),
-        );
-        Ok(session_id)
+        let registered = Arc::new(RegisteredSession {
+            session,
+            _run_lease: run_lease,
+            ready: AtomicBool::new(ready),
+            active_prompt: Mutex::new(None),
+        });
+        sessions.insert(session_id.clone(), Arc::clone(&registered));
+        Ok((session_id, registered))
     }
 
     /// Acquire the only active prompt slot for a session.
@@ -84,6 +123,10 @@ impl SessionRegistry {
             .get(session_id)
             .cloned()
             .with_context(|| format!("unknown ACP session {session_id}"))?;
+        ensure!(
+            registered.ready.load(Ordering::Acquire),
+            "ACP session {session_id} is still loading"
+        );
         let (cancel, cancellation) = watch::channel(false);
         {
             let mut active_prompt = lock(&registered.active_prompt);
@@ -106,7 +149,7 @@ impl SessionRegistry {
         let Some(registered) = sessions.get(session_id) else {
             return false;
         };
-        if lock(&registered.active_prompt).is_some() {
+        if !registered.ready.load(Ordering::Acquire) || lock(&registered.active_prompt).is_some() {
             return false;
         }
         sessions.remove(session_id);
@@ -119,12 +162,82 @@ impl SessionRegistry {
         let Some(registered) = registered else {
             return false;
         };
+        if !registered.ready.load(Ordering::Acquire) {
+            return false;
+        }
         let active_prompt = lock(&registered.active_prompt);
         let Some(cancel) = active_prompt.as_ref() else {
             return false;
         };
         cancel.send_replace(true);
         true
+    }
+}
+
+impl PreparedLoad {
+    /// Return the stable ACP session ID that will be registered on activation.
+    pub(crate) fn session_id(&self) -> SessionId {
+        SessionId::new(
+            self.session
+                .as_ref()
+                .expect("prepared load owns its session until activation")
+                .id(),
+        )
+    }
+
+    /// Return the fully validated replay projection without exposing the session.
+    pub(crate) fn updates(&self) -> &[SessionUpdate] {
+        &self.updates
+    }
+
+    /// Register this load as pending while its protocol response is admitted.
+    pub(crate) fn activate(mut self) -> Result<PendingLoad> {
+        let session = self
+            .session
+            .take()
+            .expect("prepared load owns its session until activation");
+        let run_lease = self
+            .run_lease
+            .take()
+            .expect("prepared load owns its run lease until activation");
+        let (session_id, registered) = self.registry.register(session, run_lease, false)?;
+        Ok(PendingLoad {
+            registry: Arc::clone(&self.registry),
+            session_id,
+            registered,
+            committed: false,
+        })
+    }
+}
+
+impl PendingLoad {
+    /// Make the session prompt-visible after its load response was admitted.
+    pub(crate) fn commit(mut self) {
+        let sessions = lock(&self.registry.sessions);
+        let owns_registration = sessions
+            .get(&self.session_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.registered));
+        assert!(
+            owns_registration,
+            "pending ACP load registration was replaced"
+        );
+        self.registered.ready.store(true, Ordering::Release);
+        self.committed = true;
+    }
+}
+
+impl Drop for PendingLoad {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut sessions = lock(&self.registry.sessions);
+        let owns_registration = sessions
+            .get(&self.session_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, &self.registered));
+        if owns_registration {
+            sessions.remove(&self.session_id);
+        }
     }
 }
 
@@ -198,20 +311,30 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_session_fails_closed_while_an_external_run_lease_exists() {
+    fn preparing_a_load_fails_closed_while_an_external_run_lease_exists() {
         let (_directory, store, registry) = registry();
+        let registry = Arc::new(registry);
         let session = store.create("/workspace", "model-a", "build").unwrap();
         let session_id = SessionId::new(session.id());
         let external_lease = store.try_acquire_run_lease(session.id()).unwrap();
 
-        let error = registry.open(&session_id).unwrap_err();
+        let error = registry
+            .prepare_load(&session_id, "/workspace")
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("active in another process"));
         assert!(registry.begin_prompt(&session_id).is_err());
 
         drop(external_lease);
-        registry.open(&session_id).unwrap();
-        let duplicate = registry.open(&session_id).unwrap_err();
+        let prepared = registry.prepare_load(&session_id, "/workspace").unwrap();
+        let pending = prepared.activate().unwrap();
+        let duplicate = registry
+            .prepare_load(&session_id, "/workspace")
+            .err()
+            .unwrap();
         assert!(duplicate.to_string().contains("already registered"));
+        assert!(registry.begin_prompt(&session_id).is_err());
+        pending.commit();
         registry.begin_prompt(&session_id).unwrap();
     }
 
