@@ -50,13 +50,16 @@ pub(crate) enum ControlError {
     Protocol(ProtocolError),
 }
 
+/// Result returned by ACP control boundaries before wire conversion.
 pub(crate) type ControlResult<T> = Result<T, ControlError>;
 
 impl ControlError {
+    /// Classify one fixed client-controlled validation failure.
     pub(crate) fn invalid(reason: InvalidSessionRequest) -> Self {
         Self::Invalid(reason)
     }
 
+    /// Preserve an internal source for local diagnostics and sanitized mapping.
     pub(crate) fn internal(error: impl Into<Error>) -> Self {
         Self::Internal(error.into())
     }
@@ -90,7 +93,10 @@ impl From<ControlError> for ProtocolError {
             ControlError::SessionNotFound(session_id) => {
                 schema::Error::session_not_found(session_id).into()
             }
-            ControlError::Internal(_) => ProtocolError::internal_error(),
+            ControlError::Internal(error) => {
+                eprintln!("warning: ACP internal error: {error:#}");
+                ProtocolError::internal_error()
+            }
             ControlError::Protocol(error) => error,
         }
     }
