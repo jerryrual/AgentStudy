@@ -10,6 +10,7 @@
 //! * [`tui`] — the ratatui terminal user interface.
 //! * [`run`] — headless, non-interactive execution (`icode run`).
 
+pub(crate) mod acp;
 pub mod agent;
 pub mod cli;
 pub mod compaction;
