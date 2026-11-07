@@ -1,5 +1,6 @@
 //! Agent Client Protocol integration foundations.
 
+pub(crate) mod callbacks;
 pub(crate) mod dispatcher;
 pub(crate) mod error;
 pub(crate) mod event_mapping;
