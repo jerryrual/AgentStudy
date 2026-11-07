@@ -6,6 +6,7 @@ use agent_client_protocol::v1::schema::{
 };
 use serde_json::Value;
 
+use crate::model::ToolCall as ModelToolCall;
 use crate::run::turn_events::TurnEvent;
 
 /// Map one internal event without inventing session or message identity.
@@ -20,47 +21,52 @@ pub(crate) fn session_update(event: TurnEvent) -> Option<SessionUpdate> {
     match event {
         TurnEvent::TextDelta(text) => Some(SessionUpdate::AgentMessageChunk(text_chunk(text))),
         TurnEvent::ReasoningDelta(text) => Some(SessionUpdate::AgentThoughtChunk(text_chunk(text))),
-        TurnEvent::ToolStarted { call, summary } => {
-            let title = if summary.is_empty() {
-                call.name.clone()
-            } else {
-                summary
-            };
-            let raw_input = call
-                .parse_arguments()
-                .unwrap_or_else(|_| Value::String(call.arguments.clone()));
-            Some(SessionUpdate::ToolCall(
-                ToolCall::new(call.id, title)
-                    .name(call.name.clone())
-                    .kind(tool_kind(&call.name))
-                    .status(ToolCallStatus::InProgress)
-                    .raw_input(raw_input),
-            ))
-        }
+        TurnEvent::ToolStarted { call, summary } => Some(tool_started(call, summary)),
         TurnEvent::ToolFinished {
             call, ok, output, ..
-        } => {
-            let status = if ok {
-                ToolCallStatus::Completed
-            } else {
-                ToolCallStatus::Failed
-            };
-            let fields = ToolCallUpdateFields::new()
-                .status(status)
-                .content(vec![ToolCallContent::from(output.clone())])
-                .raw_output(Value::String(output));
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                call.id, fields,
-            )))
-        }
+        } => Some(tool_finished(call.id, ok, output)),
         TurnEvent::Usage(_) | TurnEvent::Info(_) | TurnEvent::Error(_) | TurnEvent::Warning(_) => {
             None
         }
     }
 }
 
-fn text_chunk(text: String) -> ContentChunk {
+/// Wrap one exact text payload as an ACP content chunk.
+pub(super) fn text_chunk(text: String) -> ContentChunk {
     ContentChunk::new(text.into())
+}
+
+/// Project an internal tool declaration as an in-progress ACP tool call.
+pub(super) fn tool_started(call: ModelToolCall, summary: String) -> SessionUpdate {
+    let title = if summary.is_empty() {
+        call.name.clone()
+    } else {
+        summary
+    };
+    let raw_input = call
+        .parse_arguments()
+        .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+    SessionUpdate::ToolCall(
+        ToolCall::new(call.id, title)
+            .name(call.name.clone())
+            .kind(tool_kind(&call.name))
+            .status(ToolCallStatus::InProgress)
+            .raw_input(raw_input),
+    )
+}
+
+/// Project an internal tool result as a terminal ACP tool update.
+pub(super) fn tool_finished(call_id: String, ok: bool, output: String) -> SessionUpdate {
+    let status = if ok {
+        ToolCallStatus::Completed
+    } else {
+        ToolCallStatus::Failed
+    };
+    let fields = ToolCallUpdateFields::new()
+        .status(status)
+        .content(vec![ToolCallContent::from(output.clone())])
+        .raw_output(Value::String(output));
+    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id, fields))
 }
 
 fn tool_kind(name: &str) -> ToolKind {
