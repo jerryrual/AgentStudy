@@ -52,6 +52,7 @@ pub(crate) struct PromptGuard {
 }
 
 impl SessionRegistry {
+    /// Create an empty in-process registry over the persistent session store.
     pub(crate) fn new(store: SessionStore) -> Self {
         Self {
             store,
@@ -85,7 +86,7 @@ impl SessionRegistry {
             "ACP load cwd does not match persisted session cwd"
         );
         let updates = replay_updates(&loaded.records)?;
-        let session = self.store.reopen(&id)?;
+        let session = self.store.reopen_loaded(&id, loaded)?;
         Ok(PreparedLoad {
             registry: Arc::clone(self),
             session,
@@ -235,6 +236,7 @@ impl Drop for PendingLoad {
 }
 
 impl PromptGuard {
+    /// Return the persistent session exclusively owned by this prompt slot.
     pub(crate) fn session(&self) -> &Session {
         &self.registered.session
     }
