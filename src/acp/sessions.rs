@@ -82,6 +82,10 @@ impl SessionRegistry {
         let run_lease = self.store.try_acquire_run_lease(&id)?;
         let loaded = self.store.load(&id)?;
         ensure!(
+            loaded.meta.id == id,
+            "ACP load session id does not match persisted metadata"
+        );
+        ensure!(
             loaded.meta.cwd == expected_cwd,
             "ACP load cwd does not match persisted session cwd"
         );
@@ -331,6 +335,38 @@ mod tests {
         assert!(registry.begin_prompt(&session_id).is_err());
         pending.commit();
         registry.begin_prompt(&session_id).unwrap();
+    }
+
+    #[test]
+    fn preparing_a_load_rejects_mismatched_metadata_id_without_state() {
+        let (directory, store, registry) = registry();
+        let registry = Arc::new(registry);
+        let session = store.create("/workspace", "model-a", "build").unwrap();
+        let id = session.id().to_string();
+        let session_id = SessionId::new(id.as_str());
+        let path = directory
+            .path()
+            .join("sessions")
+            .join(format!("{id}.jsonl"));
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        meta["meta"]["id"] = serde_json::json!("different-id");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&meta).unwrap()),
+        )
+        .unwrap();
+
+        let error = registry
+            .prepare_load(&session_id, "/workspace")
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "ACP load session id does not match persisted metadata"
+        );
+        assert!(registry.begin_prompt(&session_id).is_err());
+        store.try_acquire_run_lease(&id).unwrap();
     }
 
     #[test]
