@@ -207,16 +207,13 @@ impl StdioJsonRpc {
 
     pub(crate) async fn send(&mut self, message: &Value) -> Result<(), TransportError> {
         validate_envelope(message)?;
-        let encoded = serde_json::to_vec(message).map_err(TransportError::Json)?;
+        let mut encoded = serde_json::to_vec(message).map_err(TransportError::Json)?;
         if encoded.len() > MAX_MESSAGE_BYTES {
             return Err(TransportError::Oversized);
         }
+        encoded.push(b'\n');
         self.stdin
             .write_all(&encoded)
-            .await
-            .map_err(TransportError::Io)?;
-        self.stdin
-            .write_all(b"\n")
             .await
             .map_err(TransportError::Io)?;
         self.stdin.flush().await.map_err(TransportError::Io)
@@ -229,11 +226,11 @@ impl StdioJsonRpc {
             .read_until(b'\n', &mut encoded)
             .await
             .map_err(TransportError::Io)?;
-        if read == 0 || encoded.last() != Some(&b'\n') {
-            return Err(TransportError::Truncated);
-        }
         if encoded.len() > MAX_MESSAGE_BYTES {
             return Err(TransportError::Oversized);
+        }
+        if read == 0 || encoded.last() != Some(&b'\n') {
+            return Err(TransportError::Truncated);
         }
         encoded.pop();
         if encoded.last() == Some(&b'\r') {
@@ -430,6 +427,24 @@ mod tests {
             drop(transport);
             process.shutdown(Duration::from_secs(1)).await.unwrap();
         }
+
+        let inbound_spec = StdioServerSpec {
+            name: "inbound-oversized".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "head -c 4194305 /dev/zero".into()],
+            env: Vec::new(),
+        };
+        let mut inbound_process = StdioServerProcess::spawn(&inbound_spec).unwrap();
+        let mut inbound_transport = StdioJsonRpc::from_process(&mut inbound_process).unwrap();
+        assert!(matches!(
+            inbound_transport.receive().await,
+            Err(TransportError::Oversized)
+        ));
+        drop(inbound_transport);
+        inbound_process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap();
 
         let spec = StdioServerSpec {
             name: "oversized".into(),
