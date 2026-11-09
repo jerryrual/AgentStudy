@@ -27,10 +27,20 @@ use super::prompt;
 use super::runtime::PromptRuntime;
 use super::session_control::SessionControl;
 
+pub(crate) type PromptSetupHook = Arc<dyn Fn() + Send + Sync>;
+
 /// Build the unexposed stable-v1 callbacks over the shared session control boundary.
 pub(crate) fn callback_bundle(
     control: Arc<SessionControl>,
     runtime: Arc<PromptRuntime>,
+) -> impl ConnectTo<Client> {
+    callback_bundle_with_setup_hook(control, runtime, None)
+}
+
+pub(crate) fn callback_bundle_with_setup_hook(
+    control: Arc<SessionControl>,
+    runtime: Arc<PromptRuntime>,
+    prompt_setup_hook: Option<PromptSetupHook>,
 ) -> impl ConnectTo<Client> {
     let new_control = Arc::clone(&control);
     let load_control = Arc::clone(&control);
@@ -101,6 +111,7 @@ pub(crate) fn callback_bundle(
                 let setup_ownership = Arc::clone(&ownership);
                 let cwd = PathBuf::from(session.cwd());
                 let runtime = Arc::clone(&prompt_runtime);
+                let setup_hook = prompt_setup_hook.clone();
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
                 let request_cancellation = responder.cancellation();
                 let session_id = request.session_id;
@@ -109,6 +120,9 @@ pub(crate) fn callback_bundle(
                 connection.spawn(async move {
                     let setup = tokio::task::spawn_blocking(move || {
                         let _ownership = setup_ownership;
+                        if let Some(hook) = setup_hook {
+                            hook();
+                        }
                         let agent = runtime.agent_for(&cwd);
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
