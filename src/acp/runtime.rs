@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::{Agent, AgentKind, AgentOptions};
-use crate::interaction::{Approver, DenyAll, NoAsker};
+use crate::interaction::{Approver, NoAsker};
 use crate::model::ModelClient;
 use crate::tools::ToolRegistry;
 
@@ -17,7 +17,6 @@ use crate::tools::ToolRegistry;
 pub(crate) struct PromptRuntime {
     client: Arc<ModelClient>,
     tools: Arc<ToolRegistry>,
-    approver: Arc<dyn Approver>,
     agent_kind: AgentKind,
     max_tool_rounds: usize,
     phase_four_side_call_token_budget: i64,
@@ -35,7 +34,6 @@ impl PromptRuntime {
         Self {
             client,
             tools: Arc::new(ToolRegistry::builtin()),
-            approver: Arc::new(DenyAll),
             agent_kind,
             max_tool_rounds,
             phase_four_side_call_token_budget,
@@ -44,11 +42,11 @@ impl PromptRuntime {
     }
 
     /// Construct a fresh agent whose project memory and mutable state belong to `cwd`.
-    pub(crate) fn agent_for(&self, cwd: &Path) -> Agent {
+    pub(crate) fn agent_for(&self, cwd: &Path, approver: Arc<dyn Approver>) -> Agent {
         Agent::new(
             Arc::clone(&self.client),
             Arc::clone(&self.tools),
-            Arc::clone(&self.approver),
+            approver,
             Arc::new(NoAsker),
             AgentOptions {
                 kind: self.agent_kind,
@@ -70,6 +68,7 @@ mod tests {
     use std::fs;
 
     use crate::config::ModelProfile;
+    use crate::interaction::DenyAll;
 
     use super::*;
 
@@ -90,8 +89,8 @@ mod tests {
             2048,
         );
 
-        let first_agent = runtime.agent_for(first.path());
-        let second_agent = runtime.agent_for(second.path());
+        let first_agent = runtime.agent_for(first.path(), Arc::new(DenyAll));
+        let second_agent = runtime.agent_for(second.path(), Arc::new(DenyAll));
 
         assert_eq!(first_agent.kind(), AgentKind::Code);
         assert_eq!(first_agent.model(), "mock-model");
