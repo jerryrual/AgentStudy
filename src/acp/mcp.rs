@@ -270,6 +270,94 @@ fn validate_envelope(message: &Value) -> Result<(), TransportError> {
     Ok(())
 }
 
+#[derive(Debug)]
+pub(crate) enum RequestError {
+    Transport(TransportError),
+    IdExhausted,
+    UnexpectedMessage,
+    MismatchedId,
+    InvalidResponse,
+    Remote(Value),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => error.fmt(formatter),
+            Self::IdExhausted => formatter.write_str("MCP request ID space is exhausted"),
+            Self::UnexpectedMessage => {
+                formatter.write_str("unexpected MCP message while awaiting response")
+            }
+            Self::MismatchedId => formatter.write_str("MCP response ID does not match request"),
+            Self::InvalidResponse => formatter.write_str("invalid MCP response payload"),
+            Self::Remote(error) => write!(formatter, "MCP server returned an error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::IdExhausted
+            | Self::UnexpectedMessage
+            | Self::MismatchedId
+            | Self::InvalidResponse
+            | Self::Remote(_) => None,
+        }
+    }
+}
+
+pub(crate) struct StdioMcpClient {
+    transport: StdioJsonRpc,
+    next_id: u64,
+}
+
+impl StdioMcpClient {
+    pub(crate) fn from_process(process: &mut StdioServerProcess) -> std::io::Result<Self> {
+        Ok(Self {
+            transport: StdioJsonRpc::from_process(process)?,
+            next_id: 1,
+        })
+    }
+
+    pub(crate) async fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, RequestError> {
+        let id = self.next_id;
+        self.next_id = id.checked_add(1).ok_or(RequestError::IdExhausted)?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.transport
+            .send(&request)
+            .await
+            .map_err(RequestError::Transport)?;
+        let response = self
+            .transport
+            .receive()
+            .await
+            .map_err(RequestError::Transport)?;
+        let object = response.as_object().ok_or(RequestError::InvalidResponse)?;
+        if object.contains_key("method") {
+            return Err(RequestError::UnexpectedMessage);
+        }
+        if object.get("id") != Some(&Value::from(id)) {
+            return Err(RequestError::MismatchedId);
+        }
+        match (object.get("result"), object.get("error")) {
+            (Some(result), None) => Ok(result.clone()),
+            (None, Some(error)) => Err(RequestError::Remote(error.clone())),
+            _ => Err(RequestError::InvalidResponse),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
@@ -497,5 +585,84 @@ mod tests {
         ));
         drop(transport);
         process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_correlates_sequential_response_ids() {
+        let script = concat!(
+            "read first; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"step\":1}}'; ",
+            "read second; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"step\":2}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "requests".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert_eq!(
+            client
+                .request("first", serde_json::json!({}))
+                .await
+                .unwrap(),
+            serde_json::json!({"step": 1})
+        );
+        assert_eq!(
+            client
+                .request("second", serde_json::json!({}))
+                .await
+                .unwrap(),
+            serde_json::json!({"step": 2})
+        );
+        drop(client);
+        assert!(process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_rejects_mismatched_remote_and_unsolicited_messages() {
+        let cases = [
+            (r#"{"jsonrpc":"2.0","id":99,"result":{}}"#, "mismatched"),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"no"}}"#,
+                "remote",
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"notice","params":{}}"#,
+                "unexpected",
+            ),
+        ];
+        for (response, expected) in cases {
+            let script = format!("read request; printf '%s\\n' '{response}'");
+            let spec = StdioServerSpec {
+                name: expected.into(),
+                command: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), script],
+                env: Vec::new(),
+            };
+            let mut process = StdioServerProcess::spawn(&spec).unwrap();
+            let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+            let error = client
+                .request("test", serde_json::json!({}))
+                .await
+                .unwrap_err();
+            match expected {
+                "mismatched" => assert!(matches!(error, RequestError::MismatchedId)),
+                "remote" => assert!(matches!(error, RequestError::Remote(_))),
+                "unexpected" => assert!(matches!(error, RequestError::UnexpectedMessage)),
+                _ => unreachable!(),
+            }
+            drop(client);
+            process.shutdown(Duration::from_secs(1)).await.unwrap();
+        }
     }
 }
