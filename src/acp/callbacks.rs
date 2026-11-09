@@ -8,6 +8,7 @@
 )]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
@@ -57,6 +58,14 @@ where
     }
 }
 
+fn supports_notices(request: &InitializeRequest) -> bool {
+    request
+        .client_capabilities
+        .session
+        .as_ref()
+        .is_some_and(|session| session.notices.is_some())
+}
+
 pub(crate) type PromptSetupHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Build the unexposed stable-v1 callbacks over the shared session control boundary.
@@ -73,6 +82,9 @@ pub(crate) fn callback_bundle_with_setup_hook(
     prompt_setup_hook: Option<PromptSetupHook>,
 ) -> impl ConnectTo<Client> {
     let new_control = Arc::clone(&control);
+    let notices = Arc::new(AtomicBool::new(false));
+    let initialize_notices = Arc::clone(&notices);
+    let prompt_notices = notices;
     let load_control = Arc::clone(&control);
     let prompt_control = Arc::clone(&control);
     let prompt_runtime = runtime;
@@ -83,6 +95,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
         .name("icode")
         .on_receive_request(
             async move |request: InitializeRequest, responder, _connection| {
+                initialize_notices.store(supports_notices(&request), Ordering::Release);
                 responder.respond(SessionControl::initialize(&request))
             },
             agent_client_protocol::on_receive_request!(),
@@ -144,6 +157,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let setup_hook = prompt_setup_hook.clone();
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
                 let context_window = runtime.context_window();
+                let supports_notices = prompt_notices.load(Ordering::Acquire);
                 let request_cancellation = responder.cancellation();
                 let approver = Arc::new(AcpApprover::new(
                     request.session_id.clone(),
@@ -205,6 +219,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                     let dispatch = dispatcher::dispatch_to_client(
                         session_id,
                         context_window,
+                        supports_notices,
                         events,
                         task_connection,
                     );
@@ -247,8 +262,9 @@ mod tests {
 
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::v1::schema::{
-        AgentCapabilities, ContentBlock, InitializeResponse, LoadSessionResponse,
-        NewSessionResponse, PromptRequest, SessionId, SessionNotification,
+        AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+        InitializeResponse, LoadSessionResponse, NewSessionResponse, NoticeCapabilities,
+        PromptRequest, SessionId, SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -271,6 +287,18 @@ mod tests {
             1,
             -1,
         ))
+    }
+
+    #[test]
+    fn notice_support_requires_explicit_session_capability() {
+        let without = InitializeRequest::new(ProtocolVersion::V1);
+        let with = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new()
+                .session(ClientSessionCapabilities::new().notices(NoticeCapabilities::new())),
+        );
+
+        assert!(!supports_notices(&without));
+        assert!(supports_notices(&with));
     }
 
     #[tokio::test(flavor = "current_thread")]
