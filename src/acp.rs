@@ -16,6 +16,7 @@ pub(crate) mod dispatcher;
 pub(crate) mod error;
 pub(crate) mod event_mapping;
 pub(crate) mod history_replay;
+pub(crate) mod mcp;
 pub(crate) mod prompt;
 pub(crate) mod runtime;
 pub(crate) mod session_control;
