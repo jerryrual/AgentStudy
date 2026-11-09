@@ -349,6 +349,7 @@ impl StdioMcpClient {
         }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(RequestError::IdExhausted)?;
+        self.usable = false;
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -372,9 +373,9 @@ impl StdioMcpClient {
             return Err(RequestError::UnexpectedMessage);
         }
         if object.get("id") != Some(&Value::from(id)) {
-            self.usable = false;
             return Err(RequestError::MismatchedId);
         }
+        self.usable = true;
         match (object.get("result"), object.get("error")) {
             (Some(result), None) => Ok(result.clone()),
             (None, Some(error)) => Err(RequestError::Remote(error.clone())),
@@ -390,10 +391,11 @@ impl StdioMcpClient {
             "method": method,
             "params": params,
         });
+        self.usable = false;
         if let Err(error) = self.transport.send(&notification).await {
-            self.usable = false;
             return Err(RequestError::Transport(error));
         }
+        self.usable = true;
         Ok(())
     }
 
@@ -1187,6 +1189,36 @@ mod tests {
             drop(client);
             process.shutdown(Duration::from_secs(1)).await.unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_request_leaves_mcp_client_unusable() {
+        let spec = StdioServerSpec {
+            name: "cancelled".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "read request; sleep 1; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'"
+                    .into(),
+            ],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            client.request("slow", serde_json::json!({}))
+        )
+        .await
+        .is_err());
+        assert!(matches!(
+            client.request("again", serde_json::json!({})).await,
+            Err(RequestError::Unusable)
+        ));
+        drop(client);
+        process.shutdown(Duration::from_millis(10)).await.unwrap();
     }
 
     #[cfg(unix)]
