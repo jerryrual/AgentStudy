@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
 
+use super::approval::{new_policy, ApprovalPolicy};
 use super::history_replay::replay_updates;
 
 /// A classified failure while acquiring one ACP prompt slot.
@@ -79,6 +80,7 @@ struct RegisteredSession {
     session: Session,
     _run_lease: SessionRunLease,
     ready: AtomicBool,
+    approval_policy: ApprovalPolicy,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -193,6 +195,7 @@ impl SessionRegistry {
             session,
             _run_lease: run_lease,
             ready: AtomicBool::new(ready),
+            approval_policy: new_policy(),
             active_prompt: Mutex::new(None),
         });
         sessions.insert(session_id.clone(), Arc::clone(&registered));
@@ -331,6 +334,10 @@ impl PromptGuard {
         Arc::new(SessionOwnership {
             _registered: Arc::clone(&self.registered),
         })
+    }
+
+    pub(crate) fn approval_policy(&self) -> ApprovalPolicy {
+        Arc::clone(&self.registered.approval_policy)
     }
 
     /// Wait until the matching session receives a cancellation request.
