@@ -50,7 +50,8 @@ impl SessionControl {
         } else {
             ProtocolVersion::LATEST
         };
-        InitializeResponse::new(protocol_version).agent_capabilities(AgentCapabilities::new())
+        InitializeResponse::new(protocol_version)
+            .agent_capabilities(AgentCapabilities::new().load_session(true))
     }
 
     /// Validate all setup fields before creating any durable session state.
@@ -212,7 +213,10 @@ mod tests {
         for requested in [ProtocolVersion::V0, ProtocolVersion::V1] {
             let response = SessionControl::initialize(&InitializeRequest::new(requested));
             assert_eq!(response.protocol_version, ProtocolVersion::V1);
-            assert_eq!(response.agent_capabilities, AgentCapabilities::new());
+            assert_eq!(
+                response.agent_capabilities,
+                AgentCapabilities::new().load_session(true)
+            );
         }
     }
 

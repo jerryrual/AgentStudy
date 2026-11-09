@@ -288,7 +288,10 @@ mod tests {
                         .block_task()
                         .await?;
                     assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
-                    assert_eq!(initialized.agent_capabilities, AgentCapabilities::new());
+                    assert_eq!(
+                        initialized.agent_capabilities,
+                        AgentCapabilities::new().load_session(true)
+                    );
 
                     let empty_prompt = connection
                         .send_request(PromptRequest::new(cancel_id.clone(), vec![]))
