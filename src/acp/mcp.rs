@@ -319,6 +319,7 @@ pub(crate) struct StdioMcpClient {
     next_id: u64,
     usable: bool,
     initialized: bool,
+    discovered_tools: HashSet<String>,
 }
 
 impl StdioMcpClient {
@@ -328,6 +329,7 @@ impl StdioMcpClient {
             next_id: 1,
             usable: true,
             initialized: false,
+            discovered_tools: HashSet::new(),
         })
     }
 
@@ -449,6 +451,7 @@ impl StdioMcpClient {
                 tools.push(tool);
             }
             let Some(next_cursor) = page.next_cursor else {
+                self.discovered_tools = tools.iter().map(|tool| tool.name.clone()).collect();
                 return Ok(tools);
             };
             if !seen_cursors.insert(next_cursor.clone()) {
@@ -457,6 +460,30 @@ impl StdioMcpClient {
             cursor = Some(next_cursor);
         }
         Err(DiscoveryError::TooManyPages)
+    }
+
+    pub(crate) async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolCallResult, ToolCallError> {
+        if !self.initialized {
+            return Err(ToolCallError::NotInitialized);
+        }
+        if !self.discovered_tools.contains(name) {
+            return Err(ToolCallError::UnknownTool(name.to_string()));
+        }
+        if !arguments.is_object() {
+            return Err(ToolCallError::InvalidArguments);
+        }
+        let result = self
+            .request(
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+            .await
+            .map_err(ToolCallError::Request)?;
+        ToolCallResult::from_result(&result)
     }
 }
 
@@ -654,6 +681,86 @@ impl std::error::Error for DiscoveryError {
             | Self::TooManyPages
             | Self::TooManyTools
             | Self::DuplicateName(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolCallResult {
+    pub(crate) content: Vec<Value>,
+    pub(crate) structured_content: Option<Value>,
+    pub(crate) is_error: bool,
+    pub(crate) meta: Option<Value>,
+}
+
+impl ToolCallResult {
+    fn from_result(result: &Value) -> Result<Self, ToolCallError> {
+        let object = result.as_object().ok_or(ToolCallError::InvalidResult)?;
+        let content = object
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or(ToolCallError::InvalidResult)?;
+        if content.iter().any(|item| {
+            item.as_object()
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        }) {
+            return Err(ToolCallError::InvalidResult);
+        }
+        let structured_content = call_result_object(object.get("structuredContent"))?;
+        let meta = call_result_object(object.get("_meta"))?;
+        let is_error = match object.get("isError") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(is_error)) => *is_error,
+            Some(_) => return Err(ToolCallError::InvalidResult),
+        };
+        Ok(Self {
+            content: content.clone(),
+            structured_content,
+            is_error,
+            meta,
+        })
+    }
+}
+
+fn call_result_object(value: Option<&Value>) -> Result<Option<Value>, ToolCallError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) if value.is_object() => Ok(Some(value.clone())),
+        Some(_) => Err(ToolCallError::InvalidResult),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ToolCallError {
+    Request(RequestError),
+    NotInitialized,
+    UnknownTool(String),
+    InvalidArguments,
+    InvalidResult,
+}
+
+impl std::fmt::Display for ToolCallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(formatter),
+            Self::NotInitialized => formatter.write_str("MCP client is not initialized"),
+            Self::UnknownTool(name) => write!(formatter, "unknown MCP tool: {name}"),
+            Self::InvalidArguments => formatter.write_str("MCP tool arguments must be an object"),
+            Self::InvalidResult => formatter.write_str("invalid MCP tools/call result"),
+        }
+    }
+}
+
+impl std::error::Error for ToolCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::NotInitialized
+            | Self::UnknownTool(_)
+            | Self::InvalidArguments
+            | Self::InvalidResult => None,
         }
     }
 }
@@ -1186,5 +1293,70 @@ mod tests {
             })),
             Err(DiscoveryError::InvalidResult)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_calls_only_discovered_tools_and_preserves_result() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read list; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}'; ",
+            "read call; case \"$call\" in *'\"name\":\"echo\"'*'\"text\":\"hi\"'*) ;; *) exit 6;; esac; ",
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{",
+            "\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],",
+            "\"structuredContent\":{\"echo\":\"hi\"},\"isError\":false,\"_meta\":{\"source\":\"fixture\"}}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "call".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+        client.initialize().await.unwrap();
+        client.list_tools().await.unwrap();
+
+        assert!(matches!(
+            client.call_tool("missing", serde_json::json!({})).await,
+            Err(ToolCallError::UnknownTool(name)) if name == "missing"
+        ));
+        let result = client
+            .call_tool("echo", serde_json::json!({"text": "hi"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.content,
+            vec![serde_json::json!({"type": "text", "text": "hi"})]
+        );
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"echo": "hi"}))
+        );
+        assert!(!result.is_error);
+        assert_eq!(result.meta, Some(serde_json::json!({"source": "fixture"})));
+        drop(client);
+        assert!(process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn tool_call_result_rejects_untyped_content_and_non_object_extensions() {
+        for result in [
+            serde_json::json!({"content": [{}]}),
+            serde_json::json!({"content": [], "structuredContent": []}),
+            serde_json::json!({"content": [], "isError": "yes"}),
+        ] {
+            assert!(matches!(
+                ToolCallResult::from_result(&result),
+                Err(ToolCallError::InvalidResult)
+            ));
+        }
     }
 }
