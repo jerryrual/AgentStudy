@@ -10,6 +10,7 @@ use crate::config::{ModelProfile, Settings};
 use crate::model::ModelClient;
 use crate::session::SessionStore;
 
+pub(crate) mod approval;
 pub(crate) mod callbacks;
 pub(crate) mod dispatcher;
 pub(crate) mod error;
