@@ -131,7 +131,7 @@ pub(crate) fn callback_bundle(
                             prepared,
                             observer,
                             phase_four_budget,
-                            async move {
+                            async {
                                 tokio::select! {
                                     _ = guard.cancelled() => {}
                                     _ = request_cancellation.cancelled() => {}
@@ -165,7 +165,9 @@ pub(crate) fn callback_bundle(
                         SessionTurnStatus::Completed(_) => StopReason::EndTurn,
                         SessionTurnStatus::Cancelled => StopReason::Cancelled,
                     };
-                    responder.respond(PromptResponse::new(stop_reason))
+                    let response = responder.respond(PromptResponse::new(stop_reason));
+                    drop(guard);
+                    response
                 })
             },
             agent_client_protocol::on_receive_request!(),
