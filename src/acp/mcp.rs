@@ -320,6 +320,15 @@ impl std::error::Error for RequestError {
     }
 }
 
+fn valid_remote_error(value: &Value) -> bool {
+    let Some(error) = value.as_object() else {
+        return false;
+    };
+    let integer_code = error.get("code").and_then(Value::as_i64).is_some()
+        || error.get("code").and_then(Value::as_u64).is_some();
+    integer_code && error.get("message").and_then(Value::as_str).is_some()
+}
+
 pub(crate) struct StdioMcpClient {
     transport: StdioJsonRpc,
     next_id: u64,
@@ -380,7 +389,7 @@ impl StdioMcpClient {
                 self.usable = true;
                 Ok(result.clone())
             }
-            (None, Some(error)) => {
+            (None, Some(error)) if valid_remote_error(error) => {
                 self.usable = true;
                 Err(RequestError::Remote(error.clone()))
             }
@@ -1171,6 +1180,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1}}"#,
                 "invalid",
             ),
+            (r#"{"jsonrpc":"2.0","id":1,"error":null}"#, "invalid"),
         ];
         for (response, expected) in cases {
             let script = format!("read request; printf '%s\\n' '{response}'");
