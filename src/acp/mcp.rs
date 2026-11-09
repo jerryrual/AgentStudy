@@ -10,11 +10,14 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::McpServer;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
 const MAX_ENV: usize = 256;
+const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -152,11 +155,124 @@ impl Drop for StdioServerProcess {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum TransportError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Oversized,
+    Truncated,
+    InvalidEnvelope,
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "MCP stdio I/O failed: {error}"),
+            Self::Json(error) => write!(formatter, "invalid MCP JSON: {error}"),
+            Self::Oversized => formatter.write_str("MCP message exceeds the size limit"),
+            Self::Truncated => formatter.write_str("MCP message is not newline terminated"),
+            Self::InvalidEnvelope => formatter.write_str("invalid MCP JSON-RPC envelope"),
+        }
+    }
+}
+
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Json(error) => Some(error),
+            Self::Oversized | Self::Truncated | Self::InvalidEnvelope => None,
+        }
+    }
+}
+
+pub(crate) struct StdioJsonRpc {
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl StdioJsonRpc {
+    pub(crate) fn from_process(process: &mut StdioServerProcess) -> std::io::Result<Self> {
+        let stdin = process
+            .take_stdin()
+            .ok_or_else(|| std::io::Error::other("MCP child stdin already taken"))?;
+        let stdout = process
+            .take_stdout()
+            .ok_or_else(|| std::io::Error::other("MCP child stdout already taken"))?;
+        Ok(Self {
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    pub(crate) async fn send(&mut self, message: &Value) -> Result<(), TransportError> {
+        let encoded = encode_frame(message)?;
+        self.stdin
+            .write_all(&encoded)
+            .await
+            .map_err(TransportError::Io)?;
+        self.stdin.flush().await.map_err(TransportError::Io)
+    }
+
+    pub(crate) async fn receive(&mut self) -> Result<Value, TransportError> {
+        let mut encoded = Vec::new();
+        let read = (&mut self.stdout)
+            .take((MAX_MESSAGE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut encoded)
+            .await
+            .map_err(TransportError::Io)?;
+        if read == 0 {
+            return Err(TransportError::Truncated);
+        }
+        decode_frame(encoded)
+    }
+}
+
+fn encode_frame(message: &Value) -> Result<Vec<u8>, TransportError> {
+    validate_envelope(message)?;
+    let mut encoded = serde_json::to_vec(message).map_err(TransportError::Json)?;
+    if encoded.len() >= MAX_MESSAGE_BYTES {
+        return Err(TransportError::Oversized);
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn decode_frame(mut encoded: Vec<u8>) -> Result<Value, TransportError> {
+    if encoded.len() > MAX_MESSAGE_BYTES {
+        return Err(TransportError::Oversized);
+    }
+    if encoded.last() != Some(&b'\n') {
+        return Err(TransportError::Truncated);
+    }
+    encoded.pop();
+    if encoded.last() == Some(&b'\r') {
+        encoded.pop();
+    }
+    let message = serde_json::from_slice(&encoded).map_err(TransportError::Json)?;
+    validate_envelope(&message)?;
+    Ok(message)
+}
+
+fn validate_envelope(message: &Value) -> Result<(), TransportError> {
+    let Some(object) = message.as_object() else {
+        return Err(TransportError::InvalidEnvelope);
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(TransportError::InvalidEnvelope);
+    }
+    if !object.contains_key("method")
+        && !object.contains_key("result")
+        && !object.contains_key("error")
+    {
+        return Err(TransportError::InvalidEnvelope);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
-    #[cfg(unix)]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -274,5 +390,112 @@ mod tests {
 
         assert!(status.success());
         assert_eq!(output, b"ping");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_rpc_transport_round_trips_one_complete_envelope() {
+        let spec = StdioServerSpec {
+            name: "rpc".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "cat".into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut transport = StdioJsonRpc::from_process(&mut process).unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        });
+        transport.send(&request).await.unwrap();
+        assert_eq!(transport.receive().await.unwrap(), request);
+        drop(transport);
+        assert!(process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    fn json_rpc_transport_round_trips_exact_frame_limit() {
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "boundary",
+            "params": ""
+        });
+        let baseline = serde_json::to_vec(&request).unwrap().len();
+        request["params"] = Value::String("x".repeat(MAX_MESSAGE_BYTES - 1 - baseline));
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap().len() + 1,
+            MAX_MESSAGE_BYTES
+        );
+
+        let encoded = encode_frame(&request).unwrap();
+        assert_eq!(encoded.len(), MAX_MESSAGE_BYTES);
+        assert_eq!(decode_frame(encoded).unwrap(), request);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_rpc_transport_rejects_invalid_truncated_and_oversized_messages() {
+        for script in ["printf 'not-json\\n'", "printf '{\"jsonrpc\":\"2.0\"}'"] {
+            let spec = StdioServerSpec {
+                name: "invalid".into(),
+                command: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), script.into()],
+                env: Vec::new(),
+            };
+            let mut process = StdioServerProcess::spawn(&spec).unwrap();
+            let mut transport = StdioJsonRpc::from_process(&mut process).unwrap();
+            let error = transport.receive().await.unwrap_err();
+            assert!(matches!(
+                error,
+                TransportError::Json(_) | TransportError::Truncated
+            ));
+            drop(transport);
+            process.shutdown(Duration::from_secs(1)).await.unwrap();
+        }
+
+        let inbound_spec = StdioServerSpec {
+            name: "inbound-oversized".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "head -c 4194305 /dev/zero".into()],
+            env: Vec::new(),
+        };
+        let mut inbound_process = StdioServerProcess::spawn(&inbound_spec).unwrap();
+        let mut inbound_transport = StdioJsonRpc::from_process(&mut inbound_process).unwrap();
+        assert!(matches!(
+            inbound_transport.receive().await,
+            Err(TransportError::Oversized)
+        ));
+        drop(inbound_transport);
+        inbound_process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let spec = StdioServerSpec {
+            name: "oversized".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "cat".into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut transport = StdioJsonRpc::from_process(&mut process).unwrap();
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "oversized",
+            "params": "x".repeat(MAX_MESSAGE_BYTES)
+        });
+        assert!(matches!(
+            transport.send(&oversized).await,
+            Err(TransportError::Oversized)
+        ));
+        drop(transport);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }
