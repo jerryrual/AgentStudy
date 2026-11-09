@@ -28,6 +28,35 @@ use super::prompt;
 use super::runtime::PromptRuntime;
 use super::session_control::SessionControl;
 
+#[derive(Debug)]
+enum PromptTaskError {
+    Execution(anyhow::Error),
+    Dispatch(ProtocolError),
+}
+
+async fn await_execution_and_dispatch<E, D>(
+    execution: E,
+    dispatch: D,
+) -> Result<SessionTurnStatus, PromptTaskError>
+where
+    E: std::future::Future<Output = anyhow::Result<SessionTurnStatus>>,
+    D: std::future::Future<Output = Result<(), ProtocolError>>,
+{
+    tokio::pin!(execution);
+    tokio::pin!(dispatch);
+    tokio::select! {
+        result = &mut execution => {
+            let status = result.map_err(PromptTaskError::Execution)?;
+            dispatch.await.map_err(PromptTaskError::Dispatch)?;
+            Ok(status)
+        }
+        result = &mut dispatch => {
+            result.map_err(PromptTaskError::Dispatch)?;
+            execution.await.map_err(PromptTaskError::Execution)
+        }
+    }
+}
+
 pub(crate) type PromptSetupHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Build the unexposed stable-v1 callbacks over the shared session control boundary.
@@ -173,13 +202,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
                     };
                     let dispatch =
                         dispatcher::dispatch_to_client(session_id, events, task_connection);
-                    let (execution, dispatch) = tokio::join!(execution, dispatch);
-                    if let Err(error) = dispatch {
-                        return responder.respond_with_error(error);
-                    }
-                    let status = match execution {
+                    let status = match await_execution_and_dispatch(execution, dispatch).await {
                         Ok(status) => status,
-                        Err(error) => {
+                        Err(PromptTaskError::Dispatch(error)) => {
+                            return responder.respond_with_error(error);
+                        }
+                        Err(PromptTaskError::Execution(error)) => {
                             return responder
                                 .respond_with_error(ControlError::internal(error).into());
                         }
@@ -207,6 +235,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -236,6 +265,33 @@ mod tests {
             1,
             -1,
         ))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_failure_drops_pending_execution_without_waiting() {
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let execution_dropped = Arc::clone(&dropped);
+        let execution = async move {
+            let _signal = DropSignal(execution_dropped);
+            std::future::pending::<anyhow::Result<SessionTurnStatus>>().await
+        };
+        let dispatch = async { Err(ProtocolError::internal_error()) };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_execution_and_dispatch(execution, dispatch),
+        )
+        .await
+        .expect("dispatch failure waited for pending execution");
+        assert!(matches!(result, Err(PromptTaskError::Dispatch(_))));
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "current_thread")]
