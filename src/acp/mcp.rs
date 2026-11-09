@@ -206,12 +206,7 @@ impl StdioJsonRpc {
     }
 
     pub(crate) async fn send(&mut self, message: &Value) -> Result<(), TransportError> {
-        validate_envelope(message)?;
-        let mut encoded = serde_json::to_vec(message).map_err(TransportError::Json)?;
-        if encoded.len() > MAX_MESSAGE_BYTES {
-            return Err(TransportError::Oversized);
-        }
-        encoded.push(b'\n');
+        let encoded = encode_frame(message)?;
         self.stdin
             .write_all(&encoded)
             .await
@@ -226,20 +221,37 @@ impl StdioJsonRpc {
             .read_until(b'\n', &mut encoded)
             .await
             .map_err(TransportError::Io)?;
-        if encoded.len() > MAX_MESSAGE_BYTES {
-            return Err(TransportError::Oversized);
-        }
-        if read == 0 || encoded.last() != Some(&b'\n') {
+        if read == 0 {
             return Err(TransportError::Truncated);
         }
-        encoded.pop();
-        if encoded.last() == Some(&b'\r') {
-            encoded.pop();
-        }
-        let message = serde_json::from_slice(&encoded).map_err(TransportError::Json)?;
-        validate_envelope(&message)?;
-        Ok(message)
+        decode_frame(encoded)
     }
+}
+
+fn encode_frame(message: &Value) -> Result<Vec<u8>, TransportError> {
+    validate_envelope(message)?;
+    let mut encoded = serde_json::to_vec(message).map_err(TransportError::Json)?;
+    if encoded.len() >= MAX_MESSAGE_BYTES {
+        return Err(TransportError::Oversized);
+    }
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn decode_frame(mut encoded: Vec<u8>) -> Result<Value, TransportError> {
+    if encoded.len() > MAX_MESSAGE_BYTES {
+        return Err(TransportError::Oversized);
+    }
+    if encoded.last() != Some(&b'\n') {
+        return Err(TransportError::Truncated);
+    }
+    encoded.pop();
+    if encoded.last() == Some(&b'\r') {
+        encoded.pop();
+    }
+    let message = serde_json::from_slice(&encoded).map_err(TransportError::Json)?;
+    validate_envelope(&message)?;
+    Ok(message)
 }
 
 fn validate_envelope(message: &Value) -> Result<(), TransportError> {
@@ -405,6 +417,26 @@ mod tests {
             .await
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn json_rpc_transport_round_trips_exact_frame_limit() {
+        let mut request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "boundary",
+            "params": ""
+        });
+        let baseline = serde_json::to_vec(&request).unwrap().len();
+        request["params"] = Value::String("x".repeat(MAX_MESSAGE_BYTES - 1 - baseline));
+        assert_eq!(
+            serde_json::to_vec(&request).unwrap().len() + 1,
+            MAX_MESSAGE_BYTES
+        );
+
+        let encoded = encode_frame(&request).unwrap();
+        assert_eq!(encoded.len(), MAX_MESSAGE_BYTES);
+        assert_eq!(decode_frame(encoded).unwrap(), request);
     }
 
     #[cfg(unix)]
