@@ -19,6 +19,8 @@ const MAX_ARGS: usize = 256;
 const MAX_ENV: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MAX_TOOL_PAGES: usize = 64;
+const MAX_DISCOVERED_TOOLS: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -316,6 +318,7 @@ pub(crate) struct StdioMcpClient {
     transport: StdioJsonRpc,
     next_id: u64,
     usable: bool,
+    initialized: bool,
 }
 
 impl StdioMcpClient {
@@ -324,6 +327,7 @@ impl StdioMcpClient {
             transport: StdioJsonRpc::from_process(process)?,
             next_id: 1,
             usable: true,
+            initialized: false,
         })
     }
 
@@ -413,7 +417,46 @@ impl StdioMcpClient {
         self.notify("notifications/initialized", serde_json::json!({}))
             .await
             .map_err(InitializeError::Request)?;
+        self.initialized = true;
         Ok(initialization)
+    }
+
+    pub(crate) async fn list_tools(&mut self) -> Result<Vec<DiscoveredTool>, DiscoveryError> {
+        if !self.initialized {
+            return Err(DiscoveryError::NotInitialized);
+        }
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_names = HashSet::new();
+        let mut tools = Vec::new();
+        for _ in 0..MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(cursor) => serde_json::json!({"cursor": cursor}),
+                None => serde_json::json!({}),
+            };
+            let result = self
+                .request("tools/list", params)
+                .await
+                .map_err(DiscoveryError::Request)?;
+            let page = ToolPage::from_result(&result)?;
+            if tools.len() + page.tools.len() > MAX_DISCOVERED_TOOLS {
+                return Err(DiscoveryError::TooManyTools);
+            }
+            for tool in page.tools {
+                if !seen_names.insert(tool.name.clone()) {
+                    return Err(DiscoveryError::DuplicateName(tool.name));
+                }
+                tools.push(tool);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(tools);
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(DiscoveryError::RepeatedCursor);
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(DiscoveryError::TooManyPages)
     }
 }
 
@@ -492,6 +535,125 @@ impl std::error::Error for InitializeError {
         match self {
             Self::Request(error) => Some(error),
             Self::UnsupportedVersion(_) | Self::InvalidResult => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DiscoveredTool {
+    pub(crate) name: String,
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) input_schema: Value,
+    pub(crate) output_schema: Option<Value>,
+    pub(crate) annotations: Option<Value>,
+    pub(crate) meta: Option<Value>,
+}
+
+struct ToolPage {
+    tools: Vec<DiscoveredTool>,
+    next_cursor: Option<String>,
+}
+
+impl ToolPage {
+    fn from_result(result: &Value) -> Result<Self, DiscoveryError> {
+        let object = result.as_object().ok_or(DiscoveryError::InvalidResult)?;
+        let values = object
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or(DiscoveryError::InvalidResult)?;
+        let tools = values
+            .iter()
+            .map(DiscoveredTool::from_value)
+            .collect::<Result<_, _>>()?;
+        let next_cursor = match object.get("nextCursor") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.clone()),
+            Some(_) => return Err(DiscoveryError::InvalidResult),
+        };
+        Ok(Self { tools, next_cursor })
+    }
+}
+
+impl DiscoveredTool {
+    fn from_value(value: &Value) -> Result<Self, DiscoveryError> {
+        let object = value.as_object().ok_or(DiscoveryError::InvalidResult)?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .ok_or(DiscoveryError::InvalidResult)?;
+        let title = optional_string(object.get("title"))?;
+        let description = optional_string(object.get("description"))?;
+        let input_schema =
+            optional_object(object.get("inputSchema"))?.ok_or(DiscoveryError::InvalidResult)?;
+        let output_schema = optional_object(object.get("outputSchema"))?;
+        let annotations = optional_object(object.get("annotations"))?;
+        let meta = optional_object(object.get("_meta"))?;
+        Ok(Self {
+            name,
+            title,
+            description,
+            input_schema,
+            output_schema,
+            annotations,
+            meta,
+        })
+    }
+}
+
+fn optional_string(value: Option<&Value>) -> Result<Option<String>, DiscoveryError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(DiscoveryError::InvalidResult),
+    }
+}
+
+fn optional_object(value: Option<&Value>) -> Result<Option<Value>, DiscoveryError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) if value.is_object() => Ok(Some(value.clone())),
+        Some(_) => Err(DiscoveryError::InvalidResult),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DiscoveryError {
+    Request(RequestError),
+    NotInitialized,
+    InvalidResult,
+    RepeatedCursor,
+    TooManyPages,
+    TooManyTools,
+    DuplicateName(String),
+}
+
+impl std::fmt::Display for DiscoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(formatter),
+            Self::NotInitialized => formatter.write_str("MCP client is not initialized"),
+            Self::InvalidResult => formatter.write_str("invalid MCP tools/list result"),
+            Self::RepeatedCursor => formatter.write_str("MCP tools/list cursor did not advance"),
+            Self::TooManyPages => formatter.write_str("MCP tools/list exceeds page limit"),
+            Self::TooManyTools => formatter.write_str("MCP tools/list exceeds tool limit"),
+            Self::DuplicateName(name) => write!(formatter, "duplicate MCP tool name: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for DiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::NotInitialized
+            | Self::InvalidResult
+            | Self::RepeatedCursor
+            | Self::TooManyPages
+            | Self::TooManyTools
+            | Self::DuplicateName(_) => None,
         }
     }
 }
@@ -933,6 +1095,76 @@ mod tests {
         process.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_discovers_valid_tools_across_pages() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read page1; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"read\",\"title\":\"Read\",",
+            "\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"page-2\"}}'; ",
+            "read page2; case \"$page2\" in *'\"cursor\":\"page-2\"'*) ;; *) exit 5;; esac; ",
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{",
+            "\"tools\":[{\"name\":\"write\",\"description\":\"Writes\",",
+            "\"inputSchema\":{},\"outputSchema\":{},\"annotations\":{},\"_meta\":{}}]}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "tools".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+        client.initialize().await.unwrap();
+
+        let tools = client.list_tools().await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "read");
+        assert_eq!(tools[0].title.as_deref(), Some("Read"));
+        assert_eq!(tools[1].name, "write");
+        assert_eq!(tools[1].description.as_deref(), Some("Writes"));
+        assert!(tools[1].output_schema.as_ref().unwrap().is_object());
+        drop(client);
+        assert!(process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_rejects_repeated_tool_cursor() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read page1; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[],\"nextCursor\":\"same\"}}'; ",
+            "read page2; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,",
+            "\"result\":{\"tools\":[],\"nextCursor\":\"same\"}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "cursor".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+        client.initialize().await.unwrap();
+
+        assert!(matches!(
+            client.list_tools().await,
+            Err(DiscoveryError::RepeatedCursor)
+        ));
+        drop(client);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
     #[test]
     fn initialize_result_requires_capabilities_and_server_identity() {
         assert!(matches!(
@@ -942,6 +1174,17 @@ mod tests {
                 "serverInfo": {"name": "", "version": "1"}
             })),
             Err(InitializeError::InvalidResult)
+        ));
+    }
+
+    #[test]
+    fn tool_page_rejects_invalid_schema_and_cursor() {
+        assert!(matches!(
+            ToolPage::from_result(&serde_json::json!({
+                "tools": [{"name": "bad", "inputSchema": []}],
+                "nextCursor": ""
+            })),
+            Err(DiscoveryError::InvalidResult)
         ));
     }
 }
