@@ -9,12 +9,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use tokio::sync::watch;
 
 use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
 
 use super::history_replay::replay_updates;
+
+/// A classified failure while acquiring one ACP prompt slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BeginPromptError {
+    SessionNotFound,
+    Loading,
+    ActivePrompt,
+}
+
+impl std::fmt::Display for BeginPromptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str("ACP session not found"),
+            Self::Loading => formatter.write_str("ACP session is still loading"),
+            Self::ActivePrompt => formatter.write_str("ACP session already has an active prompt"),
+        }
+    }
+}
+
+impl std::error::Error for BeginPromptError {}
 
 /// A classified failure while preparing or activating an ACP session load.
 #[derive(Debug)]
@@ -175,23 +195,24 @@ impl SessionRegistry {
     }
 
     /// Acquire the only active prompt slot for a session.
-    pub(crate) fn begin_prompt(&self, session_id: &SessionId) -> Result<PromptGuard> {
+    pub(crate) fn begin_prompt(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<PromptGuard, BeginPromptError> {
         let sessions = lock(&self.sessions);
         let registered = sessions
             .get(session_id)
             .cloned()
-            .with_context(|| format!("unknown ACP session {session_id}"))?;
-        ensure!(
-            registered.ready.load(Ordering::Acquire),
-            "ACP session {session_id} is still loading"
-        );
+            .ok_or(BeginPromptError::SessionNotFound)?;
+        if !registered.ready.load(Ordering::Acquire) {
+            return Err(BeginPromptError::Loading);
+        }
         let (cancel, cancellation) = watch::channel(false);
         {
             let mut active_prompt = lock(&registered.active_prompt);
-            ensure!(
-                active_prompt.is_none(),
-                "ACP session {session_id} already has an active prompt"
-            );
+            if active_prompt.is_some() {
+                return Err(BeginPromptError::ActivePrompt);
+            }
             *active_prompt = Some(cancel);
         }
         drop(sessions);
@@ -477,7 +498,10 @@ mod tests {
         });
 
         ready_rx.await.unwrap();
-        assert!(registry.begin_prompt(&session_id).is_err());
+        assert!(matches!(
+            registry.begin_prompt(&session_id),
+            Err(BeginPromptError::ActivePrompt)
+        ));
         assert!(registry.cancel(&session_id));
         let guard = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
@@ -498,7 +522,10 @@ mod tests {
     fn unknown_or_idle_sessions_are_not_reported_as_cancelled() {
         let (_directory, _store, registry) = registry();
         let unknown = SessionId::new("missing-session");
-        assert!(registry.begin_prompt(&unknown).is_err());
+        assert!(matches!(
+            registry.begin_prompt(&unknown),
+            Err(BeginPromptError::SessionNotFound)
+        ));
         assert!(!registry.cancel(&unknown));
 
         let session_id = registry.create("/workspace", "model-a", "build").unwrap();

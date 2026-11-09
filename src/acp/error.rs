@@ -21,6 +21,8 @@ pub(crate) enum InvalidSessionRequest {
     InvalidSessionId,
     AlreadyRegistered,
     ActiveElsewhere,
+    PromptLoading,
+    PromptActive,
 }
 
 impl InvalidSessionRequest {
@@ -37,6 +39,8 @@ impl InvalidSessionRequest {
             Self::InvalidSessionId => "session ID is invalid",
             Self::AlreadyRegistered => "session is already active",
             Self::ActiveElsewhere => "session is active in another process",
+            Self::PromptLoading => "session is still loading",
+            Self::PromptActive => "session already has an active prompt",
         }
     }
 }
@@ -148,6 +152,14 @@ mod tests {
             (
                 InvalidSessionRequest::ActiveElsewhere,
                 "session is active in another process",
+            ),
+            (
+                InvalidSessionRequest::PromptLoading,
+                "session is still loading",
+            ),
+            (
+                InvalidSessionRequest::PromptActive,
+                "session already has an active prompt",
             ),
         ];
 

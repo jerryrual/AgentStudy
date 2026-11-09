@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::error::{ControlError, ControlResult, InvalidSessionRequest};
-use super::sessions::{LoadError, PreparedLoad, SessionRegistry};
+use super::sessions::{BeginPromptError, LoadError, PreparedLoad, PromptGuard, SessionRegistry};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
@@ -93,6 +93,26 @@ impl SessionControl {
             .prepare_load(&request.session_id, cwd)
             .map_err(|error| map_load_error(error, &request.session_id))?;
         Ok(LoadTransaction { prepared })
+    }
+
+    /// Acquire the prompt slot or classify its client-visible admission failure.
+    pub(crate) fn begin_prompt(
+        &self,
+        session_id: &agent_client_protocol::v1::schema::SessionId,
+    ) -> ControlResult<PromptGuard> {
+        self.sessions
+            .begin_prompt(session_id)
+            .map_err(|error| match error {
+                BeginPromptError::SessionNotFound => {
+                    ControlError::SessionNotFound(session_id.clone())
+                }
+                BeginPromptError::Loading => {
+                    ControlError::invalid(InvalidSessionRequest::PromptLoading)
+                }
+                BeginPromptError::ActivePrompt => {
+                    ControlError::invalid(InvalidSessionRequest::PromptActive)
+                }
+            })
     }
 
     /// Forward a fire-and-forget cancellation to the matching active prompt.
@@ -538,7 +558,17 @@ mod tests {
         let unknown = CancelNotification::new(SessionId::new("unknown"));
         assert!(!control.cancel(&unknown));
 
-        let mut guard = control.sessions.begin_prompt(&response.session_id).unwrap();
+        let missing = control
+            .begin_prompt(&SessionId::new("missing"))
+            .err()
+            .expect("missing session must be rejected");
+        assert!(matches!(missing, ControlError::SessionNotFound(_)));
+
+        let mut guard = control.begin_prompt(&response.session_id).unwrap();
+        assert!(matches!(
+            control.begin_prompt(&response.session_id),
+            Err(ControlError::Invalid(InvalidSessionRequest::PromptActive))
+        ));
         assert!(control.cancel(&CancelNotification::new(response.session_id.clone())));
         tokio::time::timeout(std::time::Duration::from_secs(1), guard.cancelled())
             .await
