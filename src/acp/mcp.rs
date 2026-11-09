@@ -7,12 +7,18 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::McpServer;
+use anyhow::bail;
+use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+
+use crate::tools::{truncate_output, Tool, ToolContext};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
@@ -765,9 +771,120 @@ impl std::error::Error for ToolCallError {
     }
 }
 
+pub(crate) struct McpServerHandle {
+    client: Mutex<StdioMcpClient>,
+    _process: StdioServerProcess,
+}
+
+pub(crate) fn tool_adapters(
+    process: StdioServerProcess,
+    client: StdioMcpClient,
+    tools: Vec<DiscoveredTool>,
+) -> Vec<Box<dyn Tool>> {
+    let handle = Arc::new(McpServerHandle {
+        client: Mutex::new(client),
+        _process: process,
+    });
+    tools
+        .into_iter()
+        .map(|tool| Box::new(McpTool::new(tool, Arc::clone(&handle))) as Box<dyn Tool>)
+        .collect()
+}
+
+struct McpTool {
+    exposed_name: String,
+    remote_name: String,
+    description: String,
+    parameters: Value,
+    handle: Arc<McpServerHandle>,
+}
+
+impl McpTool {
+    fn new(tool: DiscoveredTool, handle: Arc<McpServerHandle>) -> Self {
+        let description = tool
+            .description
+            .or(tool.title)
+            .unwrap_or_else(|| "Tool provided by an MCP server".to_string());
+        Self {
+            exposed_name: tool.name.clone(),
+            remote_name: tool.name,
+            description,
+            parameters: tool.input_schema,
+            handle,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for McpTool {
+    fn name(&self) -> &'static str {
+        "mcp_tool"
+    }
+
+    fn description(&self) -> &'static str {
+        "Tool provided by an MCP server"
+    }
+
+    fn model_name(&self) -> &str {
+        &self.exposed_name
+    }
+
+    fn model_description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters(&self) -> Value {
+        self.parameters.clone()
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn summarize(&self, _raw_arguments: &str) -> String {
+        format!("{} via MCP", self.exposed_name)
+    }
+
+    async fn run(&self, arguments: &Value, _context: &ToolContext) -> anyhow::Result<String> {
+        let result = self
+            .handle
+            .client
+            .lock()
+            .await
+            .call_tool(&self.remote_name, arguments.clone())
+            .await?;
+        finish_tool_result(result)
+    }
+}
+
+fn finish_tool_result(result: ToolCallResult) -> anyhow::Result<String> {
+    let is_error = result.is_error;
+    let rendered = render_tool_result(result)?;
+    if is_error {
+        bail!("MCP tool returned an error: {}", truncate_output(&rendered));
+    }
+    Ok(rendered)
+}
+
+fn render_tool_result(result: ToolCallResult) -> serde_json::Result<String> {
+    let mut rendered = serde_json::Map::new();
+    rendered.insert("content".to_string(), Value::Array(result.content));
+    rendered.insert("isError".to_string(), Value::Bool(result.is_error));
+    if let Some(structured) = result.structured_content {
+        rendered.insert("structuredContent".to_string(), structured);
+    }
+    if let Some(meta) = result.meta {
+        rendered.insert("_meta".to_string(), meta);
+    }
+    serde_json::to_string(&Value::Object(rendered))
+}
+
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
+
+    use crate::interaction::NoAsker;
+    use crate::tools::ToolRegistry;
 
     use super::*;
 
@@ -1346,6 +1463,62 @@ mod tests {
             .success());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_adapter_registers_dynamic_metadata_and_preserves_full_result() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read list; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echoes\",",
+            "\"inputSchema\":{\"type\":\"object\"}}]}}'; ",
+            "read call; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{",
+            "\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],",
+            "\"structuredContent\":{\"echo\":\"hi\"},\"_meta\":{\"source\":\"fixture\"}}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "adapter".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+        client.initialize().await.unwrap();
+        let discovered = client.list_tools().await.unwrap();
+        let registry =
+            ToolRegistry::try_with_tools(tool_adapters(process, client, discovered)).unwrap();
+        let tool = registry.get("echo").unwrap();
+
+        assert_eq!(tool.name(), "mcp_tool");
+        assert_eq!(tool.model_name(), "echo");
+        assert_eq!(tool.model_description(), "Echoes");
+        assert_eq!(tool.parameters(), serde_json::json!({"type": "object"}));
+        assert!(tool.mutates());
+        assert!(!tool.parallel_safe());
+        assert_eq!(registry.model_names(), vec!["echo"]);
+        let context = ToolContext {
+            cwd: PathBuf::from("/tmp"),
+            timeout: Duration::from_secs(1),
+            asker: Arc::new(NoAsker),
+            todos: Arc::new(Mutex::new(Vec::new())),
+        };
+        let output = tool
+            .run(&serde_json::json!({"text": "hi"}), &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap(),
+            serde_json::json!({
+                "content": [{"type": "text", "text": "hi"}],
+                "structuredContent": {"echo": "hi"},
+                "isError": false,
+                "_meta": {"source": "fixture"}
+            })
+        );
+    }
+
     #[test]
     fn tool_call_result_rejects_untyped_content_and_non_object_extensions() {
         for result in [
@@ -1358,5 +1531,24 @@ mod tests {
                 Err(ToolCallError::InvalidResult)
             ));
         }
+    }
+
+    #[test]
+    fn mcp_tool_error_payload_is_bounded_before_agent_propagation() {
+        let error = finish_tool_result(ToolCallResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": "x".repeat(100_000)
+            })],
+            structured_content: None,
+            is_error: true,
+            meta: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.len() < 31_000);
+        assert!(error.contains("characters omitted"));
+        assert!(error.starts_with("MCP tool returned an error:"));
     }
 }
