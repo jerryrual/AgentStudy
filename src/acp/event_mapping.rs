@@ -1,8 +1,8 @@
 //! Pure mapping from internal turn events to stable ACP v1 updates.
 
 use agent_client_protocol::v1::schema::{
-    ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind, UsageUpdate,
+    ContentChunk, Notice, NoticeSeverity, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use serde_json::Value;
 
@@ -20,6 +20,7 @@ use crate::run::turn_events::TurnEvent;
 pub(crate) fn session_update(
     event: TurnEvent,
     context_window: Option<u32>,
+    supports_notices: bool,
 ) -> Option<SessionUpdate> {
     match event {
         TurnEvent::TextDelta(text) => Some(SessionUpdate::AgentMessageChunk(text_chunk(text))),
@@ -31,8 +32,27 @@ pub(crate) fn session_update(
         TurnEvent::Usage(usage) => context_window.map(|size| {
             SessionUpdate::UsageUpdate(UsageUpdate::new(usage.prompt_tokens, u64::from(size)))
         }),
+        TurnEvent::Info(message) if supports_notices => {
+            Some(notice(NoticeSeverity::Info, "Information", message))
+        }
+        TurnEvent::Warning(message) if supports_notices => {
+            Some(notice(NoticeSeverity::Warning, "Warning", message))
+        }
+        TurnEvent::Error(message) if supports_notices => {
+            Some(notice(NoticeSeverity::Error, "Error", message))
+        }
         TurnEvent::Info(_) | TurnEvent::Error(_) | TurnEvent::Warning(_) => None,
     }
+}
+
+fn notice(severity: NoticeSeverity, title: &str, message: String) -> SessionUpdate {
+    let notice = Notice::new(severity, title);
+    let notice = if message.is_empty() {
+        notice
+    } else {
+        notice.description(message)
+    };
+    SessionUpdate::Notice(notice)
 }
 
 /// Wrap one exact text payload as an ACP content chunk.
@@ -92,7 +112,7 @@ mod tests {
     use crate::model::{ToolCall as ModelToolCall, Usage};
 
     fn update(event: TurnEvent) -> Option<SessionUpdate> {
-        session_update(event, None)
+        session_update(event, None, false)
     }
 
     fn call(id: &str, name: &str, arguments: &str) -> ModelToolCall {
@@ -184,8 +204,10 @@ mod tests {
         };
 
         assert_eq!(
-            serde_json::to_value(session_update(TurnEvent::Usage(usage), Some(128_000)).unwrap())
-                .unwrap(),
+            serde_json::to_value(
+                session_update(TurnEvent::Usage(usage), Some(128_000), false).unwrap(),
+            )
+            .unwrap(),
             serde_json::json!({
                 "sessionUpdate": "usage_update",
                 "used": 3,
@@ -196,5 +218,18 @@ mod tests {
         assert!(update(TurnEvent::Info("working".to_string())).is_none());
         assert!(update(TurnEvent::Error("failed".to_string())).is_none());
         assert!(update(TurnEvent::Warning("retry".to_string())).is_none());
+
+        let mapped = session_update(TurnEvent::Warning("retry".to_string()), None, true).unwrap();
+        assert_eq!(
+            serde_json::to_value(mapped).unwrap(),
+            serde_json::json!({
+                "sessionUpdate": "notice",
+                "severity": "warning",
+                "title": "Warning",
+                "description": "retry"
+            })
+        );
+        let empty = session_update(TurnEvent::Error(String::new()), None, true).unwrap();
+        assert_eq!(serde_json::to_value(empty).unwrap()["title"], "Error");
     }
 }

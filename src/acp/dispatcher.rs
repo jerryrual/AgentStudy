@@ -17,11 +17,12 @@ use super::event_mapping::session_update;
 async fn dispatch_with<E>(
     session_id: SessionId,
     context_window: Option<u32>,
+    supports_notices: bool,
     mut events: UnboundedReceiver<TurnEvent>,
     mut send: impl FnMut(SessionNotification) -> Result<(), E>,
 ) -> Result<(), E> {
     while let Some(event) = events.recv().await {
-        if let Some(update) = session_update(event, context_window) {
+        if let Some(update) = session_update(event, context_window, supports_notices) {
             send(SessionNotification::new(session_id.clone(), update))?;
         }
     }
@@ -35,12 +36,17 @@ async fn dispatch_with<E>(
 pub(crate) async fn dispatch_to_client(
     session_id: SessionId,
     context_window: Option<u32>,
+    supports_notices: bool,
     events: UnboundedReceiver<TurnEvent>,
     connection: ConnectionTo<Client>,
 ) -> AcpResult<()> {
-    dispatch_with(session_id, context_window, events, |notification| {
-        connection.send_notification(notification)
-    })
+    dispatch_with(
+        session_id,
+        context_window,
+        supports_notices,
+        events,
+        |notification| connection.send_notification(notification),
+    )
     .await
 }
 
@@ -76,6 +82,7 @@ mod tests {
         dispatch_with(
             SessionId::new("session-7"),
             Some(128_000),
+            false,
             receiver,
             |notification| {
                 notifications.push(notification);
@@ -113,7 +120,7 @@ mod tests {
         drop(observer);
         let mut attempts = 0;
 
-        dispatch_with(SessionId::new("session-8"), None, receiver, |_| {
+        dispatch_with(SessionId::new("session-8"), None, false, receiver, |_| {
             attempts += 1;
             Ok::<_, ()>(())
         })
@@ -132,7 +139,7 @@ mod tests {
         drop(observer);
         let mut attempts = 0;
 
-        let result = dispatch_with(SessionId::new("session-9"), None, receiver, |_| {
+        let result = dispatch_with(SessionId::new("session-9"), None, false, receiver, |_| {
             attempts += 1;
             if attempts == 2 {
                 Err("closed")
@@ -154,10 +161,16 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            dispatch_with(SessionId::new("session-empty"), None, receiver, |_| {
-                sent = true;
-                Ok::<_, ()>(())
-            }),
+            dispatch_with(
+                SessionId::new("session-empty"),
+                None,
+                false,
+                receiver,
+                |_| {
+                    sent = true;
+                    Ok::<_, ()>(())
+                },
+            ),
         )
         .await
         .expect("dispatcher did not observe channel closure")
