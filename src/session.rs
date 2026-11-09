@@ -955,6 +955,11 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.meta.id
     }
+
+    /// Return the exact working directory persisted for this session.
+    pub(crate) fn cwd(&self) -> &str {
+        &self.meta.cwd
+    }
 }
 
 fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
