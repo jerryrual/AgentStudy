@@ -18,6 +18,7 @@ const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
 const MAX_ENV: usize = 256;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -368,6 +369,131 @@ impl StdioMcpClient {
             _ => Err(RequestError::InvalidResponse),
         }
     }
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), RequestError> {
+        if !self.usable {
+            return Err(RequestError::Unusable);
+        }
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        if let Err(error) = self.transport.send(&notification).await {
+            self.usable = false;
+            return Err(RequestError::Transport(error));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn initialize(&mut self) -> Result<ServerInitialization, InitializeError> {
+        let result = self
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "icode",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                }),
+            )
+            .await
+            .map_err(|error| {
+                self.usable = false;
+                InitializeError::Request(error)
+            })?;
+        let initialization = match ServerInitialization::from_result(&result) {
+            Ok(initialization) => initialization,
+            Err(error) => {
+                self.usable = false;
+                return Err(error);
+            }
+        };
+        self.notify("notifications/initialized", serde_json::json!({}))
+            .await
+            .map_err(InitializeError::Request)?;
+        Ok(initialization)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ServerInitialization {
+    pub(crate) capabilities: Value,
+    pub(crate) server_name: String,
+    pub(crate) server_version: String,
+    pub(crate) instructions: Option<String>,
+}
+
+impl ServerInitialization {
+    fn from_result(result: &Value) -> Result<Self, InitializeError> {
+        let object = result.as_object().ok_or(InitializeError::InvalidResult)?;
+        let version = object
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or(InitializeError::InvalidResult)?;
+        if version != MCP_PROTOCOL_VERSION {
+            return Err(InitializeError::UnsupportedVersion(version.to_string()));
+        }
+        let capabilities = object
+            .get("capabilities")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or(InitializeError::InvalidResult)?;
+        let server_info = object
+            .get("serverInfo")
+            .and_then(Value::as_object)
+            .ok_or(InitializeError::InvalidResult)?;
+        let server_name = nonempty_string(server_info.get("name"))?;
+        let server_version = nonempty_string(server_info.get("version"))?;
+        let instructions = match object.get("instructions") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(instructions)) => Some(instructions.clone()),
+            Some(_) => return Err(InitializeError::InvalidResult),
+        };
+        Ok(Self {
+            capabilities,
+            server_name,
+            server_version,
+            instructions,
+        })
+    }
+}
+
+fn nonempty_string(value: Option<&Value>) -> Result<String, InitializeError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or(InitializeError::InvalidResult)
+}
+
+#[derive(Debug)]
+pub(crate) enum InitializeError {
+    Request(RequestError),
+    UnsupportedVersion(String),
+    InvalidResult,
+}
+
+impl std::fmt::Display for InitializeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) => error.fmt(formatter),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported MCP protocol version: {version}")
+            }
+            Self::InvalidResult => formatter.write_str("invalid MCP initialize result"),
+        }
+    }
+}
+
+impl std::error::Error for InitializeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Request(error) => Some(error),
+            Self::UnsupportedVersion(_) | Self::InvalidResult => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -708,5 +834,114 @@ mod tests {
         );
         drop(client);
         process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_initializes_then_notifies_with_supported_version() {
+        let script = concat!(
+            "read initialize; ",
+            "case \"$initialize\" in *'\"method\":\"initialize\"'*) ;; *) exit 2;; esac; ",
+            "case \"$initialize\" in *'\"protocolVersion\":\"2025-06-18\"'*) ;; *) exit 3;; esac; ",
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{",
+            "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1.2.3\"},",
+            "\"instructions\":\"use carefully\"}}'; ",
+            "read initialized; ",
+            "case \"$initialized\" in *'\"method\":\"notifications/initialized\"'*) exit 0;; *) exit 4;; esac"
+        );
+        let spec = StdioServerSpec {
+            name: "initialize".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert_eq!(
+            client.initialize().await.unwrap(),
+            ServerInitialization {
+                capabilities: serde_json::json!({"tools": {}}),
+                server_name: "fixture".into(),
+                server_version: "1.2.3".into(),
+                instructions: Some("use carefully".into()),
+            }
+        );
+        drop(client);
+        assert!(process
+            .shutdown(Duration::from_secs(1))
+            .await
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_rejects_unsupported_version_and_becomes_unusable() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2099-01-01\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"future\",\"version\":\"1\"}}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "unsupported".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert!(matches!(
+            client.initialize().await,
+            Err(InitializeError::UnsupportedVersion(version)) if version == "2099-01-01"
+        ));
+        assert!(matches!(
+            client.request("again", serde_json::json!({})).await,
+            Err(RequestError::Unusable)
+        ));
+        drop(client);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_remote_initialize_error_becomes_unusable() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"error\":{\"code\":-1,\"message\":\"denied\"}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "remote-initialize-error".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert!(matches!(
+            client.initialize().await,
+            Err(InitializeError::Request(RequestError::Remote(_)))
+        ));
+        assert!(matches!(
+            client.request("again", serde_json::json!({})).await,
+            Err(RequestError::Unusable)
+        ));
+        drop(client);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[test]
+    fn initialize_result_requires_capabilities_and_server_identity() {
+        assert!(matches!(
+            ServerInitialization::from_result(&serde_json::json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": [],
+                "serverInfo": {"name": "", "version": "1"}
+            })),
+            Err(InitializeError::InvalidResult)
+        ));
     }
 }
