@@ -273,6 +273,7 @@ fn validate_envelope(message: &Value) -> Result<(), TransportError> {
 #[derive(Debug)]
 pub(crate) enum RequestError {
     Transport(TransportError),
+    Unusable,
     IdExhausted,
     UnexpectedMessage,
     MismatchedId,
@@ -284,6 +285,7 @@ impl std::fmt::Display for RequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(error) => error.fmt(formatter),
+            Self::Unusable => formatter.write_str("MCP client stream is no longer reusable"),
             Self::IdExhausted => formatter.write_str("MCP request ID space is exhausted"),
             Self::UnexpectedMessage => {
                 formatter.write_str("unexpected MCP message while awaiting response")
@@ -299,7 +301,8 @@ impl std::error::Error for RequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Transport(error) => Some(error),
-            Self::IdExhausted
+            Self::Unusable
+            | Self::IdExhausted
             | Self::UnexpectedMessage
             | Self::MismatchedId
             | Self::InvalidResponse
@@ -311,6 +314,7 @@ impl std::error::Error for RequestError {
 pub(crate) struct StdioMcpClient {
     transport: StdioJsonRpc,
     next_id: u64,
+    usable: bool,
 }
 
 impl StdioMcpClient {
@@ -318,6 +322,7 @@ impl StdioMcpClient {
         Ok(Self {
             transport: StdioJsonRpc::from_process(process)?,
             next_id: 1,
+            usable: true,
         })
     }
 
@@ -326,6 +331,9 @@ impl StdioMcpClient {
         method: &str,
         params: Value,
     ) -> Result<Value, RequestError> {
+        if !self.usable {
+            return Err(RequestError::Unusable);
+        }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or(RequestError::IdExhausted)?;
         let request = serde_json::json!({
@@ -334,20 +342,24 @@ impl StdioMcpClient {
             "method": method,
             "params": params,
         });
-        self.transport
-            .send(&request)
-            .await
-            .map_err(RequestError::Transport)?;
-        let response = self
-            .transport
-            .receive()
-            .await
-            .map_err(RequestError::Transport)?;
+        if let Err(error) = self.transport.send(&request).await {
+            self.usable = false;
+            return Err(RequestError::Transport(error));
+        }
+        let response = match self.transport.receive().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.usable = false;
+                return Err(RequestError::Transport(error));
+            }
+        };
         let object = response.as_object().ok_or(RequestError::InvalidResponse)?;
         if object.contains_key("method") {
+            self.usable = false;
             return Err(RequestError::UnexpectedMessage);
         }
         if object.get("id") != Some(&Value::from(id)) {
+            self.usable = false;
             return Err(RequestError::MismatchedId);
         }
         match (object.get("result"), object.get("error")) {
@@ -629,13 +641,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn mcp_client_rejects_mismatched_remote_and_unsolicited_messages() {
+    async fn mcp_client_rejects_mismatched_and_unsolicited_messages() {
         let cases = [
             (r#"{"jsonrpc":"2.0","id":99,"result":{}}"#, "mismatched"),
-            (
-                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"no"}}"#,
-                "remote",
-            ),
             (
                 r#"{"jsonrpc":"2.0","method":"notice","params":{}}"#,
                 "unexpected",
@@ -657,12 +665,48 @@ mod tests {
                 .unwrap_err();
             match expected {
                 "mismatched" => assert!(matches!(error, RequestError::MismatchedId)),
-                "remote" => assert!(matches!(error, RequestError::Remote(_))),
                 "unexpected" => assert!(matches!(error, RequestError::UnexpectedMessage)),
                 _ => unreachable!(),
             }
+            assert!(matches!(
+                client.request("again", serde_json::json!({})).await,
+                Err(RequestError::Unusable)
+            ));
             drop(client);
             process.shutdown(Duration::from_secs(1)).await.unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_remains_reusable_after_remote_error() {
+        let script = concat!(
+            "read first; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"error\":{\"code\":-1,\"message\":\"no\"}}'; ",
+            "read second; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"ok\":true}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "remote-error".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert!(matches!(
+            client.request("first", serde_json::json!({})).await,
+            Err(RequestError::Remote(_))
+        ));
+        assert_eq!(
+            client
+                .request("second", serde_json::json!({}))
+                .await
+                .unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        drop(client);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }
