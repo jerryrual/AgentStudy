@@ -181,7 +181,18 @@ impl Default for ToolRegistry {
 impl ToolRegistry {
     /// Register the complete built-in tool set.
     pub fn builtin() -> Self {
-        let tools: Vec<Box<dyn Tool>> = vec![
+        Self::try_with_tools(Self::builtin_tools()).expect("built-in tool names are unique")
+    }
+
+    /// Register built-ins plus additional tools, rejecting every name collision.
+    pub fn builtin_with(mut additional: Vec<Box<dyn Tool>>) -> Result<Self> {
+        let mut tools = Self::builtin_tools();
+        tools.append(&mut additional);
+        Self::try_with_tools(tools)
+    }
+
+    fn builtin_tools() -> Vec<Box<dyn Tool>> {
+        vec![
             Box::new(fs::ReadFile),
             Box::new(fs::WriteFile),
             Box::new(fs::EditFile),
@@ -191,8 +202,7 @@ impl ToolRegistry {
             Box::new(shell::Bash),
             Box::new(misc::TodoWrite),
             Box::new(misc::AskUser),
-        ];
-        Self::try_with_tools(tools).expect("built-in tool names are unique")
+        ]
     }
 
     pub(crate) fn try_with_tools(tools: Vec<Box<dyn Tool>>) -> Result<Self> {
@@ -348,6 +358,16 @@ mod tests {
             }),
         ])
         .is_err());
+        assert!(ToolRegistry::builtin_with(vec![Box::new(DynamicTool {
+            name: "read_file".into(),
+        })])
+        .is_err());
+        let combined = ToolRegistry::builtin_with(vec![Box::new(DynamicTool {
+            name: "remote".into(),
+        })])
+        .unwrap();
+        assert!(combined.get("read_file").is_some());
+        assert!(combined.get("remote").is_some());
     }
 
     #[test]

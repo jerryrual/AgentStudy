@@ -27,6 +27,7 @@ const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_DISCOVERED_TOOLS: usize = 1024;
+const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -795,6 +796,7 @@ pub(crate) struct McpServerHandle {
 }
 
 pub(crate) fn tool_adapters(
+    server_index: usize,
     process: StdioServerProcess,
     client: StdioMcpClient,
     tools: Vec<DiscoveredTool>,
@@ -805,8 +807,29 @@ pub(crate) fn tool_adapters(
     });
     tools
         .into_iter()
-        .map(|tool| Box::new(McpTool::new(tool, Arc::clone(&handle))) as Box<dyn Tool>)
+        .enumerate()
+        .map(|(tool_index, tool)| {
+            let exposed_name = model_tool_name(server_index, tool_index, &tool.name);
+            Box::new(McpTool::new(exposed_name, tool, Arc::clone(&handle))) as Box<dyn Tool>
+        })
         .collect()
+}
+
+fn model_tool_name(server_index: usize, tool_index: usize, remote_name: &str) -> String {
+    let mut name = format!("mcp_s{server_index}_t{tool_index}_");
+    for character in remote_name.chars() {
+        if name.len() == MAX_MODEL_TOOL_NAME_BYTES {
+            break;
+        }
+        name.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    name
 }
 
 struct McpTool {
@@ -818,13 +841,13 @@ struct McpTool {
 }
 
 impl McpTool {
-    fn new(tool: DiscoveredTool, handle: Arc<McpServerHandle>) -> Self {
+    fn new(exposed_name: String, tool: DiscoveredTool, handle: Arc<McpServerHandle>) -> Self {
         let description = tool
             .description
             .or(tool.title)
             .unwrap_or_else(|| "Tool provided by an MCP server".to_string());
         Self {
-            exposed_name: tool.name.clone(),
+            exposed_name,
             remote_name: tool.name,
             description,
             parameters: tool.input_schema,
@@ -1546,16 +1569,18 @@ mod tests {
         client.initialize().await.unwrap();
         let discovered = client.list_tools().await.unwrap();
         let registry =
-            ToolRegistry::try_with_tools(tool_adapters(process, client, discovered)).unwrap();
-        let tool = registry.get("echo").unwrap();
+            ToolRegistry::builtin_with(tool_adapters(3, process, client, discovered)).unwrap();
+        let model_name = "mcp_s3_t0_echo";
+        let tool = registry.get(model_name).unwrap();
 
         assert_eq!(tool.name(), "mcp_tool");
-        assert_eq!(tool.model_name(), "echo");
+        assert_eq!(tool.model_name(), model_name);
         assert_eq!(tool.model_description(), "Echoes");
         assert_eq!(tool.parameters(), serde_json::json!({"type": "object"}));
         assert!(tool.mutates());
         assert!(!tool.parallel_safe());
-        assert_eq!(registry.model_names(), vec!["echo"]);
+        assert!(registry.model_names().contains(&model_name));
+        assert!(registry.get("read_file").is_some());
         let context = ToolContext {
             cwd: PathBuf::from("/tmp"),
             timeout: Duration::from_secs(1),
@@ -1574,6 +1599,26 @@ mod tests {
                 "isError": false,
                 "_meta": {"source": "fixture"}
             })
+        );
+    }
+
+    #[test]
+    fn mcp_model_names_are_bounded_safe_and_ordinally_unique() {
+        let first = model_tool_name(0, 0, "same tool/工具");
+        let other_server = model_tool_name(1, 0, "same tool/工具");
+        let other_tool = model_tool_name(0, 1, "same tool/工具");
+        assert_eq!(first, "mcp_s0_t0_same_tool___");
+        assert_ne!(first, other_server);
+        assert_ne!(first, other_tool);
+        for name in [first, other_server, other_tool] {
+            assert!(name.len() <= MAX_MODEL_TOOL_NAME_BYTES);
+            assert!(name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
+        }
+        assert_eq!(
+            model_tool_name(31, 1023, &"x".repeat(200)).len(),
+            MAX_MODEL_TOOL_NAME_BYTES
         );
     }
 
