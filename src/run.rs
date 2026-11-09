@@ -410,6 +410,43 @@ impl<O: TurnObserver> EventSink for PersistentTurnSink<O> {
     }
 }
 
+/// How a caller starts one turn on an already-owned persistent session.
+pub(crate) enum TurnStart {
+    User(String),
+    Resume,
+}
+
+/// Durable state prepared before an agent begins one session turn.
+pub(crate) struct PreparedSessionTurn {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) phase_four_turn: u64,
+    pub(crate) phase_four_state: crate::phase4_breaker::PhaseFourBreakerState,
+}
+
+/// Load history and atomically persist one new user turn, or resume an interrupted turn.
+pub(crate) fn prepare_session_turn(
+    session: &Session,
+    start: TurnStart,
+) -> Result<PreparedSessionTurn> {
+    let (messages, phase_four_turn, phase_four_state) = match start {
+        TurnStart::Resume => session.load_resumable_turn()?,
+        TurnStart::User(text) => {
+            if text.trim().is_empty() {
+                anyhow::bail!("the task prompt must not be empty");
+            }
+            let mut messages = session.load_messages()?;
+            messages.push(Message::user(text.clone()));
+            let (turn, state) = session.append_user_and_load_phase_four_breaker(&text)?;
+            (messages, turn, state)
+        }
+    };
+    Ok(PreparedSessionTurn {
+        messages,
+        phase_four_turn,
+        phase_four_state,
+    })
+}
+
 /// Execute one task without the TUI.
 ///
 /// Like iCode's `icode run`, no approval prompt is shown: mutating tools are
@@ -442,24 +479,18 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             (session, lease)
         }
     };
-    let loaded = options
-        .session
-        .as_deref()
-        .map(|id| store.load(id))
-        .transpose()?;
-
-    let (mut messages, phase_four_turn, phase_four_state) = if options.resume_turn {
-        session.load_resumable_turn()?
-    } else {
-        let mut messages = loaded.map(|loaded| loaded.messages()).unwrap_or_default();
-        let task = options.task.trim().to_string();
-        if task.is_empty() {
-            anyhow::bail!("the task prompt must not be empty");
-        }
-        messages.push(Message::user(task.clone()));
-        let (turn, state) = session.append_user_and_load_phase_four_breaker(&task)?;
-        (messages, turn, state)
-    };
+    let PreparedSessionTurn {
+        mut messages,
+        phase_four_turn,
+        phase_four_state,
+    } = prepare_session_turn(
+        &session,
+        if options.resume_turn {
+            TurnStart::Resume
+        } else {
+            TurnStart::User(options.task.trim().to_string())
+        },
+    )?;
 
     let approver: std::sync::Arc<dyn Approver> = if options.resume_turn {
         // The prior process may have exited after a mutating tool took effect but
@@ -730,6 +761,51 @@ mod tests {
             recovery_writer,
         );
         (sink, observer)
+    }
+
+    #[test]
+    fn session_turn_preparation_loads_history_and_persists_one_user() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        session
+            .append(&Record::Assistant {
+                content: Some("earlier".to_string()),
+                reasoning: None,
+                tool_calls: vec![],
+                responses_items: vec![],
+            })
+            .unwrap();
+
+        let prepared =
+            prepare_session_turn(&session, TurnStart::User(" next ".to_string())).unwrap();
+
+        assert_eq!(
+            prepared.messages,
+            vec![
+                Message::Assistant {
+                    message: crate::model::AssistantMessage {
+                        content: Some("earlier".to_string()),
+                        reasoning: None,
+                        tool_calls: vec![],
+                        responses_items: vec![],
+                    },
+                },
+                Message::user(" next "),
+            ]
+        );
+        assert_eq!(session.load_messages().unwrap(), prepared.messages);
+        assert_eq!(prepared.phase_four_turn, 1);
+    }
+
+    #[test]
+    fn rejected_session_turn_does_not_append_a_user_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+
+        assert!(prepare_session_turn(&session, TurnStart::User(" \n ".to_string())).is_err());
+        assert!(session.load_messages().unwrap().is_empty());
     }
 
     #[test]
