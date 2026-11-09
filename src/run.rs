@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use crate::agent::{Agent, AgentKind, AgentOptions, EventSink};
+use crate::agent::{Agent, AgentKind, AgentOptions, EventSink, TurnResult};
 use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::compaction_archive::CurrentTurnArchiveManifest;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
@@ -170,8 +170,8 @@ impl<O> PersistentTurnSink<O> {
             .reset();
     }
 
-    pub(crate) fn observer(&self) -> &O {
-        &self.observer
+    fn into_observer(self) -> O {
+        self.observer
     }
 }
 
@@ -447,6 +447,119 @@ pub(crate) fn prepare_session_turn(
     })
 }
 
+/// Terminal state of one persistent session turn.
+pub(crate) enum SessionTurnStatus {
+    Completed(TurnResult),
+    Cancelled,
+}
+
+/// Turn result plus the caller's presentation observer.
+pub(crate) struct SessionTurnOutput<O> {
+    pub(crate) status: SessionTurnStatus,
+    pub(crate) observer: O,
+    pub(crate) has_unsaved_messages: bool,
+}
+
+async fn finalize_recovery(mut writer: RecoveryCheckpointWriter, preserve: bool) {
+    let result = tokio::task::spawn_blocking(move || {
+        if preserve {
+            writer.preserve()
+        } else {
+            writer.clear()
+        }
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("warning: failed to finalize recovery checkpoint: {error:#}");
+        }
+        Err(error) => {
+            eprintln!("warning: recovery checkpoint task failed: {error}");
+        }
+    }
+}
+
+/// Run one prepared persistent turn and finalize its recovery state.
+pub(crate) async fn execute_session_turn<O, C>(
+    agent: &Agent,
+    session: Session,
+    prepared: PreparedSessionTurn,
+    observer: O,
+    phase_four_side_call_token_budget: i64,
+    cancelled: C,
+) -> Result<SessionTurnOutput<O>>
+where
+    O: TurnObserver,
+    C: std::future::Future<Output = ()>,
+{
+    let PreparedSessionTurn {
+        mut messages,
+        phase_four_turn,
+        phase_four_state,
+    } = prepared;
+    let recovery_writer = RecoveryCheckpointWriter::new(session.clone(), phase_four_turn)?;
+    let sink = PersistentTurnSink::new(
+        observer,
+        session.clone(),
+        phase_four_turn,
+        phase_four_side_call_token_budget,
+        phase_four_state,
+        recovery_writer.handle(),
+    );
+    let mut run = Box::pin(agent.run(&mut messages, &sink));
+    let cancelled = std::pin::pin!(cancelled);
+    let result = tokio::select! {
+        biased;
+        _ = cancelled => None,
+        result = run.as_mut() => Some(result),
+    };
+    drop(run);
+
+    let status = match result {
+        None => {
+            finalize_recovery(recovery_writer, true).await;
+            SessionTurnStatus::Cancelled
+        }
+        Some(Ok(turn)) => {
+            if !sink.has_unsaved_messages() && agent.should_force_compression(&turn) {
+                if let Some(plan) = crate::compaction::plan_forced_compression(&messages) {
+                    let checkpoint = Record::Compaction {
+                        summary: plan.summary.clone(),
+                        compacted_messages: Some(plan.compacted_messages),
+                    };
+                    let compression_session = session.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        compression_session.append(&checkpoint)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => sink.reset_buffer(),
+                        Ok(Err(error)) => {
+                            eprintln!("warning: failed to save automatic compaction: {error:#}");
+                        }
+                        Err(error) => {
+                            eprintln!("warning: automatic compaction task failed: {error}");
+                        }
+                    }
+                }
+            }
+            finalize_recovery(recovery_writer, sink.has_unsaved_messages()).await;
+            SessionTurnStatus::Completed(turn)
+        }
+        Some(Err(error)) => {
+            finalize_recovery(recovery_writer, true).await;
+            return Err(error).context("the agent run failed");
+        }
+    };
+    let has_unsaved_messages = sink.has_unsaved_messages();
+    Ok(SessionTurnOutput {
+        status,
+        observer: sink.into_observer(),
+        has_unsaved_messages,
+    })
+}
+
 /// Execute one task without the TUI.
 ///
 /// Like iCode's `icode run`, no approval prompt is shown: mutating tools are
@@ -479,11 +592,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             (session, lease)
         }
     };
-    let PreparedSessionTurn {
-        mut messages,
-        phase_four_turn,
-        phase_four_state,
-    } = prepare_session_turn(
+    let prepared = prepare_session_turn(
         &session,
         if options.resume_turn {
             TurnStart::Resume
@@ -515,69 +624,47 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         },
     );
 
-    let mut recovery_writer = RecoveryCheckpointWriter::new(session.clone(), phase_four_turn)?;
-    let sink = PersistentTurnSink::new(
+    let execution = execute_session_turn(
+        &agent,
+        session.clone(),
+        prepared,
         ConsoleObserver {
             json: options.json,
             wrote_text: AtomicBool::new(false),
         },
-        session.clone(),
-        phase_four_turn,
         options.settings.phase4_side_call_token_budget,
-        phase_four_state,
-        recovery_writer.handle(),
-    );
-
-    let mut run = Box::pin(agent.run(&mut messages, &sink));
-    let result = tokio::select! {
-        result = run.as_mut() => Some(result),
-        _ = tokio::signal::ctrl_c() => None,
-    };
-    drop(run);
-    let Some(result) = result else {
-        let preserve = tokio::task::spawn_blocking(move || recovery_writer.preserve());
-        match tokio::time::timeout(Duration::from_secs(5), preserve).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => {
-                eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+    )
+    .await;
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            if options.json {
+                let payload = json!({
+                    "ok": false,
+                    "agent": options.agent.as_str(),
+                    "model": options.profile.model,
+                    "session_id": session.id(),
+                    "error": format!("{error:#}"),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             }
-            Ok(Err(error)) => {
-                eprintln!("warning: recovery checkpoint task failed: {error}");
-            }
-            Err(_) => {
-                eprintln!("warning: timed out preserving recovery checkpoint");
-            }
+            return Err(error);
         }
-        if !options.json {
-            eprintln!();
-        }
-        eprintln!("✗ Interrupted");
-        std::process::exit(130);
     };
 
-    match result {
-        Ok(turn) => {
-            if !sink.has_unsaved_messages() && agent.should_force_compression(&turn) {
-                if let Some(plan) = crate::compaction::plan_forced_compression(&messages) {
-                    let checkpoint = Record::Compaction {
-                        summary: plan.summary.clone(),
-                        compacted_messages: Some(plan.compacted_messages),
-                    };
-                    match session.append(&checkpoint) {
-                        Ok(()) => sink.reset_buffer(),
-                        Err(error) => {
-                            eprintln!("warning: failed to save automatic compaction: {error:#}");
-                        }
-                    }
-                }
+    let _has_unsaved_messages = execution.has_unsaved_messages;
+    match execution.status {
+        SessionTurnStatus::Cancelled => {
+            if !options.json {
+                eprintln!();
             }
-            if !sink.has_unsaved_messages() {
-                if let Err(error) = recovery_writer.clear() {
-                    eprintln!("warning: failed to clear recovery checkpoint: {error:#}");
-                }
-            } else if let Err(error) = recovery_writer.preserve() {
-                eprintln!("warning: failed to preserve recovery checkpoint: {error:#}");
-            }
+            eprintln!("✗ Interrupted");
+            std::process::exit(130);
+        }
+        SessionTurnStatus::Completed(turn) => {
             if options.json {
                 let payload = json!({
                     "ok": true,
@@ -596,7 +683,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 });
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                if sink.observer().text_written() {
+                if execution.observer.text_written() {
                     println!();
                 }
                 eprintln!(
@@ -607,22 +694,6 @@ pub async fn execute(options: RunOptions) -> Result<()> {
                 );
             }
             Ok(())
-        }
-        Err(error) => {
-            if let Err(persist_error) = recovery_writer.preserve() {
-                eprintln!("warning: failed to preserve recovery checkpoint: {persist_error:#}");
-            }
-            if options.json {
-                let payload = json!({
-                    "ok": false,
-                    "agent": options.agent.as_str(),
-                    "model": options.profile.model,
-                    "session_id": session.id(),
-                    "error": format!("{error:#}"),
-                });
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            }
-            Err(error).context("the agent run failed")
         }
     }
 }
@@ -806,6 +877,46 @@ mod tests {
 
         assert!(prepare_session_turn(&session, TurnStart::User(" \n ".to_string())).is_err());
         assert!(session.load_messages().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_turn_cancellation_is_returned_as_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let prepared =
+            prepare_session_turn(&session, TurnStart::User("cancel me".to_string())).unwrap();
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = "http://127.0.0.1:1".to_string();
+        profile.model = "mock-model".to_string();
+        let agent = Agent::new(
+            std::sync::Arc::new(ModelClient::from_profile(&profile).unwrap()),
+            std::sync::Arc::new(ToolRegistry::with_tools(Vec::new())),
+            std::sync::Arc::new(DenyAll),
+            std::sync::Arc::new(NoAsker),
+            AgentOptions::new(AgentKind::Code, "/tmp"),
+        );
+        let observer = Arc::new(RecordingObserver::default());
+
+        let output = execute_session_turn(
+            &agent,
+            session.clone(),
+            prepared,
+            Arc::clone(&observer),
+            -1,
+            async {},
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(output.status, SessionTurnStatus::Cancelled));
+        assert!(!output.has_unsaved_messages);
+        assert!(Arc::ptr_eq(&output.observer, &observer));
+        assert_eq!(
+            session.load_messages().unwrap(),
+            vec![Message::user("cancel me")]
+        );
     }
 
     #[test]
