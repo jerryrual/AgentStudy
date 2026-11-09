@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::tools::{Tool, ToolContext};
+use crate::tools::{truncate_output, Tool, ToolContext};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
@@ -853,13 +853,17 @@ impl Tool for McpTool {
             .await
             .call_tool(&self.remote_name, arguments.clone())
             .await?;
-        let is_error = result.is_error;
-        let rendered = render_tool_result(result)?;
-        if is_error {
-            bail!("MCP tool returned an error: {rendered}");
-        }
-        Ok(rendered)
+        finish_tool_result(result)
     }
+}
+
+fn finish_tool_result(result: ToolCallResult) -> anyhow::Result<String> {
+    let is_error = result.is_error;
+    let rendered = render_tool_result(result)?;
+    if is_error {
+        bail!("MCP tool returned an error: {}", truncate_output(&rendered));
+    }
+    Ok(rendered)
 }
 
 fn render_tool_result(result: ToolCallResult) -> serde_json::Result<String> {
@@ -1527,5 +1531,24 @@ mod tests {
                 Err(ToolCallError::InvalidResult)
             ));
         }
+    }
+
+    #[test]
+    fn mcp_tool_error_payload_is_bounded_before_agent_propagation() {
+        let error = finish_tool_result(ToolCallResult {
+            content: vec![serde_json::json!({
+                "type": "text",
+                "text": "x".repeat(100_000)
+            })],
+            structured_content: None,
+            is_error: true,
+            meta: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.len() < 31_000);
+        assert!(error.contains("characters omitted"));
+        assert!(error.starts_with("MCP tool returned an error:"));
     }
 }
