@@ -324,8 +324,10 @@ fn valid_remote_error(value: &Value) -> bool {
     let Some(error) = value.as_object() else {
         return false;
     };
-    let integer_code = error.get("code").and_then(Value::as_i64).is_some()
-        || error.get("code").and_then(Value::as_u64).is_some();
+    let integer_code = error
+        .get("code")
+        .and_then(Value::as_f64)
+        .is_some_and(|code| code.is_finite() && code.fract() == 0.0);
     integer_code && error.get("message").and_then(Value::as_str).is_some()
 }
 
@@ -1181,6 +1183,10 @@ mod tests {
                 "invalid",
             ),
             (r#"{"jsonrpc":"2.0","id":1,"error":null}"#, "invalid"),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":1.5,"message":"bad"}}"#,
+                "invalid",
+            ),
         ];
         for (response, expected) in cases {
             let script = format!("read request; printf '%s\\n' '{response}'");
@@ -1246,7 +1252,7 @@ mod tests {
     async fn mcp_client_remains_reusable_after_remote_error() {
         let script = concat!(
             "read first; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
-            "\"error\":{\"code\":-1,\"message\":\"no\"}}'; ",
+            "\"error\":{\"code\":-32603.0,\"message\":\"no\"}}'; ",
             "read second; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
             "\"result\":{\"ok\":true}}'"
         );
