@@ -82,8 +82,82 @@ mod tests {
     };
     use agent_client_protocol::{Channel, Client, Error as ProtocolError};
     use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
 
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_phase_prompt_eof_releases_connection_scoped_lease() {
+        let directory = TempDir::new().unwrap();
+        let store = SessionStore::with_root(directory.path().join("sessions"));
+        let cwd = directory.path().to_path_buf();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (provider_entered_tx, provider_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_provider_tx, release_provider_rx) = tokio::sync::oneshot::channel();
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(read > 0, "provider received an empty HTTP request");
+            provider_entered_tx.send(()).unwrap();
+            let _ = release_provider_rx.await;
+        });
+        let mut profile = ModelProfile::builtin_deepseek();
+        profile.api_key = "test-key".to_string();
+        profile.base_url = format!("http://{address}");
+        profile.model = "mock-model".to_string();
+        let created_id = Arc::new(Mutex::new(None::<SessionId>));
+        let received_id = Arc::clone(&created_id);
+        let (transport, peer) = Channel::duplex();
+
+        let server = serve(
+            Settings::default(),
+            profile,
+            AgentKind::Code,
+            store.clone(),
+            transport,
+        );
+        let client = Client.v1().connect_with(peer, async move |connection| {
+            let _: InitializeResponse = connection
+                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let created: NewSessionResponse = connection
+                .send_request(NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            *received_id.lock().unwrap() = Some(created.session_id.clone());
+            let prompt = connection
+                .send_request(PromptRequest::new(
+                    created.session_id,
+                    vec![ContentBlock::from("remain active at provider")],
+                ))
+                .block_task();
+            connection.spawn(async move {
+                let _ = prompt.await;
+                Ok(())
+            })?;
+            provider_entered_rx.await.unwrap();
+            Ok::<(), ProtocolError>(())
+        });
+
+        let (server_result, client_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("provider-phase EOF test timed out");
+        server_result.unwrap();
+        client_result.unwrap();
+
+        let session_id = created_id.lock().unwrap().clone().unwrap().to_string();
+        let _lease = store
+            .try_acquire_run_lease(&session_id)
+            .expect("provider-phase EOF must release the session run lease");
+        release_provider_tx.send(()).unwrap();
+        provider.await.unwrap();
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn active_prompt_eof_waits_for_detached_setup_before_releasing_lease() {
