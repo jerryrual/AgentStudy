@@ -21,6 +21,7 @@ use crate::run::{
     execute_session_turn, prepare_session_turn, turn_events, SessionTurnStatus, TurnStart,
 };
 
+use super::approval::AcpApprover;
 use super::dispatcher;
 use super::error::ControlError;
 use super::prompt;
@@ -114,6 +115,10 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let setup_hook = prompt_setup_hook.clone();
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
                 let request_cancellation = responder.cancellation();
+                let approver = Arc::new(AcpApprover::new(
+                    request.session_id.clone(),
+                    connection.clone(),
+                ));
                 let session_id = request.session_id;
                 let task_connection = connection.clone();
 
@@ -123,7 +128,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         if let Some(hook) = setup_hook {
                             hook();
                         }
-                        let agent = runtime.agent_for(&cwd);
+                        let agent = runtime.agent_for(&cwd, approver);
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
                     })
