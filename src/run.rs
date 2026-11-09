@@ -4,7 +4,7 @@ pub(crate) mod turn_events;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -461,8 +461,13 @@ pub(crate) struct SessionTurnOutput<O> {
 }
 
 /// Finalize one recovery checkpoint on a blocking worker, returning any warning.
-async fn finalize_recovery(mut writer: RecoveryCheckpointWriter, preserve: bool) -> Option<String> {
+async fn finalize_recovery(
+    mut writer: RecoveryCheckpointWriter,
+    preserve: bool,
+    ownership: Option<Arc<dyn Send + Sync>>,
+) -> Option<String> {
     let result = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
         if preserve {
             writer.preserve()
         } else {
@@ -484,6 +489,7 @@ pub(crate) async fn execute_session_turn<O, C>(
     prepared: PreparedSessionTurn,
     observer: O,
     phase_four_side_call_token_budget: i64,
+    blocking_ownership: Option<Arc<dyn Send + Sync>>,
     cancelled: C,
 ) -> Result<SessionTurnOutput<O>>
 where
@@ -515,7 +521,9 @@ where
 
     let status = match result {
         None => {
-            if let Some(warning) = finalize_recovery(recovery_writer, true).await {
+            if let Some(warning) =
+                finalize_recovery(recovery_writer, true, blocking_ownership.clone()).await
+            {
                 sink.observer.warning(&warning);
             }
             SessionTurnStatus::Cancelled
@@ -528,7 +536,9 @@ where
                         compacted_messages: Some(plan.compacted_messages),
                     };
                     let compression_session = session.clone();
+                    let compression_ownership = blocking_ownership.clone();
                     match tokio::task::spawn_blocking(move || {
+                        let _ownership = compression_ownership;
                         compression_session.append(&checkpoint)
                     })
                     .await
@@ -543,15 +553,21 @@ where
                     }
                 }
             }
-            if let Some(warning) =
-                finalize_recovery(recovery_writer, sink.has_unsaved_messages()).await
+            if let Some(warning) = finalize_recovery(
+                recovery_writer,
+                sink.has_unsaved_messages(),
+                blocking_ownership.clone(),
+            )
+            .await
             {
                 sink.observer.warning(&warning);
             }
             SessionTurnStatus::Completed(turn)
         }
         Some(Err(error)) => {
-            if let Some(warning) = finalize_recovery(recovery_writer, true).await {
+            if let Some(warning) =
+                finalize_recovery(recovery_writer, true, blocking_ownership.clone()).await
+            {
                 sink.observer.warning(&warning);
             }
             return Err(error).context("the agent run failed");
@@ -638,6 +654,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
             wrote_text: AtomicBool::new(false),
         },
         options.settings.phase4_side_call_token_budget,
+        None,
         async {
             let _ = tokio::signal::ctrl_c().await;
         },
@@ -910,6 +927,7 @@ mod tests {
             prepared,
             Arc::clone(&observer),
             -1,
+            None,
             async {},
         )
         .await
