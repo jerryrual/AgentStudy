@@ -13,6 +13,7 @@ use anyhow::{ensure, Result};
 use tokio::sync::watch;
 
 use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
+use crate::tools::ToolRegistry;
 
 use super::approval::{new_policy, ApprovalPolicy};
 use super::history_replay::replay_updates;
@@ -81,6 +82,7 @@ struct RegisteredSession {
     _run_lease: SessionRunLease,
     ready: AtomicBool,
     approval_policy: ApprovalPolicy,
+    tools: Arc<ToolRegistry>,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -121,10 +123,16 @@ impl SessionRegistry {
     }
 
     /// Create and exclusively own a persistent session until this registry drops.
-    pub(crate) fn create(&self, cwd: &str, model: &str, agent: &str) -> Result<SessionId> {
+    pub(crate) fn create(
+        &self,
+        cwd: &str,
+        model: &str,
+        agent: &str,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<SessionId> {
         let session = self.store.create(cwd, model, agent)?;
         let run_lease = self.store.try_acquire_run_lease(session.id())?;
-        self.register(session, run_lease, true)
+        self.register(session, run_lease, true, tools)
             .map(|(session_id, _)| session_id)
     }
 
@@ -184,6 +192,7 @@ impl SessionRegistry {
         session: Session,
         run_lease: SessionRunLease,
         ready: bool,
+        tools: Arc<ToolRegistry>,
     ) -> Result<(SessionId, Arc<RegisteredSession>)> {
         let session_id = SessionId::new(session.id());
         let mut sessions = lock(&self.sessions);
@@ -196,6 +205,7 @@ impl SessionRegistry {
             _run_lease: run_lease,
             ready: AtomicBool::new(ready),
             approval_policy: new_policy(),
+            tools,
             active_prompt: Mutex::new(None),
         });
         sessions.insert(session_id.clone(), Arc::clone(&registered));
@@ -281,7 +291,7 @@ impl PreparedLoad {
             updates: _,
         } = self;
         let (session_id, registered) = registry
-            .register(session, run_lease, false)
+            .register(session, run_lease, false, Arc::new(ToolRegistry::builtin()))
             .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
@@ -340,6 +350,10 @@ impl PromptGuard {
         Arc::clone(&self.registered.approval_policy)
     }
 
+    pub(crate) fn tools(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.registered.tools)
+    }
+
     /// Wait until the matching session receives a cancellation request.
     pub(crate) async fn cancelled(&mut self) {
         let _ = self.cancellation.wait_for(|cancelled| *cancelled).await;
@@ -379,7 +393,14 @@ mod tests {
     fn creates_a_persistent_session_with_the_same_acp_id() {
         let (_directory, store, registry) = registry();
 
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let id = session_id.to_string();
         let loaded = store.load(&id).unwrap();
 
@@ -394,7 +415,14 @@ mod tests {
     #[test]
     fn holds_the_cross_process_run_lease_for_the_registered_lifetime() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let id = session_id.to_string();
 
         let error = store.try_acquire_run_lease(&id).unwrap_err();
@@ -464,15 +492,21 @@ mod tests {
     #[test]
     fn close_refuses_an_active_prompt_then_releases_the_idle_run_lease() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let tools = Arc::new(ToolRegistry::builtin());
+        let session_id = registry
+            .create("/workspace", "model-a", "build", Arc::clone(&tools))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&tools), 2);
         let id = session_id.to_string();
         let guard = registry.begin_prompt(&session_id).unwrap();
 
         assert!(!registry.close(&session_id));
+        assert_eq!(Arc::strong_count(&tools), 2);
         assert!(store.try_acquire_run_lease(&id).is_err());
 
         drop(guard);
         assert!(registry.close(&session_id));
+        assert_eq!(Arc::strong_count(&tools), 1);
         store.try_acquire_run_lease(&id).unwrap();
         assert!(!registry.close(&session_id));
     }
@@ -481,7 +515,14 @@ mod tests {
     fn concurrent_prompt_admission_has_exactly_one_winner() {
         let (_directory, _store, registry) = registry();
         let registry = Arc::new(registry);
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let mut attempts = Vec::new();
         for _ in 0..2 {
@@ -507,7 +548,14 @@ mod tests {
     #[tokio::test]
     async fn cancellation_wakes_the_prompt_but_keeps_the_slot_busy_until_drop() {
         let (_directory, _store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let mut guard = registry.begin_prompt(&session_id).unwrap();
         let (ready_tx, ready_rx) = oneshot::channel();
         let waiter = tokio::spawn(async move {
@@ -540,7 +588,14 @@ mod tests {
     #[test]
     fn detached_prompt_ownership_keeps_run_lease_until_worker_finishes() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let guard = registry.begin_prompt(&session_id).unwrap();
         let ownership = guard.ownership();
 
@@ -566,7 +621,14 @@ mod tests {
         ));
         assert!(!registry.cancel(&unknown));
 
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         assert!(!registry.cancel(&session_id));
         let guard = registry.begin_prompt(&session_id).unwrap();
         drop(guard);

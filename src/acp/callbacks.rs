@@ -103,10 +103,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
         .on_receive_request(
             async move |request: NewSessionRequest, responder, _connection| {
                 let control = Arc::clone(&new_control);
-                let result = tokio::task::spawn_blocking(move || control.new_session(&request))
-                    .await
-                    .map_err(ControlError::internal)
-                    .and_then(|result| result);
+                let result = control.new_session(&request).await;
                 responder.respond_with_result(result.map_err(ProtocolError::from))
             },
             agent_client_protocol::on_receive_request!(),
@@ -150,6 +147,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                     Err(error) => return responder.respond_with_error(error.into()),
                 };
                 let session = guard.session().clone();
+                let tools = guard.tools();
                 let ownership = guard.ownership();
                 let setup_ownership = Arc::clone(&ownership);
                 let cwd = PathBuf::from(session.cwd());
@@ -173,7 +171,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         if let Some(hook) = setup_hook {
                             hook();
                         }
-                        let agent = runtime.agent_for(&cwd, approver);
+                        let agent = runtime.agent_for(&cwd, tools, approver);
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
                     })
@@ -359,7 +357,12 @@ mod tests {
         let load_id = SessionId::new(loaded.id());
 
         let cancel_id = sessions
-            .create(directory.path().to_str().unwrap(), "model-a", "build")
+            .create(
+                directory.path().to_str().unwrap(),
+                "model-a",
+                "build",
+                Arc::new(crate::tools::ToolRegistry::builtin()),
+            )
             .unwrap();
         let mut prompt = sessions.begin_prompt(&cancel_id).unwrap();
         let notifications = Arc::new(Mutex::new(Vec::new()));

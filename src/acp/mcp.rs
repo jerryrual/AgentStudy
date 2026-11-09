@@ -11,14 +11,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::McpServer;
-use anyhow::bail;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::tools::{truncate_output, Tool, ToolContext};
+use crate::tools::{truncate_output, Tool, ToolContext, ToolRegistry};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
@@ -788,6 +788,30 @@ impl std::error::Error for ToolCallError {
             | Self::InvalidResult => None,
         }
     }
+}
+
+pub(crate) async fn start_tool_registry(
+    specs: &[StdioServerSpec],
+) -> anyhow::Result<Arc<ToolRegistry>> {
+    let mut adapters = Vec::new();
+    for (server_index, spec) in specs.iter().enumerate() {
+        let mut process = StdioServerProcess::spawn(spec)
+            .with_context(|| format!("failed to start MCP server {:?}", spec.name))?;
+        let mut client = StdioMcpClient::from_process(&mut process)
+            .with_context(|| format!("failed to connect MCP server {:?}", spec.name))?;
+        client
+            .initialize()
+            .await
+            .with_context(|| format!("failed to initialize MCP server {:?}", spec.name))?;
+        let tools = client
+            .list_tools()
+            .await
+            .with_context(|| format!("failed to discover MCP server {:?}", spec.name))?;
+        adapters.extend(tool_adapters(server_index, process, client, tools));
+    }
+    ToolRegistry::builtin_with(adapters)
+        .map(Arc::new)
+        .context("failed to compose MCP tool registry")
 }
 
 pub(crate) struct McpServerHandle {

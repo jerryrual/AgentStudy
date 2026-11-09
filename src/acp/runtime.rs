@@ -16,7 +16,6 @@ use crate::tools::ToolRegistry;
 /// Immutable dependencies shared by prompt turns on one ACP service.
 pub(crate) struct PromptRuntime {
     client: Arc<ModelClient>,
-    tools: Arc<ToolRegistry>,
     agent_kind: AgentKind,
     max_tool_rounds: usize,
     phase_four_side_call_token_budget: i64,
@@ -33,7 +32,6 @@ impl PromptRuntime {
     ) -> Self {
         Self {
             client,
-            tools: Arc::new(ToolRegistry::builtin()),
             agent_kind,
             max_tool_rounds,
             phase_four_side_call_token_budget,
@@ -42,10 +40,15 @@ impl PromptRuntime {
     }
 
     /// Construct a fresh agent whose project memory and mutable state belong to `cwd`.
-    pub(crate) fn agent_for(&self, cwd: &Path, approver: Arc<dyn Approver>) -> Agent {
+    pub(crate) fn agent_for(
+        &self,
+        cwd: &Path,
+        tools: Arc<ToolRegistry>,
+        approver: Arc<dyn Approver>,
+    ) -> Agent {
         Agent::new(
             Arc::clone(&self.client),
-            Arc::clone(&self.tools),
+            tools,
             approver,
             Arc::new(NoAsker),
             AgentOptions {
@@ -93,8 +96,16 @@ mod tests {
             2048,
         );
 
-        let first_agent = runtime.agent_for(first.path(), Arc::new(DenyAll));
-        let second_agent = runtime.agent_for(second.path(), Arc::new(DenyAll));
+        let first_agent = runtime.agent_for(
+            first.path(),
+            Arc::new(ToolRegistry::builtin()),
+            Arc::new(DenyAll),
+        );
+        let second_agent = runtime.agent_for(
+            second.path(),
+            Arc::new(ToolRegistry::builtin()),
+            Arc::new(DenyAll),
+        );
 
         assert_eq!(first_agent.kind(), AgentKind::Code);
         assert_eq!(first_agent.model(), "mock-model");
