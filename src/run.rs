@@ -460,7 +460,8 @@ pub(crate) struct SessionTurnOutput<O> {
     pub(crate) has_unsaved_messages: bool,
 }
 
-async fn finalize_recovery(mut writer: RecoveryCheckpointWriter, preserve: bool) {
+/// Finalize one recovery checkpoint on a blocking worker, returning any warning.
+async fn finalize_recovery(mut writer: RecoveryCheckpointWriter, preserve: bool) -> Option<String> {
     let result = tokio::task::spawn_blocking(move || {
         if preserve {
             writer.preserve()
@@ -470,13 +471,9 @@ async fn finalize_recovery(mut writer: RecoveryCheckpointWriter, preserve: bool)
     })
     .await;
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            eprintln!("warning: failed to finalize recovery checkpoint: {error:#}");
-        }
-        Err(error) => {
-            eprintln!("warning: recovery checkpoint task failed: {error}");
-        }
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("failed to finalize recovery checkpoint: {error:#}")),
+        Err(error) => Some(format!("recovery checkpoint task failed: {error}")),
     }
 }
 
@@ -518,7 +515,9 @@ where
 
     let status = match result {
         None => {
-            finalize_recovery(recovery_writer, true).await;
+            if let Some(warning) = finalize_recovery(recovery_writer, true).await {
+                sink.observer.warning(&warning);
+            }
             SessionTurnStatus::Cancelled
         }
         Some(Ok(turn)) => {
@@ -535,20 +534,26 @@ where
                     .await
                     {
                         Ok(Ok(())) => sink.reset_buffer(),
-                        Ok(Err(error)) => {
-                            eprintln!("warning: failed to save automatic compaction: {error:#}");
-                        }
-                        Err(error) => {
-                            eprintln!("warning: automatic compaction task failed: {error}");
-                        }
+                        Ok(Err(error)) => sink
+                            .observer
+                            .warning(&format!("failed to save automatic compaction: {error:#}")),
+                        Err(error) => sink
+                            .observer
+                            .warning(&format!("automatic compaction task failed: {error}")),
                     }
                 }
             }
-            finalize_recovery(recovery_writer, sink.has_unsaved_messages()).await;
+            if let Some(warning) =
+                finalize_recovery(recovery_writer, sink.has_unsaved_messages()).await
+            {
+                sink.observer.warning(&warning);
+            }
             SessionTurnStatus::Completed(turn)
         }
         Some(Err(error)) => {
-            finalize_recovery(recovery_writer, true).await;
+            if let Some(warning) = finalize_recovery(recovery_writer, true).await {
+                sink.observer.warning(&warning);
+            }
             return Err(error).context("the agent run failed");
         }
     };
