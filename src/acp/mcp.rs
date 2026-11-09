@@ -6,8 +6,11 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use agent_client_protocol::v1::schema::McpServer;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
@@ -91,9 +94,69 @@ pub(crate) fn stdio_specs(servers: &[McpServer]) -> Result<Vec<StdioServerSpec>,
         .collect()
 }
 
+pub(crate) struct StdioServerProcess {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+}
+
+impl StdioServerProcess {
+    pub(crate) fn spawn(spec: &StdioServerSpec) -> std::io::Result<Self> {
+        let mut command = Command::new(&spec.command);
+        command
+            .args(&spec.args)
+            .envs(spec.env.iter().cloned())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("MCP child stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("MCP child stdout was not piped"))?;
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+        })
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.stdin.take()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.stdout.take()
+    }
+
+    pub(crate) async fn shutdown(mut self, grace: Duration) -> std::io::Result<ExitStatus> {
+        drop(self.stdin.take());
+        match tokio::time::timeout(grace, self.child.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                self.child.kill().await?;
+                self.child.wait().await
+            }
+        }
+    }
+}
+
+impl Drop for StdioServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
+    #[cfg(unix)]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -166,5 +229,50 @@ mod tests {
             )]),
             Err(SpecError::TooManyArguments)
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_inherits_parent_environment_and_overrides_declared_values() {
+        let inherited_path = std::env::var("PATH").expect("test process has PATH");
+        let spec = StdioServerSpec {
+            name: "env".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "printf '%s|%s' \"$PATH\" \"$ACP_MCP_EXPLICIT\"".into(),
+            ],
+            env: vec![("ACP_MCP_EXPLICIT".into(), "declared".into())],
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut stdout = process.take_stdout().unwrap();
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).await.unwrap();
+        let status = process.shutdown(Duration::from_secs(1)).await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(output, format!("{inherited_path}|declared"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_exposes_pipes_and_shutdown_closes_stdin() {
+        let spec = StdioServerSpec {
+            name: "echo".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "cat".into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut stdin = process.take_stdin().unwrap();
+        let mut stdout = process.take_stdout().unwrap();
+        stdin.write_all(b"ping").await.unwrap();
+        drop(stdin);
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).await.unwrap();
+        let status = process.shutdown(Duration::from_secs(1)).await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(output, b"ping");
     }
 }
