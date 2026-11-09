@@ -110,6 +110,14 @@ pub fn truncate_output(text: &str) -> String {
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
+    /// Model-visible name; dynamic adapters may override this without leaking strings.
+    fn model_name(&self) -> &str {
+        self.name()
+    }
+    /// Model-visible description; dynamic adapters may override this.
+    fn model_description(&self) -> &str {
+        self.description()
+    }
     fn parameters(&self) -> Value;
     /// Whether invoking this tool can change the workspace.
     fn mutates(&self) -> bool {
@@ -184,22 +192,26 @@ impl ToolRegistry {
             Box::new(misc::TodoWrite),
             Box::new(misc::AskUser),
         ];
-        let index = tools
-            .iter()
-            .enumerate()
-            .map(|(index, tool)| (tool.name().to_string(), index))
-            .collect();
-        Self { tools, index }
+        Self::try_with_tools(tools).expect("built-in tool names are unique")
+    }
+
+    pub(crate) fn try_with_tools(tools: Vec<Box<dyn Tool>>) -> Result<Self> {
+        let mut index = HashMap::with_capacity(tools.len());
+        for (position, tool) in tools.iter().enumerate() {
+            let name = tool.model_name();
+            if name.is_empty() {
+                return Err(anyhow!("tool name must not be empty"));
+            }
+            if index.insert(name.to_string(), position).is_some() {
+                return Err(anyhow!("duplicate tool name {name:?}"));
+            }
+        }
+        Ok(Self { tools, index })
     }
 
     #[cfg(test)]
     pub(crate) fn with_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        let index = tools
-            .iter()
-            .enumerate()
-            .map(|(index, tool)| (tool.name().to_string(), index))
-            .collect();
-        Self { tools, index }
+        Self::try_with_tools(tools).expect("test tool names are unique")
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
@@ -213,8 +225,8 @@ impl ToolRegistry {
         self.tools
             .iter()
             .map(|tool| ToolDef {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
+                name: tool.model_name().to_string(),
+                description: tool.model_description().to_string(),
                 parameters: tool.parameters(),
             })
             .collect()
@@ -222,6 +234,10 @@ impl ToolRegistry {
 
     pub fn names(&self) -> Vec<&'static str> {
         self.tools.iter().map(|tool| tool.name()).collect()
+    }
+
+    pub fn model_names(&self) -> Vec<&str> {
+        self.tools.iter().map(|tool| tool.model_name()).collect()
     }
 }
 
@@ -277,6 +293,61 @@ mod tests {
                 "{sequential} must remain a sequential barrier"
             );
         }
+    }
+
+    struct DynamicTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for DynamicTool {
+        fn name(&self) -> &'static str {
+            "dynamic_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "dynamic fallback"
+        }
+
+        fn model_name(&self) -> &str {
+            &self.name
+        }
+
+        fn model_description(&self) -> &str {
+            "dynamic description"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn summarize(&self, _raw_arguments: &str) -> String {
+            self.name.clone()
+        }
+
+        async fn run(&self, _arguments: &Value, _context: &ToolContext) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn registry_indexes_dynamic_names_and_rejects_collisions() {
+        let registry = ToolRegistry::try_with_tools(vec![Box::new(DynamicTool {
+            name: "remote".into(),
+        })])
+        .unwrap();
+        assert!(registry.get("remote").is_some());
+        assert_eq!(registry.model_names(), vec!["remote"]);
+        assert_eq!(registry.specs()[0].description, "dynamic description");
+        assert!(ToolRegistry::try_with_tools(vec![
+            Box::new(DynamicTool {
+                name: "same".into(),
+            }),
+            Box::new(DynamicTool {
+                name: "same".into(),
+            }),
+        ])
+        .is_err());
     }
 
     #[test]
