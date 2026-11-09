@@ -104,6 +104,11 @@ pub(crate) struct PromptGuard {
     cancellation: watch::Receiver<bool>,
 }
 
+/// Keeps a registered session and its run lease alive without owning its prompt slot.
+pub(crate) struct SessionOwnership {
+    _registered: Arc<RegisteredSession>,
+}
+
 impl SessionRegistry {
     /// Create an empty in-process registry over the persistent session store.
     pub(crate) fn new(store: SessionStore) -> Self {
@@ -321,6 +326,13 @@ impl PromptGuard {
         &self.registered.session
     }
 
+    /// Clone ownership that keeps the session run lease alive for blocking work.
+    pub(crate) fn ownership(&self) -> Arc<dyn Send + Sync> {
+        Arc::new(SessionOwnership {
+            _registered: Arc::clone(&self.registered),
+        })
+    }
+
     /// Wait until the matching session receives a cancellation request.
     pub(crate) async fn cancelled(&mut self) {
         let _ = self.cancellation.wait_for(|cancelled| *cancelled).await;
@@ -516,6 +528,25 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), next.cancelled())
             .await
             .expect("new prompt cancellation signal was not delivered");
+    }
+
+    #[test]
+    fn detached_prompt_ownership_keeps_run_lease_until_worker_finishes() {
+        let (_directory, store, registry) = registry();
+        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let guard = registry.begin_prompt(&session_id).unwrap();
+        let ownership = guard.ownership();
+
+        drop(guard);
+        drop(registry);
+        assert!(store
+            .try_acquire_run_lease(&session_id.to_string())
+            .is_err());
+
+        drop(ownership);
+        store
+            .try_acquire_run_lease(&session_id.to_string())
+            .unwrap();
     }
 
     #[test]

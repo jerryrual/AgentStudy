@@ -97,6 +97,8 @@ pub(crate) fn callback_bundle(
                     Err(error) => return responder.respond_with_error(error.into()),
                 };
                 let session = guard.session().clone();
+                let ownership = guard.ownership();
+                let setup_ownership = Arc::clone(&ownership);
                 let cwd = PathBuf::from(session.cwd());
                 let runtime = Arc::clone(&prompt_runtime);
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
@@ -106,6 +108,7 @@ pub(crate) fn callback_bundle(
 
                 connection.spawn(async move {
                     let setup = tokio::task::spawn_blocking(move || {
+                        let _ownership = setup_ownership;
                         let agent = runtime.agent_for(&cwd);
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
@@ -131,6 +134,7 @@ pub(crate) fn callback_bundle(
                             prepared,
                             observer,
                             phase_four_budget,
+                            Some(ownership),
                             async {
                                 tokio::select! {
                                     _ = guard.cancelled() => {}

@@ -72,6 +72,8 @@ pub enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Serve the Agent Client Protocol over stdin/stdout.
+    Acp,
     /// List the configured model profiles.
     Models,
 }
@@ -144,6 +146,13 @@ pub fn execute(cli: Cli) -> Result<()> {
                 store,
             }))
         }
+        Some(Command::Acp) => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to start the async runtime")?;
+            runtime.block_on(crate::acp::serve_stdio(settings, profile, agent, store))
+        }
         Some(Command::Models) => run::list_models(&settings),
         Some(Command::Run {
             task,
@@ -208,4 +217,15 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<PathBuf> {
         bail!("{} is not a directory", cwd.display());
     }
     Ok(cwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_acp_stdio_subcommand() {
+        let cli = Cli::try_parse_from(["icode", "acp"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Acp)));
+    }
 }
