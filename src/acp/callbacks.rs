@@ -147,6 +147,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let approver = Arc::new(AcpApprover::new(
                     request.session_id.clone(),
                     connection.clone(),
+                    guard.approval_policy(),
                 ));
                 let session_id = request.session_id;
                 let task_connection = connection.clone();
@@ -278,8 +279,9 @@ mod tests {
 
         let dropped = Arc::new(AtomicBool::new(false));
         let execution_dropped = Arc::clone(&dropped);
+        let signal = DropSignal(execution_dropped);
         let execution = async move {
-            let _signal = DropSignal(execution_dropped);
+            let _signal = signal;
             std::future::pending::<anyhow::Result<SessionTurnStatus>>().await
         };
         let dispatch = async { Err(ProtocolError::internal_error()) };
