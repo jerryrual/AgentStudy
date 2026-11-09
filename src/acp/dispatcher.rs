@@ -16,11 +16,12 @@ use super::event_mapping::session_update;
 /// The first synchronous send error stops admission of later updates.
 async fn dispatch_with<E>(
     session_id: SessionId,
+    context_window: Option<u32>,
     mut events: UnboundedReceiver<TurnEvent>,
     mut send: impl FnMut(SessionNotification) -> Result<(), E>,
 ) -> Result<(), E> {
     while let Some(event) = events.recv().await {
-        if let Some(update) = session_update(event) {
+        if let Some(update) = session_update(event, context_window) {
             send(SessionNotification::new(session_id.clone(), update))?;
         }
     }
@@ -33,10 +34,11 @@ async fn dispatch_with<E>(
 #[allow(dead_code, reason = "consumed by the upcoming ACP prompt handler")]
 pub(crate) async fn dispatch_to_client(
     session_id: SessionId,
+    context_window: Option<u32>,
     events: UnboundedReceiver<TurnEvent>,
     connection: ConnectionTo<Client>,
 ) -> AcpResult<()> {
-    dispatch_with(session_id, events, |notification| {
+    dispatch_with(session_id, context_window, events, |notification| {
         connection.send_notification(notification)
     })
     .await
@@ -71,14 +73,19 @@ mod tests {
         drop(observer);
 
         let mut notifications = Vec::new();
-        dispatch_with(SessionId::new("session-7"), receiver, |notification| {
-            notifications.push(notification);
-            Ok::<_, ()>(())
-        })
+        dispatch_with(
+            SessionId::new("session-7"),
+            Some(128_000),
+            receiver,
+            |notification| {
+                notifications.push(notification);
+                Ok::<_, ()>(())
+            },
+        )
         .await
         .unwrap();
 
-        assert_eq!(notifications.len(), 3);
+        assert_eq!(notifications.len(), 4);
         let encoded: Vec<_> = notifications
             .into_iter()
             .map(|notification| serde_json::to_value(notification).unwrap())
@@ -87,10 +94,13 @@ mod tests {
             .iter()
             .all(|value| value["sessionId"] == "session-7"));
         assert_eq!(encoded[0]["update"]["sessionUpdate"], "agent_message_chunk");
-        assert_eq!(encoded[1]["update"]["sessionUpdate"], "tool_call");
-        assert_eq!(encoded[1]["update"]["toolCallId"], "call-4");
-        assert_eq!(encoded[2]["update"]["sessionUpdate"], "tool_call_update");
+        assert_eq!(encoded[1]["update"]["sessionUpdate"], "usage_update");
+        assert_eq!(encoded[1]["update"]["used"], 0);
+        assert_eq!(encoded[1]["update"]["size"], 128_000);
+        assert_eq!(encoded[2]["update"]["sessionUpdate"], "tool_call");
         assert_eq!(encoded[2]["update"]["toolCallId"], "call-4");
+        assert_eq!(encoded[3]["update"]["sessionUpdate"], "tool_call_update");
+        assert_eq!(encoded[3]["update"]["toolCallId"], "call-4");
     }
 
     #[tokio::test]
@@ -103,7 +113,7 @@ mod tests {
         drop(observer);
         let mut attempts = 0;
 
-        dispatch_with(SessionId::new("session-8"), receiver, |_| {
+        dispatch_with(SessionId::new("session-8"), None, receiver, |_| {
             attempts += 1;
             Ok::<_, ()>(())
         })
@@ -122,7 +132,7 @@ mod tests {
         drop(observer);
         let mut attempts = 0;
 
-        let result = dispatch_with(SessionId::new("session-9"), receiver, |_| {
+        let result = dispatch_with(SessionId::new("session-9"), None, receiver, |_| {
             attempts += 1;
             if attempts == 2 {
                 Err("closed")
@@ -144,7 +154,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            dispatch_with(SessionId::new("session-empty"), receiver, |_| {
+            dispatch_with(SessionId::new("session-empty"), None, receiver, |_| {
                 sent = true;
                 Ok::<_, ()>(())
             }),

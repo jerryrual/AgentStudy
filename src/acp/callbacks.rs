@@ -143,6 +143,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let runtime = Arc::clone(&prompt_runtime);
                 let setup_hook = prompt_setup_hook.clone();
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
+                let context_window = runtime.context_window();
                 let request_cancellation = responder.cancellation();
                 let approver = Arc::new(AcpApprover::new(
                     request.session_id.clone(),
@@ -201,8 +202,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         );
                         Ok::<_, anyhow::Error>(status)
                     };
-                    let dispatch =
-                        dispatcher::dispatch_to_client(session_id, events, task_connection);
+                    let dispatch = dispatcher::dispatch_to_client(
+                        session_id,
+                        context_window,
+                        events,
+                        task_connection,
+                    );
                     let status = match await_execution_and_dispatch(execution, dispatch).await {
                         Ok(status) => status,
                         Err(PromptTaskError::Dispatch(error)) => {

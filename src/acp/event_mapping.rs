@@ -2,7 +2,7 @@
 
 use agent_client_protocol::v1::schema::{
     ContentChunk, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use serde_json::Value;
 
@@ -17,7 +17,10 @@ use crate::run::turn_events::TurnEvent;
     not(test),
     allow(dead_code, reason = "consumed by the upcoming ACP dispatcher")
 )]
-pub(crate) fn session_update(event: TurnEvent) -> Option<SessionUpdate> {
+pub(crate) fn session_update(
+    event: TurnEvent,
+    context_window: Option<u32>,
+) -> Option<SessionUpdate> {
     match event {
         TurnEvent::TextDelta(text) => Some(SessionUpdate::AgentMessageChunk(text_chunk(text))),
         TurnEvent::ReasoningDelta(text) => Some(SessionUpdate::AgentThoughtChunk(text_chunk(text))),
@@ -25,9 +28,10 @@ pub(crate) fn session_update(event: TurnEvent) -> Option<SessionUpdate> {
         TurnEvent::ToolFinished {
             call, ok, output, ..
         } => Some(tool_finished(call.id, ok, output)),
-        TurnEvent::Usage(_) | TurnEvent::Info(_) | TurnEvent::Error(_) | TurnEvent::Warning(_) => {
-            None
-        }
+        TurnEvent::Usage(usage) => context_window.map(|size| {
+            SessionUpdate::UsageUpdate(UsageUpdate::new(usage.prompt_tokens, u64::from(size)))
+        }),
+        TurnEvent::Info(_) | TurnEvent::Error(_) | TurnEvent::Warning(_) => None,
     }
 }
 
@@ -87,6 +91,10 @@ mod tests {
     use super::*;
     use crate::model::{ToolCall as ModelToolCall, Usage};
 
+    fn update(event: TurnEvent) -> Option<SessionUpdate> {
+        session_update(event, None)
+    }
+
     fn call(id: &str, name: &str, arguments: &str) -> ModelToolCall {
         ModelToolCall {
             id: id.to_string(),
@@ -97,8 +105,8 @@ mod tests {
 
     #[test]
     fn maps_text_and_reasoning_to_distinct_chunk_updates() {
-        let text = session_update(TurnEvent::TextDelta("answer".to_string())).unwrap();
-        let thought = session_update(TurnEvent::ReasoningDelta("thought".to_string())).unwrap();
+        let text = update(TurnEvent::TextDelta("answer".to_string())).unwrap();
+        let thought = update(TurnEvent::ReasoningDelta("thought".to_string())).unwrap();
 
         assert_eq!(
             serde_json::to_value(text).unwrap(),
@@ -121,17 +129,17 @@ mod tests {
         let first = call("call-1", "read_file", r#"{"path":"src/lib.rs"}"#);
         let second = call("call-2", "read_file", "not-json");
 
-        let first_start = session_update(TurnEvent::ToolStarted {
+        let first_start = update(TurnEvent::ToolStarted {
             call: first.clone(),
             summary: "src/lib.rs".to_string(),
         })
         .unwrap();
-        let second_start = session_update(TurnEvent::ToolStarted {
+        let second_start = update(TurnEvent::ToolStarted {
             call: second.clone(),
             summary: String::new(),
         })
         .unwrap();
-        let first_finish = session_update(TurnEvent::ToolFinished {
+        let first_finish = update(TurnEvent::ToolFinished {
             call: first,
             ok: true,
             duration: Duration::from_millis(4),
@@ -139,7 +147,7 @@ mod tests {
             output: "contents".to_string(),
         })
         .unwrap();
-        let second_finish = session_update(TurnEvent::ToolFinished {
+        let second_finish = update(TurnEvent::ToolFinished {
             call: second,
             ok: false,
             duration: Duration::from_millis(2),
@@ -168,16 +176,25 @@ mod tests {
     }
 
     #[test]
-    fn omits_events_without_an_honest_context_free_acp_mapping() {
+    fn maps_usage_only_with_a_known_context_window_and_omits_notices() {
         let usage = Usage {
             prompt_tokens: 3,
             completion_tokens: 2,
             total_tokens: 5,
         };
 
-        assert!(session_update(TurnEvent::Usage(usage)).is_none());
-        assert!(session_update(TurnEvent::Info("working".to_string())).is_none());
-        assert!(session_update(TurnEvent::Error("failed".to_string())).is_none());
-        assert!(session_update(TurnEvent::Warning("retry".to_string())).is_none());
+        assert_eq!(
+            serde_json::to_value(session_update(TurnEvent::Usage(usage), Some(128_000)).unwrap())
+                .unwrap(),
+            serde_json::json!({
+                "sessionUpdate": "usage_update",
+                "used": 3,
+                "size": 128_000
+            })
+        );
+        assert!(update(TurnEvent::Usage(usage)).is_none());
+        assert!(update(TurnEvent::Info("working".to_string())).is_none());
+        assert!(update(TurnEvent::Error("failed".to_string())).is_none());
+        assert!(update(TurnEvent::Warning("retry".to_string())).is_none());
     }
 }

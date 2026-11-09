@@ -130,6 +130,10 @@ impl ModelClient {
         &self.endpoint
     }
 
+    pub(crate) fn context_window(&self) -> Option<u32> {
+        self.context_window
+    }
+
     /// Whether one completed model call crossed the persisted-fold threshold.
     pub(crate) fn should_force_compression(&self, usage: Usage) -> bool {
         if usage.prompt_tokens == 0 {

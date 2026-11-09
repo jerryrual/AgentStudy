@@ -57,6 +57,10 @@ impl PromptRuntime {
         )
     }
 
+    pub(crate) fn context_window(&self) -> Option<u32> {
+        self.client.context_window()
+    }
+
     /// Return the durable Phase 4 side-call budget used by each prompt sink.
     pub(crate) fn phase_four_side_call_token_budget(&self) -> i64 {
         self.phase_four_side_call_token_budget
