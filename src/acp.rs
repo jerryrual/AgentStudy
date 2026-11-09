@@ -101,7 +101,12 @@ mod tests {
             Ok::<(), ProtocolError>(())
         });
 
-        let (server_result, client_result) = tokio::join!(server, client);
+        let (server_result, client_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(server, client)
+            })
+            .await
+            .expect("ACP clean EOF test timed out");
         server_result.unwrap();
         client_result.unwrap();
 
