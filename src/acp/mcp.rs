@@ -399,7 +399,10 @@ impl StdioMcpClient {
                 }),
             )
             .await
-            .map_err(InitializeError::Request)?;
+            .map_err(|error| {
+                self.usable = false;
+                InitializeError::Request(error)
+            })?;
         let initialization = match ServerInitialization::from_result(&result) {
             Ok(initialization) => initialization,
             Err(error) => {
@@ -893,6 +896,34 @@ mod tests {
         assert!(matches!(
             client.initialize().await,
             Err(InitializeError::UnsupportedVersion(version)) if version == "2099-01-01"
+        ));
+        assert!(matches!(
+            client.request("again", serde_json::json!({})).await,
+            Err(RequestError::Unusable)
+        ));
+        drop(client);
+        process.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_client_remote_initialize_error_becomes_unusable() {
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"error\":{\"code\":-1,\"message\":\"denied\"}}'"
+        );
+        let spec = StdioServerSpec {
+            name: "remote-initialize-error".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            env: Vec::new(),
+        };
+        let mut process = StdioServerProcess::spawn(&spec).unwrap();
+        let mut client = StdioMcpClient::from_process(&mut process).unwrap();
+
+        assert!(matches!(
+            client.initialize().await,
+            Err(InitializeError::Request(RequestError::Remote(_)))
         ));
         assert!(matches!(
             client.request("again", serde_json::json!({})).await,
