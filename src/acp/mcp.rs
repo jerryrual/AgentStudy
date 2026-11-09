@@ -375,10 +375,15 @@ impl StdioMcpClient {
         if object.get("id") != Some(&Value::from(id)) {
             return Err(RequestError::MismatchedId);
         }
-        self.usable = true;
         match (object.get("result"), object.get("error")) {
-            (Some(result), None) => Ok(result.clone()),
-            (None, Some(error)) => Err(RequestError::Remote(error.clone())),
+            (Some(result), None) => {
+                self.usable = true;
+                Ok(result.clone())
+            }
+            (None, Some(error)) => {
+                self.usable = true;
+                Err(RequestError::Remote(error.clone()))
+            }
             _ => Err(RequestError::InvalidResponse),
         }
     }
@@ -1162,6 +1167,10 @@ mod tests {
                 r#"{"jsonrpc":"2.0","method":"notice","params":{}}"#,
                 "unexpected",
             ),
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1}}"#,
+                "invalid",
+            ),
         ];
         for (response, expected) in cases {
             let script = format!("read request; printf '%s\\n' '{response}'");
@@ -1180,6 +1189,7 @@ mod tests {
             match expected {
                 "mismatched" => assert!(matches!(error, RequestError::MismatchedId)),
                 "unexpected" => assert!(matches!(error, RequestError::UnexpectedMessage)),
+                "invalid" => assert!(matches!(error, RequestError::InvalidResponse)),
                 _ => unreachable!(),
             }
             assert!(matches!(
