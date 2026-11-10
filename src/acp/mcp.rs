@@ -791,6 +791,17 @@ impl std::error::Error for ToolCallError {
     }
 }
 
+async fn bounded_blocking<T, F>(timeout: Duration, operation: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
+        .await
+        .context("blocking operation timed out")?
+        .context("blocking operation task failed")
+}
+
 pub(crate) async fn start_tool_registry(
     specs: &[StdioServerSpec],
 ) -> anyhow::Result<Arc<ToolRegistry>> {
@@ -803,11 +814,18 @@ async fn start_tool_registry_with_timeout(
 ) -> anyhow::Result<Arc<ToolRegistry>> {
     let mut adapters = Vec::new();
     for (server_index, spec) in specs.iter().enumerate() {
-        let mut process = StdioServerProcess::spawn(spec)
-            .with_context(|| format!("failed to start MCP server {:?}", spec.name))?;
+        let started = tokio::time::Instant::now();
+        let owned_spec = spec.clone();
+        let mut process = bounded_blocking(startup_timeout, move || {
+            StdioServerProcess::spawn(&owned_spec)
+        })
+        .await
+        .with_context(|| format!("MCP server {:?} process spawn timed out", spec.name))?
+        .with_context(|| format!("failed to start MCP server {:?}", spec.name))?;
+        let remaining = startup_timeout.saturating_sub(started.elapsed());
         let mut client = StdioMcpClient::from_process(&mut process)
             .with_context(|| format!("failed to connect MCP server {:?}", spec.name))?;
-        let tools = tokio::time::timeout(startup_timeout, async {
+        let tools = tokio::time::timeout(remaining, async {
             client
                 .initialize()
                 .await
@@ -958,6 +976,8 @@ fn render_tool_result(result: ToolCallResult) -> serde_json::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
 
     use crate::interaction::NoAsker;
@@ -1636,6 +1656,32 @@ mod tests {
                 "_meta": {"source": "fixture"}
             })
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_operation_drops_its_late_output() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let late_drop = Arc::clone(&dropped);
+        assert!(bounded_blocking(Duration::from_millis(10), move || {
+            std::thread::sleep(Duration::from_millis(50));
+            DropProbe(late_drop)
+        })
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late blocking output must be dropped");
     }
 
     #[cfg(unix)]
