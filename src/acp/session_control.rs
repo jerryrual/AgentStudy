@@ -73,7 +73,7 @@ impl SessionControl {
         .map_err(ControlError::internal)??;
         let specs = mcp::stdio_specs(&request.mcp_servers)
             .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
-        let tools = mcp::start_tool_registry(&specs)
+        let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
             .await
             .map_err(ControlError::internal)?;
         let sessions = Arc::clone(&self.sessions);
@@ -581,6 +581,7 @@ mod tests {
     async fn new_session_starts_mcp_tools_before_persisting() {
         let (directory, store, control) = control();
         let script = concat!(
+            "pwd > mcp-cwd.txt; ",
             "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
             "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
             "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
@@ -596,6 +597,12 @@ mod tests {
         let guard = control.begin_prompt(&response.session_id).unwrap();
         assert!(guard.tools().get("read_file").is_some());
         assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("mcp-cwd.txt"))
+                .unwrap()
+                .trim(),
+            directory.path().to_str().unwrap()
+        );
         assert!(store.load(&response.session_id.to_string()).is_ok());
     }
 

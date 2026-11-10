@@ -5,7 +5,7 @@
 )]
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,10 +116,20 @@ pub(crate) struct StdioServerProcess {
 
 impl StdioServerProcess {
     pub(crate) fn spawn(spec: &StdioServerSpec) -> std::io::Result<Self> {
+        Self::spawn_with_cwd(spec, None)
+    }
+
+    fn spawn_in(spec: &StdioServerSpec, cwd: &Path) -> std::io::Result<Self> {
+        Self::spawn_with_cwd(spec, Some(cwd))
+    }
+
+    fn spawn_with_cwd(spec: &StdioServerSpec, cwd: Option<&Path>) -> std::io::Result<Self> {
         let mut command = Command::new(&spec.command);
+        command.args(&spec.args).envs(spec.env.iter().cloned());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command
-            .args(&spec.args)
-            .envs(spec.env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -804,20 +814,23 @@ where
 
 pub(crate) async fn start_tool_registry(
     specs: &[StdioServerSpec],
+    cwd: &Path,
 ) -> anyhow::Result<Arc<ToolRegistry>> {
-    start_tool_registry_with_timeout(specs, STARTUP_TIMEOUT).await
+    start_tool_registry_with_timeout(specs, cwd, STARTUP_TIMEOUT).await
 }
 
 async fn start_tool_registry_with_timeout(
     specs: &[StdioServerSpec],
+    cwd: &Path,
     startup_timeout: Duration,
 ) -> anyhow::Result<Arc<ToolRegistry>> {
     let mut adapters = Vec::new();
     for (server_index, spec) in specs.iter().enumerate() {
         let started = tokio::time::Instant::now();
         let owned_spec = spec.clone();
+        let owned_cwd = cwd.to_path_buf();
         let mut process = bounded_blocking(startup_timeout, move || {
-            StdioServerProcess::spawn(&owned_spec)
+            StdioServerProcess::spawn_in(&owned_spec, &owned_cwd)
         })
         .await
         .with_context(|| format!("MCP server {:?} process spawn timed out", spec.name))?
@@ -1694,10 +1707,11 @@ mod tests {
             env: Vec::new(),
         }];
 
-        let error = start_tool_registry_with_timeout(&specs, Duration::from_millis(25))
-            .await
-            .err()
-            .expect("silent MCP server must time out");
+        let error =
+            start_tool_registry_with_timeout(&specs, Path::new("/"), Duration::from_millis(25))
+                .await
+                .err()
+                .expect("silent MCP server must time out");
         assert!(error.to_string().contains("silent"));
         assert!(error.to_string().contains("timed out"));
     }
