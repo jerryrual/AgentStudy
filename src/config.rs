@@ -90,6 +90,9 @@ pub struct ModelProfile {
     /// Which wire API to speak to the provider.
     #[serde(default)]
     pub api_style: ApiStyle,
+    /// Enable provider-hosted web search for ordinary Responses requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub responses_web_search: bool,
     /// Provider model identifier, e.g. `deepseek-chat`.
     pub model: String,
     /// Base URL; empty means the provider default.
@@ -123,6 +126,10 @@ fn default_stream() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_last_words_max_output_tokens() -> u32 {
     DEFAULT_LAST_WORDS_MAX_OUTPUT_TOKENS
 }
@@ -138,6 +145,7 @@ impl ModelProfile {
             name: DEFAULT_PROFILE.to_string(),
             provider: "deepseek".to_string(),
             api_style: ApiStyle::Chat,
+            responses_web_search: false,
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "{{DEEPSEEK_API_KEY}}".to_string(),
@@ -327,6 +335,12 @@ impl Settings {
             }
             if profile.model.trim().is_empty() {
                 bail!("model profile {:?} has an empty model id", profile.name);
+            }
+            if profile.responses_web_search && profile.api_style != ApiStyle::Responses {
+                bail!(
+                    "model profile {:?} enables Responses web search with a non-Responses API style",
+                    profile.name
+                );
             }
             if !(MIN_LAST_WORDS_MAX_OUTPUT_TOKENS..=MAX_LAST_WORDS_MAX_OUTPUT_TOKENS)
                 .contains(&profile.last_words_max_output_tokens)
@@ -647,6 +661,36 @@ mod tests {
 
         let json = serde_json::to_value(profile).unwrap();
         assert_eq!(json.get("context_window"), None);
+    }
+
+    #[test]
+    fn responses_web_search_is_opt_in_and_responses_only() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert!(!profile.responses_web_search);
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("responses_web_search"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].responses_web_search = true;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("Responses web search with a non-Responses API style"));
+
+        settings.models[0].api_style = ApiStyle::Responses;
+        settings.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["models"][0]["responses_web_search"],
+            true
+        );
     }
 
     #[test]
