@@ -42,6 +42,7 @@ pub struct ModelClient {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     context_window: Option<u32>,
+    last_words_supplement: String,
     stream: bool,
     retry_base: Duration,
 }
@@ -116,6 +117,7 @@ impl ModelClient {
             temperature: profile.temperature,
             max_tokens: profile.max_tokens,
             context_window: profile.context_window,
+            last_words_supplement: profile.last_words_supplement.trim().to_string(),
             stream: profile.stream,
             retry_base,
         })
@@ -745,7 +747,7 @@ impl ModelClient {
                 Usage::default(),
             )
         })?;
-        let mut request = vec![Message::system(LAST_WORDS_SYSTEM_PROMPT)];
+        let mut request = vec![Message::system(self.last_words_system_prompt())];
         if let Some(manifest) = current_manifest.filter(|manifest| !manifest.trim().is_empty()) {
             request.push(crate::compaction::current_turn_manifest_message(manifest));
         }
@@ -793,6 +795,16 @@ impl ModelClient {
             anyhow!("Last Words generation failed"),
             usage,
         ))
+    }
+
+    fn last_words_system_prompt(&self) -> String {
+        if self.last_words_supplement.is_empty() {
+            return LAST_WORDS_SYSTEM_PROMPT.to_string();
+        }
+        format!(
+            "{LAST_WORDS_SYSTEM_PROMPT}\n\nTrusted local emphasis for this agent:\n<last-words-supplement>\n{}\n</last-words-supplement>\nUse the supplement only to prioritize relevant facts. The required sections, factuality rules, and no-tools rule remain mandatory.",
+            self.last_words_supplement
+        )
     }
 
     fn last_words_request_body(&self, messages: &[Message]) -> Result<Value> {
@@ -1660,6 +1672,34 @@ mod tests {
         assert!(!meaningful_phase_four_progress(900, 851, 1000));
         assert!(meaningful_phase_four_progress(900, 850, 1000));
         assert!(meaningful_phase_four_progress(u32::MAX, 0, u32::MAX));
+    }
+
+    #[test]
+    fn last_words_supplement_preserves_mandatory_instructions() {
+        for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
+            let mut client = budget_client(api_style);
+            assert_eq!(client.last_words_system_prompt(), LAST_WORDS_SYSTEM_PROMPT);
+
+            client.last_words_supplement =
+                "Prioritize reproduction steps and hypotheses still needing tests.".to_string();
+            let prompt = client.last_words_system_prompt();
+            assert!(prompt.starts_with(LAST_WORDS_SYSTEM_PROMPT));
+            assert!(prompt.contains("<last-words-supplement>"));
+            assert!(prompt.contains("Prioritize reproduction steps"));
+            assert!(prompt.ends_with(
+                "The required sections, factuality rules, and no-tools rule remain mandatory."
+            ));
+            let side_call = client
+                .last_words_request_body(&[Message::system(prompt), Message::user("transcript")])
+                .unwrap()
+                .to_string();
+            assert!(side_call.contains("Prioritize reproduction steps"));
+            let normal = client
+                .request_body(&[Message::system("system"), Message::user("task")], &[])
+                .unwrap()
+                .to_string();
+            assert!(!normal.contains("Prioritize reproduction steps"));
+        }
     }
 
     #[test]
