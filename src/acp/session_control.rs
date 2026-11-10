@@ -76,14 +76,19 @@ impl SessionControl {
         let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
             .await
             .map_err(ControlError::internal)?;
-        let sessions = Arc::clone(&self.sessions);
+        let store = self.sessions.store();
         let model = self.model.clone();
         let agent = self.agent.clone();
-        let session_id =
-            tokio::task::spawn_blocking(move || sessions.create(&cwd, &model, &agent, tools))
-                .await
-                .map_err(ControlError::internal)?
-                .map_err(ControlError::internal)?;
+        let prepared = tokio::task::spawn_blocking(move || {
+            SessionRegistry::prepare_create(store, &cwd, &model, &agent)
+        })
+        .await
+        .map_err(ControlError::internal)?
+        .map_err(ControlError::internal)?;
+        let session_id = self
+            .sessions
+            .commit_create(prepared, tools)
+            .map_err(ControlError::internal)?;
         Ok(NewSessionResponse::new(session_id))
     }
 
@@ -598,10 +603,13 @@ mod tests {
         assert!(guard.tools().get("read_file").is_some());
         assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
         assert_eq!(
-            std::fs::read_to_string(directory.path().join("mcp-cwd.txt"))
-                .unwrap()
-                .trim(),
-            directory.path().to_str().unwrap()
+            std::fs::canonicalize(
+                std::fs::read_to_string(directory.path().join("mcp-cwd.txt"))
+                    .unwrap()
+                    .trim()
+            )
+            .unwrap(),
+            std::fs::canonicalize(directory.path()).unwrap()
         );
         assert!(store.load(&response.session_id.to_string()).is_ok());
     }

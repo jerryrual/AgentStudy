@@ -86,6 +86,15 @@ struct RegisteredSession {
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
 }
 
+/// A newly persisted session that is removed unless registered and committed.
+pub(crate) struct PreparedCreate {
+    store: SessionStore,
+    session_id: String,
+    session: Option<Session>,
+    run_lease: Option<SessionRunLease>,
+    committed: bool,
+}
+
 /// A validated load whose replay is complete but whose session is not exposed.
 pub(crate) struct PreparedLoad {
     registry: Arc<SessionRegistry>,
@@ -122,6 +131,47 @@ impl SessionRegistry {
         }
     }
 
+    /// Clone the persistent store without retaining this registry.
+    pub(crate) fn store(&self) -> SessionStore {
+        self.store.clone()
+    }
+
+    /// Persist and lease a session that rolls back unless committed.
+    pub(crate) fn prepare_create(
+        store: SessionStore,
+        cwd: &str,
+        model: &str,
+        agent: &str,
+    ) -> Result<PreparedCreate> {
+        let session = store.create(cwd, model, agent)?;
+        let session_id = session.id().to_string();
+        let mut prepared = PreparedCreate {
+            store,
+            session_id,
+            session: Some(session),
+            run_lease: None,
+            committed: false,
+        };
+        prepared.run_lease = Some(prepared.store.try_acquire_run_lease(&prepared.session_id)?);
+        Ok(prepared)
+    }
+
+    /// Register a prepared session and disable its persistence rollback.
+    pub(crate) fn commit_create(
+        &self,
+        mut prepared: PreparedCreate,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<SessionId> {
+        let session = prepared.session.take().expect("prepared session missing");
+        let run_lease = prepared
+            .run_lease
+            .take()
+            .expect("prepared session run lease missing");
+        let (session_id, _) = self.register(session, run_lease, true, tools)?;
+        prepared.committed = true;
+        Ok(session_id)
+    }
+
     /// Create and exclusively own a persistent session until this registry drops.
     pub(crate) fn create(
         &self,
@@ -130,10 +180,8 @@ impl SessionRegistry {
         agent: &str,
         tools: Arc<ToolRegistry>,
     ) -> Result<SessionId> {
-        let session = self.store.create(cwd, model, agent)?;
-        let run_lease = self.store.try_acquire_run_lease(session.id())?;
-        self.register(session, run_lease, true, tools)
-            .map(|(session_id, _)| session_id)
+        let prepared = Self::prepare_create(self.store.clone(), cwd, model, agent)?;
+        self.commit_create(prepared, tools)
     }
 
     /// Validate and project a persisted session while holding its run lease.
@@ -268,6 +316,25 @@ impl SessionRegistry {
         };
         cancel.send_replace(true);
         true
+    }
+}
+
+impl Drop for PreparedCreate {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.run_lease.take();
+        self.session.take();
+        let _ = std::fs::remove_file(self.store.path(&self.session_id));
+        let _ = std::fs::remove_file(
+            self.store
+                .root()
+                .join(format!("{}.run.lock", self.session_id)),
+        );
+        if let Ok(archive_root) = self.store.archive_root(&self.session_id) {
+            let _ = std::fs::remove_dir(archive_root);
+        }
     }
 }
 
@@ -410,6 +477,23 @@ mod tests {
         assert_eq!(loaded.meta.agent, "build");
         let guard = registry.begin_prompt(&session_id).unwrap();
         assert_eq!(guard.session().id(), id);
+    }
+
+    #[test]
+    fn abandoned_prepared_create_removes_persistence_and_lease_files() {
+        let (_directory, store, _registry) = registry();
+        let prepared =
+            SessionRegistry::prepare_create(store.clone(), "/workspace", "model-a", "build")
+                .unwrap();
+        let id = prepared.session_id.clone();
+        assert!(store.path(&id).exists());
+        assert!(store.root().join(format!("{id}.run.lock")).exists());
+
+        drop(prepared);
+
+        assert!(!store.path(&id).exists());
+        assert!(!store.root().join(format!("{id}.run.lock")).exists());
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
