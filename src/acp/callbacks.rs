@@ -101,10 +101,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |request: NewSessionRequest, responder, _connection| {
+            async move |request: NewSessionRequest, responder, connection| {
                 let control = Arc::clone(&new_control);
-                let result = control.new_session(&request).await;
-                responder.respond_with_result(result.map_err(ProtocolError::from))
+                connection.spawn(async move {
+                    let result = control.new_session(&request).await;
+                    responder.respond_with_result(result.map_err(ProtocolError::from))
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -261,8 +263,8 @@ mod tests {
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::v1::schema::{
         AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-        InitializeResponse, LoadSessionResponse, NewSessionResponse, NoticeCapabilities,
-        PromptRequest, SessionId, SessionNotification,
+        InitializeResponse, LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse,
+        NoticeCapabilities, PromptRequest, SessionId, SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -415,6 +417,41 @@ mod tests {
                         .await
                         .unwrap_err();
                     assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+
+                    #[cfg(unix)]
+                    {
+                        let script = concat!(
+                            "read initialize; sleep 0.2; printf '%s\\n' '",
+                            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{",
+                            "\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+                            "\"serverInfo\":{\"name\":\"slow\",\"version\":\"1\"}}}'; ",
+                            "read initialized; read list; printf '%s\\n' '",
+                            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'; ",
+                            "read until_closed"
+                        );
+                        let slow_request =
+                            NewSessionRequest::new(directory.path()).mcp_servers(vec![
+                                McpServer::Stdio(
+                                    McpServerStdio::new("slow", "/bin/sh")
+                                        .args(vec!["-c".into(), script.into()]),
+                                ),
+                            ]);
+                        let slow = connection.send_request(slow_request).block_task();
+                        tokio::pin!(slow);
+                        assert!(tokio::time::timeout(Duration::from_millis(25), &mut slow)
+                            .await
+                            .is_err());
+                        let initialized: InitializeResponse = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            connection
+                                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                                .block_task(),
+                        )
+                        .await
+                        .expect("slow MCP startup blocked ACP dispatch")?;
+                        assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
+                        let _: NewSessionResponse = slow.await?;
+                    }
 
                     let created: NewSessionResponse = connection
                         .send_request(NewSessionRequest::new(directory.path()))
