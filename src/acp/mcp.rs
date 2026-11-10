@@ -547,14 +547,16 @@ impl HttpSseDecoder {
         }
         self.buffer.extend_from_slice(bytes);
         let mut messages = Vec::new();
-        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            self.consume_line(&line, &mut messages)?;
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut start = 0;
+        while let Some(offset) = buffer[start..].iter().position(|byte| *byte == b'\n') {
+            let end = start + offset;
+            let raw = &buffer[start..end];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            self.consume_line(line, &mut messages)?;
+            start = end + 1;
         }
+        self.buffer.extend_from_slice(&buffer[start..]);
         Ok(messages)
     }
 
@@ -1499,6 +1501,19 @@ mod tests {
             )]),
             Err(SpecError::TooManyArguments)
         );
+    }
+
+    #[test]
+    fn streamable_http_handles_many_heartbeats_and_a_split_tail() {
+        let mut decoder = HttpSseDecoder::default();
+        let mut first_chunk = ":\n".repeat(32 * 1024).into_bytes();
+        first_chunk.extend_from_slice(b"data: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":");
+        assert!(decoder.push(&first_chunk).unwrap().is_empty());
+        let messages = decoder.push(b"{}}\n\n").unwrap();
+        let response = select_http_sse_response(messages, &serde_json::json!(9))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["result"], serde_json::json!({}));
     }
 
     #[test]
