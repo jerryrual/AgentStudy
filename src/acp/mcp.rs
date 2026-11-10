@@ -1,4 +1,4 @@
-//! Strict projection of stable ACP stdio MCP server declarations.
+//! Strict projection and runtime primitives for stable ACP MCP declarations.
 #![cfg_attr(
     not(test),
     allow(dead_code, reason = "consumed by the upcoming MCP runtime wiring")
@@ -10,9 +10,11 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::v1::schema::McpServer;
+use agent_client_protocol::v1::schema::{McpServer, McpServerHttp};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -23,6 +25,8 @@ use crate::tools::{truncate_output, Tool, ToolContext, ToolRegistry};
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
 const MAX_ENV: usize = 256;
+const MAX_HTTP_HEADERS: usize = 128;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_TOOL_PAGES: usize = 64;
@@ -38,6 +42,13 @@ pub(crate) struct StdioServerSpec {
     pub(crate) env: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
+pub(crate) struct HttpServerSpec {
+    pub(crate) name: String,
+    url: reqwest::Url,
+    headers: HeaderMap,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpecError {
     TooManyServers,
@@ -50,6 +61,11 @@ pub(crate) enum SpecError {
     TooManyEnvironmentVariables,
     InvalidEnvironmentVariable,
     DuplicateEnvironmentVariable,
+    InvalidUrl,
+    TooManyHttpHeaders,
+    InvalidHttpHeader,
+    DuplicateHttpHeader,
+    ReservedHttpHeader,
 }
 
 pub(crate) fn stdio_specs(servers: &[McpServer]) -> Result<Vec<StdioServerSpec>, SpecError> {
@@ -106,6 +122,73 @@ pub(crate) fn stdio_specs(servers: &[McpServer]) -> Result<Vec<StdioServerSpec>,
             })
         })
         .collect()
+}
+
+impl std::fmt::Debug for HttpServerSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpServerSpec")
+            .field("name", &self.name)
+            .field("origin", &self.url.origin().ascii_serialization())
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
+}
+
+pub(crate) fn http_spec(server: &McpServerHttp) -> Result<HttpServerSpec, SpecError> {
+    if server.name.is_empty() || server.name.contains('\0') {
+        return Err(SpecError::InvalidName);
+    }
+    let url = reqwest::Url::parse(&server.url).map_err(|_| SpecError::InvalidUrl)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(SpecError::InvalidUrl);
+    }
+    if server.headers.len() > MAX_HTTP_HEADERS {
+        return Err(SpecError::TooManyHttpHeaders);
+    }
+    let mut headers = HeaderMap::with_capacity(server.headers.len());
+    let mut header_bytes = 0usize;
+    for header in &server.headers {
+        header_bytes = header_bytes
+            .saturating_add(header.name.len())
+            .saturating_add(header.value.len());
+        if header_bytes > MAX_HTTP_HEADER_BYTES {
+            return Err(SpecError::TooManyHttpHeaders);
+        }
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| SpecError::InvalidHttpHeader)?;
+        if matches!(
+            name.as_str(),
+            "accept"
+                | "connection"
+                | "content-length"
+                | "content-type"
+                | "host"
+                | "mcp-protocol-version"
+                | "mcp-session-id"
+                | "origin"
+                | "transfer-encoding"
+        ) {
+            return Err(SpecError::ReservedHttpHeader);
+        }
+        if headers.contains_key(&name) {
+            return Err(SpecError::DuplicateHttpHeader);
+        }
+        let mut value =
+            HeaderValue::from_str(&header.value).map_err(|_| SpecError::InvalidHttpHeader)?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    Ok(HttpServerSpec {
+        name: server.name.clone(),
+        url,
+        headers,
+    })
 }
 
 pub(crate) struct StdioServerProcess {
@@ -183,6 +266,13 @@ pub(crate) enum TransportError {
     Oversized,
     Truncated,
     InvalidEnvelope,
+    Http(reqwest::Error),
+    HttpStatus(reqwest::StatusCode),
+    SessionExpired,
+    InvalidContentType,
+    InvalidSessionId,
+    MissingResponse,
+    MultipleResponses,
 }
 
 impl std::fmt::Display for TransportError {
@@ -193,6 +283,15 @@ impl std::fmt::Display for TransportError {
             Self::Oversized => formatter.write_str("MCP message exceeds the size limit"),
             Self::Truncated => formatter.write_str("MCP message is not newline terminated"),
             Self::InvalidEnvelope => formatter.write_str("invalid MCP JSON-RPC envelope"),
+            Self::Http(error) => write!(formatter, "MCP HTTP request failed: {error}"),
+            Self::HttpStatus(status) => write!(formatter, "MCP HTTP status was {status}"),
+            Self::SessionExpired => formatter.write_str("MCP HTTP session expired"),
+            Self::InvalidContentType => formatter.write_str("invalid MCP HTTP content type"),
+            Self::InvalidSessionId => formatter.write_str("invalid MCP HTTP session ID"),
+            Self::MissingResponse => formatter.write_str("MCP HTTP response was empty"),
+            Self::MultipleResponses => {
+                formatter.write_str("MCP HTTP response contained multiple messages")
+            }
         }
     }
 }
@@ -202,7 +301,16 @@ impl std::error::Error for TransportError {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::Oversized | Self::Truncated | Self::InvalidEnvelope => None,
+            Self::Http(error) => Some(error),
+            Self::Oversized
+            | Self::Truncated
+            | Self::InvalidEnvelope
+            | Self::HttpStatus(_)
+            | Self::SessionExpired
+            | Self::InvalidContentType
+            | Self::InvalidSessionId
+            | Self::MissingResponse
+            | Self::MultipleResponses => None,
         }
     }
 }
@@ -247,6 +355,211 @@ impl StdioJsonRpc {
         }
         decode_frame(encoded)
     }
+}
+
+pub(crate) struct StreamableHttpJsonRpc {
+    client: reqwest::Client,
+    spec: HttpServerSpec,
+    session_id: Option<HeaderValue>,
+    negotiated: bool,
+}
+
+impl StreamableHttpJsonRpc {
+    pub(crate) fn new(spec: HttpServerSpec) -> Result<Self, TransportError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(TransportError::Http)?;
+        Ok(Self {
+            client,
+            spec,
+            session_id: None,
+            negotiated: false,
+        })
+    }
+
+    pub(crate) async fn request(&mut self, message: &Value) -> Result<Value, TransportError> {
+        validate_envelope(message)?;
+        let Some(object) = message.as_object() else {
+            return Err(TransportError::InvalidEnvelope);
+        };
+        if !object.contains_key("id") || !object.contains_key("method") {
+            return Err(TransportError::InvalidEnvelope);
+        }
+        let expected_id = object
+            .get("id")
+            .cloned()
+            .ok_or(TransportError::InvalidEnvelope)?;
+        let initialize = object.get("method").and_then(Value::as_str) == Some("initialize");
+        let response = self.send(message).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && self.session_id.is_some() {
+            return Err(TransportError::SessionExpired);
+        }
+        if !response.status().is_success() {
+            return Err(TransportError::HttpStatus(response.status()));
+        }
+        let response_headers = response.headers().clone();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .map(str::to_owned)
+            .ok_or(TransportError::InvalidContentType)?;
+        let body = bounded_http_body(response).await?;
+        let mut messages = if content_type.eq_ignore_ascii_case("application/json") {
+            vec![decode_http_json(&body)?]
+        } else if content_type.eq_ignore_ascii_case("text/event-stream") {
+            decode_http_sse(&body)?
+        } else {
+            return Err(TransportError::InvalidContentType);
+        };
+        let message = match messages.len() {
+            0 => return Err(TransportError::MissingResponse),
+            1 => messages.pop().expect("one response"),
+            _ => return Err(TransportError::MultipleResponses),
+        };
+        let response_object = message.as_object().ok_or(TransportError::InvalidEnvelope)?;
+        if response_object.contains_key("method") || response_object.get("id") != Some(&expected_id)
+        {
+            return Err(TransportError::InvalidEnvelope);
+        }
+        let valid_initialize = initialize
+            && message
+                .get("result")
+                .and_then(|result| result.get("protocolVersion"))
+                .and_then(Value::as_str)
+                == Some(MCP_PROTOCOL_VERSION);
+        self.capture_session_id(&response_headers, valid_initialize)?;
+        if valid_initialize {
+            self.negotiated = true;
+        }
+        Ok(message)
+    }
+
+    pub(crate) async fn notify(&mut self, message: &Value) -> Result<(), TransportError> {
+        validate_envelope(message)?;
+        let Some(object) = message.as_object() else {
+            return Err(TransportError::InvalidEnvelope);
+        };
+        if object.contains_key("id") || !object.contains_key("method") {
+            return Err(TransportError::InvalidEnvelope);
+        }
+        let response = self.send(message).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND && self.session_id.is_some() {
+            return Err(TransportError::SessionExpired);
+        }
+        if response.status() != reqwest::StatusCode::ACCEPTED {
+            return Err(TransportError::HttpStatus(response.status()));
+        }
+        self.capture_session_id(response.headers(), false)?;
+        if !bounded_http_body(response).await?.is_empty() {
+            return Err(TransportError::MultipleResponses);
+        }
+        Ok(())
+    }
+
+    async fn send(&self, message: &Value) -> Result<reqwest::Response, TransportError> {
+        let mut request = self
+            .client
+            .post(self.spec.url.clone())
+            .headers(self.spec.headers.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(message);
+        if self.negotiated {
+            request = request.header("mcp-protocol-version", MCP_PROTOCOL_VERSION);
+        }
+        if let Some(session_id) = &self.session_id {
+            request = request.header("mcp-session-id", session_id.clone());
+        }
+        request
+            .send()
+            .await
+            .map_err(|error| TransportError::Http(error.without_url()))
+    }
+
+    fn capture_session_id(
+        &mut self,
+        headers: &HeaderMap,
+        allow_new: bool,
+    ) -> Result<(), TransportError> {
+        let Some(value) = headers.get("mcp-session-id") else {
+            return Ok(());
+        };
+        if value.is_empty()
+            || value
+                .as_bytes()
+                .iter()
+                .any(|byte| !(0x21..=0x7e).contains(byte))
+        {
+            return Err(TransportError::InvalidSessionId);
+        }
+        if self.session_id.is_none() && !allow_new {
+            return Err(TransportError::InvalidSessionId);
+        }
+        if self.session_id.as_ref().is_some_and(|known| known != value) {
+            return Err(TransportError::InvalidSessionId);
+        }
+        let mut value = value.clone();
+        value.set_sensitive(true);
+        self.session_id = Some(value);
+        Ok(())
+    }
+}
+
+async fn bounded_http_body(response: reqwest::Response) -> Result<Vec<u8>, TransportError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| TransportError::Http(error.without_url()))?;
+        if body.len().saturating_add(chunk.len()) > MAX_MESSAGE_BYTES {
+            return Err(TransportError::Oversized);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn decode_http_json(body: &[u8]) -> Result<Value, TransportError> {
+    if body.is_empty() {
+        return Err(TransportError::MissingResponse);
+    }
+    let message = serde_json::from_slice(body).map_err(TransportError::Json)?;
+    validate_envelope(&message)?;
+    Ok(message)
+}
+
+fn decode_http_sse(body: &[u8]) -> Result<Vec<Value>, TransportError> {
+    let text = std::str::from_utf8(body).map_err(|_| TransportError::InvalidEnvelope)?;
+    let mut messages = Vec::new();
+    let mut data = String::new();
+    for raw_line in text.split_inclusive('\n') {
+        let without_lf = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
+        if line.is_empty() {
+            if !data.is_empty() {
+                messages.push(decode_http_json(data.as_bytes())?);
+                data.clear();
+            }
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    if !data.is_empty() {
+        messages.push(decode_http_json(data.as_bytes())?);
+    }
+    Ok(messages)
 }
 
 fn encode_frame(message: &Value) -> Result<Vec<u8>, TransportError> {
@@ -991,7 +1304,9 @@ fn render_tool_result(result: ToolCallResult) -> serde_json::Result<String> {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
+    use agent_client_protocol::v1::schema::{
+        EnvVariable, HttpHeader, McpServerHttp, McpServerStdio,
+    };
 
     use crate::interaction::NoAsker;
     use crate::tools::ToolRegistry;
@@ -1004,6 +1319,49 @@ mod tests {
                 .args(vec!["--stdio".into(), "".into()])
                 .env(vec![EnvVariable::new("TOKEN", "secret")]),
         )
+    }
+
+    #[test]
+    fn validates_http_declarations_without_exposing_credentials() {
+        let spec = http_spec(
+            &McpServerHttp::new("remote", "https://example.invalid/mcp?tenant=private")
+                .headers(vec![HttpHeader::new("Authorization", "Bearer secret")]),
+        )
+        .unwrap();
+        let debug = format!("{spec:?}");
+        assert!(debug.contains("https://example.invalid"));
+        assert!(!debug.contains("tenant"));
+        assert!(!debug.contains("secret"));
+
+        for url in [
+            "relative",
+            "ftp://example.invalid/mcp",
+            "https://user:secret@example.invalid/mcp",
+            "https://example.invalid/mcp#fragment",
+        ] {
+            assert_eq!(
+                http_spec(&McpServerHttp::new("remote", url)).unwrap_err(),
+                SpecError::InvalidUrl
+            );
+        }
+        assert_eq!(
+            http_spec(
+                &McpServerHttp::new("remote", "https://example.invalid/mcp")
+                    .headers(vec![HttpHeader::new("Content-Type", "text/plain")])
+            )
+            .unwrap_err(),
+            SpecError::ReservedHttpHeader
+        );
+        assert_eq!(
+            http_spec(
+                &McpServerHttp::new("remote", "https://example.invalid/mcp").headers(vec![
+                    HttpHeader::new("X-Test", "first"),
+                    HttpHeader::new("x-test", "second"),
+                ])
+            )
+            .unwrap_err(),
+            SpecError::DuplicateHttpHeader
+        );
     }
 
     #[test]
@@ -1067,6 +1425,138 @@ mod tests {
             )]),
             Err(SpecError::TooManyArguments)
         );
+    }
+
+    #[test]
+    fn streamable_http_preserves_multiple_messages_and_rejects_session_rotation() {
+        let messages = decode_http_sse(
+            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notice\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let spec = http_spec(&McpServerHttp::new("remote", "https://example.invalid/mcp")).unwrap();
+        let mut transport = StreamableHttpJsonRpc::new(spec).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-session-id", HeaderValue::from_static("session-1"));
+        transport.capture_session_id(&headers, true).unwrap();
+        headers.insert("mcp-session-id", HeaderValue::from_static("session-2"));
+        assert!(matches!(
+            transport.capture_session_id(&headers, false),
+            Err(TransportError::InvalidSessionId)
+        ));
+        headers.insert("mcp-session-id", HeaderValue::from_static("bad id"));
+        assert!(matches!(
+            transport.capture_session_id(&headers, false),
+            Err(TransportError::InvalidSessionId)
+        ));
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0u8; 1024];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let mut buffer = vec![0u8; header_end + content_length - request.len()];
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn streamable_http_round_trips_json_sse_and_session_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let bodies = [
+                (
+                    "200 OK",
+                    "Content-Type: application/json\r\nMcp-Session-Id: session-1\r\n",
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}"#,
+                ),
+                ("202 Accepted", "", ""),
+                (
+                    "200 OK",
+                    "Content-Type: Text/Event-Stream; charset=utf-8\r\n",
+                    ": keepalive\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":2,\"result\":{\"tools\":[]}}\r\n\r\n",
+                ),
+            ];
+            for (status, extra_headers, body) in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut stream).await);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let spec = http_spec(
+            &McpServerHttp::new("remote", format!("http://{address}/mcp"))
+                .headers(vec![HttpHeader::new("Authorization", "Bearer test")]),
+        )
+        .unwrap();
+        let mut transport = StreamableHttpJsonRpc::new(spec).unwrap();
+        let initialized = transport
+            .request(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            initialized["result"]["protocolVersion"],
+            MCP_PROTOCOL_VERSION
+        );
+        transport
+            .notify(&serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized", "params": {}
+            }))
+            .await
+            .unwrap();
+        let listed = transport
+            .request(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+            }))
+            .await
+            .unwrap();
+        assert_eq!(listed["result"]["tools"], serde_json::json!([]));
+
+        let requests = server.await.unwrap();
+        for request in &requests {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.starts_with("post /mcp http/1.1"));
+            assert!(lower.contains("content-type: application/json"));
+            assert!(lower.contains("accept: application/json, text/event-stream"));
+            assert!(lower.contains("authorization: bearer test"));
+        }
+        let first = requests[0].to_ascii_lowercase();
+        assert!(!first.contains("mcp-session-id:"));
+        assert!(!first.contains("mcp-protocol-version:"));
+        for request in &requests[1..] {
+            let lower = request.to_ascii_lowercase();
+            assert!(lower.contains("mcp-session-id: session-1"));
+            assert!(lower.contains("mcp-protocol-version: 2025-06-18"));
+        }
     }
 
     #[cfg(unix)]
