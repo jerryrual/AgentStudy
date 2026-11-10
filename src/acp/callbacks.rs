@@ -148,6 +148,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 };
                 let session = guard.session().clone();
                 let tools = guard.tools();
+                let additional_directories = guard.additional_directories();
                 let ownership = guard.ownership();
                 let setup_ownership = Arc::clone(&ownership);
                 let cwd = PathBuf::from(session.cwd());
@@ -171,7 +172,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         if let Some(hook) = setup_hook {
                             hook();
                         }
-                        let agent = runtime.agent_for(&cwd, tools, approver);
+                        let agent = runtime.agent_for_with_directories(
+                            &cwd,
+                            additional_directories,
+                            tools,
+                            approver,
+                        );
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
                     })
@@ -262,7 +268,8 @@ mod tests {
     use agent_client_protocol::v1::schema::{
         AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
         InitializeResponse, LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse,
-        NoticeCapabilities, PromptRequest, SessionId, SessionNotification,
+        NoticeCapabilities, PromptRequest, SessionAdditionalDirectoriesCapabilities,
+        SessionCapabilities, SessionId, SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -389,7 +396,13 @@ mod tests {
                     assert_eq!(initialized.protocol_version, ProtocolVersion::V1);
                     assert_eq!(
                         initialized.agent_capabilities,
-                        AgentCapabilities::new().load_session(true)
+                        AgentCapabilities::new()
+                            .load_session(true)
+                            .session_capabilities(
+                                SessionCapabilities::new().additional_directories(
+                                    SessionAdditionalDirectoriesCapabilities::new(),
+                                ),
+                            )
                     );
 
                     let empty_prompt = connection

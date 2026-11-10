@@ -4,7 +4,7 @@
     allow(dead_code, reason = "consumed by the upcoming ACP protocol handlers")
 )]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::error::{ControlError, ControlResult, InvalidSessionRequest};
@@ -14,7 +14,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    SessionNotification,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionNotification,
 };
 use agent_client_protocol::Error as ProtocolError;
 
@@ -51,8 +51,14 @@ impl SessionControl {
         } else {
             ProtocolVersion::LATEST
         };
-        InitializeResponse::new(protocol_version)
-            .agent_capabilities(AgentCapabilities::new().load_session(true))
+        InitializeResponse::new(protocol_version).agent_capabilities(
+            AgentCapabilities::new()
+                .load_session(true)
+                .session_capabilities(
+                    SessionCapabilities::new()
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
+                ),
+        )
     }
 
     /// Validate all setup fields before creating any durable session state.
@@ -60,11 +66,8 @@ impl SessionControl {
         &self,
         request: &NewSessionRequest,
     ) -> ControlResult<NewSessionResponse> {
-        if !request.additional_directories.is_empty() {
-            return Err(ControlError::invalid(
-                InvalidSessionRequest::AdditionalDirectories,
-            ));
-        }
+        let additional_directories =
+            validated_additional_directories(&request.additional_directories)?;
         let requested_cwd = request.cwd.clone();
         let cwd = tokio::task::spawn_blocking(move || {
             validated_cwd(&requested_cwd).map(|cwd| cwd.to_string())
@@ -87,7 +90,7 @@ impl SessionControl {
         .map_err(ControlError::internal)?;
         let session_id = self
             .sessions
-            .commit_create(prepared, tools)
+            .commit_create_with_directories(prepared, tools, additional_directories)
             .map_err(ControlError::internal)?;
         Ok(NewSessionResponse::new(session_id))
     }
@@ -97,19 +100,17 @@ impl SessionControl {
         &self,
         request: &LoadSessionRequest,
     ) -> ControlResult<LoadTransaction> {
-        if !request.additional_directories.is_empty() {
-            return Err(ControlError::invalid(
-                InvalidSessionRequest::AdditionalDirectories,
-            ));
-        }
+        let additional_directories =
+            validated_additional_directories(&request.additional_directories)?;
         if !request.mcp_servers.is_empty() {
             return Err(ControlError::invalid(InvalidSessionRequest::McpServers));
         }
         let cwd = validated_cwd(&request.cwd)?;
-        let prepared = self
+        let mut prepared = self
             .sessions
             .prepare_load(&request.session_id, cwd)
             .map_err(|error| map_load_error(error, &request.session_id))?;
+        prepared.set_additional_directories(additional_directories);
         Ok(LoadTransaction { prepared })
     }
 
@@ -118,11 +119,8 @@ impl SessionControl {
         &self,
         request: &LoadSessionRequest,
     ) -> ControlResult<LoadTransaction> {
-        if !request.additional_directories.is_empty() {
-            return Err(ControlError::invalid(
-                InvalidSessionRequest::AdditionalDirectories,
-            ));
-        }
+        let additional_directories =
+            validated_additional_directories(&request.additional_directories)?;
         let specs = mcp::stdio_specs(&request.mcp_servers)
             .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
         let requested_cwd = request.cwd.clone();
@@ -146,6 +144,7 @@ impl SessionControl {
         .await
         .map_err(ControlError::internal)?
         .map_err(|error| map_load_error(error, &request.session_id))?;
+        prepared.set_additional_directories(additional_directories);
         let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
             .await
             .map_err(ControlError::internal)?;
@@ -220,6 +219,16 @@ fn map_load_error(
     }
 }
 
+/// Preserve the exact ordered roots after enforcing ACP's absolute-path rule.
+fn validated_additional_directories(directories: &[PathBuf]) -> ControlResult<Vec<PathBuf>> {
+    if directories.iter().any(|directory| !directory.is_absolute()) {
+        return Err(ControlError::invalid(
+            InvalidSessionRequest::AdditionalDirectoryNotAbsolute,
+        ));
+    }
+    Ok(directories.to_vec())
+}
+
 /// Return the exact UTF-8 cwd after validating its durable session preconditions.
 fn validated_cwd(cwd: &Path) -> ControlResult<&str> {
     if !cwd.is_absolute() {
@@ -272,7 +281,13 @@ mod tests {
             assert_eq!(response.protocol_version, ProtocolVersion::V1);
             assert_eq!(
                 response.agent_capabilities,
-                AgentCapabilities::new().load_session(true)
+                AgentCapabilities::new()
+                    .load_session(true)
+                    .session_capabilities(
+                        SessionCapabilities::new().additional_directories(
+                            SessionAdditionalDirectoriesCapabilities::new(),
+                        )
+                    )
             );
         }
     }
@@ -289,6 +304,29 @@ mod tests {
         assert_eq!(loaded.meta.cwd, directory.path().to_str().unwrap());
         assert_eq!(loaded.meta.model, "model-a");
         assert_eq!(loaded.meta.agent, "build");
+    }
+
+    #[tokio::test]
+    async fn new_session_keeps_ordered_additional_roots_out_of_the_transcript() {
+        let (directory, store, control) = control();
+        let roots = vec![
+            directory.path().join("extra-alpha"),
+            directory.path().join("extra-beta"),
+        ];
+        let response = control
+            .new_session(
+                &NewSessionRequest::new(directory.path()).additional_directories(roots.clone()),
+            )
+            .await
+            .unwrap();
+
+        let guard = control.begin_prompt(&response.session_id).unwrap();
+        assert_eq!(guard.additional_directories(), roots);
+        drop(guard);
+        let id = response.session_id.to_string();
+        let transcript = std::fs::read_to_string(store.path(&id)).unwrap();
+        assert!(!transcript.contains("extra-alpha"));
+        assert!(!transcript.contains("extra-beta"));
     }
 
     #[tokio::test]
@@ -311,8 +349,8 @@ mod tests {
             ),
             (
                 NewSessionRequest::new(directory.path())
-                    .additional_directories(vec![directory.path().join("other")]),
-                InvalidSessionRequest::AdditionalDirectories,
+                    .additional_directories(vec![PathBuf::from("other")]),
+                InvalidSessionRequest::AdditionalDirectoryNotAbsolute,
             ),
             (
                 NewSessionRequest::new(directory.path())
@@ -479,6 +517,44 @@ mod tests {
         store.try_acquire_run_lease(session.id()).unwrap();
     }
 
+    #[tokio::test]
+    async fn each_load_request_replaces_the_active_additional_roots() {
+        let (directory, _store, control) = control();
+        let created = control
+            .new_session(
+                &NewSessionRequest::new(directory.path())
+                    .additional_directories(vec![directory.path().join("create-root")]),
+            )
+            .await
+            .unwrap();
+        assert!(control.sessions.close(&created.session_id));
+
+        let replacement = vec![directory.path().join("load-root")];
+        control
+            .prepare_load(
+                &LoadSessionRequest::new(created.session_id.clone(), directory.path())
+                    .additional_directories(replacement.clone()),
+            )
+            .unwrap()
+            .complete_with(|_| Ok(()), |_| Ok(()))
+            .unwrap();
+        let guard = control.begin_prompt(&created.session_id).unwrap();
+        assert_eq!(guard.additional_directories(), replacement);
+        drop(guard);
+        assert!(control.sessions.close(&created.session_id));
+
+        control
+            .prepare_load(&LoadSessionRequest::new(
+                created.session_id.clone(),
+                directory.path(),
+            ))
+            .unwrap()
+            .complete_with(|_| Ok(()), |_| Ok(()))
+            .unwrap();
+        let guard = control.begin_prompt(&created.session_id).unwrap();
+        assert!(guard.additional_directories().is_empty());
+    }
+
     #[test]
     fn load_admits_complete_replay_before_response_then_enables_prompts() {
         let (directory, store, control) = control();
@@ -510,7 +586,12 @@ mod tests {
         ];
         let (_session, session_id) = persisted_session(&store, directory.path(), &records);
         let events = RefCell::new(Vec::new());
-        let request = LoadSessionRequest::new(session_id.clone(), directory.path());
+        let roots = vec![
+            directory.path().join("replacement-beta"),
+            directory.path().join("replacement-alpha"),
+        ];
+        let request = LoadSessionRequest::new(session_id.clone(), directory.path())
+            .additional_directories(roots.clone());
 
         control
             .prepare_load(&request)
@@ -574,6 +655,7 @@ mod tests {
         assert_eq!(events[4]["update"]["rawOutput"], "contents");
         assert_eq!(events[6], serde_json::json!({"response": {}}));
         let guard = control.sessions.begin_prompt(&session_id).unwrap();
+        assert_eq!(guard.additional_directories(), roots);
         assert!(store
             .try_acquire_run_lease(&session_id.to_string())
             .is_err());
@@ -585,6 +667,18 @@ mod tests {
         let (directory, store, control) = control();
         let other = TempDir::new().unwrap();
         let (_session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let relative_root = LoadSessionRequest::new(session_id.clone(), directory.path())
+            .additional_directories(vec![PathBuf::from("relative-extra")]);
+        assert!(matches!(
+            control.prepare_load(&relative_root),
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::AdditionalDirectoryNotAbsolute
+            ))
+        ));
+        store
+            .try_acquire_run_lease(&session_id.to_string())
+            .unwrap();
+
         let wrong_cwd = LoadSessionRequest::new(session_id.clone(), other.path());
         assert!(matches!(
             control.prepare_load(&wrong_cwd),

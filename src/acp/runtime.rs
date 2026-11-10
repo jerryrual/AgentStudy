@@ -46,6 +46,17 @@ impl PromptRuntime {
         tools: Arc<ToolRegistry>,
         approver: Arc<dyn Approver>,
     ) -> Agent {
+        self.agent_for_with_directories(cwd, Vec::new(), tools, approver)
+    }
+
+    /// Construct a fresh agent with the active ACP additional workspace roots.
+    pub(crate) fn agent_for_with_directories(
+        &self,
+        cwd: &Path,
+        additional_directories: Vec<std::path::PathBuf>,
+        tools: Arc<ToolRegistry>,
+        approver: Arc<dyn Approver>,
+    ) -> Agent {
         Agent::new(
             Arc::clone(&self.client),
             tools,
@@ -58,6 +69,7 @@ impl PromptRuntime {
                 tool_timeout: self.tool_timeout,
             },
         )
+        .with_additional_directories(additional_directories)
     }
 
     pub(crate) fn context_window(&self) -> Option<u32> {
@@ -101,8 +113,10 @@ mod tests {
             Arc::new(ToolRegistry::builtin()),
             Arc::new(DenyAll),
         );
-        let second_agent = runtime.agent_for(
+        let roots = vec![first.path().join("extra-z"), second.path().join("extra-a")];
+        let second_agent = runtime.agent_for_with_directories(
             second.path(),
+            roots.clone(),
             Arc::new(ToolRegistry::builtin()),
             Arc::new(DenyAll),
         );
@@ -119,6 +133,15 @@ mod tests {
         assert!(!second_agent
             .system_prompt()
             .contains("first workspace rule"));
+        assert!(!first_agent
+            .system_prompt()
+            .contains("Additional workspace roots"));
+        let second_prompt = second_agent.system_prompt();
+        assert!(second_prompt
+            .contains("relative paths still resolve from the current working directory"));
+        let first_root = second_prompt.find(&format!("{:?}", roots[0])).unwrap();
+        let second_root = second_prompt.find(&format!("{:?}", roots[1])).unwrap();
+        assert!(first_root < second_root);
         assert_eq!(runtime.phase_four_side_call_token_budget(), 2048);
     }
 }
