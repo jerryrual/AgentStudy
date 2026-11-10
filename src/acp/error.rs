@@ -10,7 +10,7 @@ use anyhow::Error;
 /// A client-controlled session request field that failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidSessionRequest {
-    AdditionalDirectories,
+    AdditionalDirectoryNotAbsolute,
     McpServers,
     InvalidMcpServers,
     CwdNotAbsolute,
@@ -29,7 +29,7 @@ pub(crate) enum InvalidSessionRequest {
 impl InvalidSessionRequest {
     fn message(self) -> &'static str {
         match self {
-            Self::AdditionalDirectories => "additional workspace roots are not supported",
+            Self::AdditionalDirectoryNotAbsolute => "additional workspace roots must be absolute",
             Self::McpServers => "MCP servers are not supported for loaded sessions",
             Self::InvalidMcpServers => "invalid MCP server configuration",
             Self::CwdNotAbsolute => "cwd must be absolute",
@@ -118,8 +118,8 @@ mod tests {
     fn maps_invalid_reasons_to_fixed_safe_protocol_data() {
         let cases = [
             (
-                InvalidSessionRequest::AdditionalDirectories,
-                "additional workspace roots are not supported",
+                InvalidSessionRequest::AdditionalDirectoryNotAbsolute,
+                "additional workspace roots must be absolute",
             ),
             (
                 InvalidSessionRequest::McpServers,

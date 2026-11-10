@@ -115,6 +115,7 @@ pub struct Agent {
     asker: Arc<dyn Asker>,
     options: AgentOptions,
     project_memory: crate::memory::ProjectMemory,
+    additional_directories: Vec<PathBuf>,
     todos: Arc<Mutex<Vec<TodoItem>>>,
 }
 
@@ -134,8 +135,14 @@ impl Agent {
             asker,
             options,
             project_memory,
+            additional_directories: Vec::new(),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub(crate) fn with_additional_directories(mut self, directories: Vec<PathBuf>) -> Self {
+        self.additional_directories = directories;
+        self
     }
 
     pub fn model(&self) -> &str {
@@ -161,6 +168,15 @@ impl Agent {
             self.options.cwd.display(),
             today()
         );
+        if !self.additional_directories.is_empty() {
+            prompt.push_str(
+                "\n\nAdditional workspace roots (in client order; relative paths still resolve from the current working directory):",
+            );
+            for directory in &self.additional_directories {
+                prompt.push_str("\n- ");
+                prompt.push_str(&format!("{directory:?}"));
+            }
+        }
         if !self.project_memory.prompt.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&self.project_memory.prompt);

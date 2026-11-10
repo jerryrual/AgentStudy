@@ -5,6 +5,7 @@
 )]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -83,6 +84,7 @@ struct RegisteredSession {
     ready: AtomicBool,
     approval_policy: ApprovalPolicy,
     tools: Arc<ToolRegistry>,
+    additional_directories: Vec<PathBuf>,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -102,6 +104,7 @@ pub(crate) struct PreparedLoad {
     run_lease: SessionRunLease,
     updates: Vec<SessionUpdate>,
     tools: Arc<ToolRegistry>,
+    additional_directories: Vec<PathBuf>,
 }
 
 /// A load registered as pending while its response is admitted.
@@ -160,15 +163,26 @@ impl SessionRegistry {
     /// Register a prepared session and disable its persistence rollback.
     pub(crate) fn commit_create(
         &self,
+        prepared: PreparedCreate,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<SessionId> {
+        self.commit_create_with_directories(prepared, tools, Vec::new())
+    }
+
+    /// Register a prepared session with its ordered additional workspace roots.
+    pub(crate) fn commit_create_with_directories(
+        &self,
         mut prepared: PreparedCreate,
         tools: Arc<ToolRegistry>,
+        additional_directories: Vec<PathBuf>,
     ) -> Result<SessionId> {
         let session = prepared.session.take().expect("prepared session missing");
         let run_lease = prepared
             .run_lease
             .take()
             .expect("prepared session run lease missing");
-        let (session_id, _) = self.register(session, run_lease, true, tools)?;
+        let (session_id, _) =
+            self.register(session, run_lease, true, tools, additional_directories)?;
         prepared.committed = true;
         Ok(session_id)
     }
@@ -252,6 +266,7 @@ impl SessionRegistry {
             run_lease,
             updates,
             tools: Arc::new(ToolRegistry::builtin()),
+            additional_directories: Vec::new(),
         })
     }
 
@@ -261,6 +276,7 @@ impl SessionRegistry {
         run_lease: SessionRunLease,
         ready: bool,
         tools: Arc<ToolRegistry>,
+        additional_directories: Vec<PathBuf>,
     ) -> Result<(SessionId, Arc<RegisteredSession>)> {
         let session_id = SessionId::new(session.id());
         let mut sessions = lock(&self.sessions);
@@ -274,6 +290,7 @@ impl SessionRegistry {
             ready: AtomicBool::new(ready),
             approval_policy: new_policy(),
             tools,
+            additional_directories,
             active_prompt: Mutex::new(None),
         });
         sessions.insert(session_id.clone(), Arc::clone(&registered));
@@ -374,6 +391,11 @@ impl PreparedLoad {
         self.tools = tools;
     }
 
+    /// Replace the ordered additional workspace roots for this load.
+    pub(crate) fn set_additional_directories(&mut self, directories: Vec<PathBuf>) {
+        self.additional_directories = directories;
+    }
+
     /// Register this load as pending while its protocol response is admitted.
     pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
         let PreparedLoad {
@@ -382,12 +404,13 @@ impl PreparedLoad {
             run_lease,
             updates: _,
             tools,
+            additional_directories,
         } = self;
         let registry = registry.upgrade().ok_or_else(|| {
             LoadError::Internal(anyhow::anyhow!("ACP session registry was released"))
         })?;
         let (session_id, registered) = registry
-            .register(session, run_lease, false, tools)
+            .register(session, run_lease, false, tools, additional_directories)
             .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
@@ -448,6 +471,10 @@ impl PromptGuard {
 
     pub(crate) fn tools(&self) -> Arc<ToolRegistry> {
         Arc::clone(&self.registered.tools)
+    }
+
+    pub(crate) fn additional_directories(&self) -> Vec<PathBuf> {
+        self.registered.additional_directories.clone()
     }
 
     /// Wait until the matching session receives a cancellation request.
