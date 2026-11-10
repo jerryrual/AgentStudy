@@ -113,6 +113,41 @@ impl SessionControl {
         Ok(LoadTransaction { prepared })
     }
 
+    /// Validate, rebuild MCP tools, and project a load without blocking dispatch.
+    pub(crate) async fn prepare_load_with_mcp(
+        &self,
+        request: &LoadSessionRequest,
+    ) -> ControlResult<LoadTransaction> {
+        if !request.additional_directories.is_empty() {
+            return Err(ControlError::invalid(
+                InvalidSessionRequest::AdditionalDirectories,
+            ));
+        }
+        let specs = mcp::stdio_specs(&request.mcp_servers)
+            .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
+        let requested_cwd = request.cwd.clone();
+        let cwd = tokio::task::spawn_blocking(move || {
+            validated_cwd(&requested_cwd).map(|cwd| cwd.to_string())
+        })
+        .await
+        .map_err(ControlError::internal)??;
+        let registry = Arc::downgrade(&self.sessions);
+        let store = self.sessions.store();
+        let session_id = request.session_id.clone();
+        let expected_cwd = cwd.clone();
+        let mut prepared = tokio::task::spawn_blocking(move || {
+            SessionRegistry::prepare_load_detached(registry, store, session_id, expected_cwd)
+        })
+        .await
+        .map_err(ControlError::internal)?
+        .map_err(|error| map_load_error(error, &request.session_id))?;
+        let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
+            .await
+            .map_err(ControlError::internal)?;
+        prepared.set_tools(tools);
+        Ok(LoadTransaction { prepared })
+    }
+
     /// Acquire the prompt slot or classify its client-visible admission failure.
     pub(crate) fn begin_prompt(
         &self,
@@ -317,15 +352,6 @@ mod tests {
     #[test]
     fn load_classifies_client_identity_and_lease_failures() {
         let (directory, store, control) = control();
-        let unsupported_mcp =
-            LoadSessionRequest::new(SessionId::new("not-opened"), directory.path()).mcp_servers(
-                vec![McpServer::Stdio(McpServerStdio::new("tools", "/bin/echo"))],
-            );
-        assert!(matches!(
-            control.prepare_load(&unsupported_mcp),
-            Err(ControlError::Invalid(InvalidSessionRequest::McpServers))
-        ));
-
         let invalid_id = SessionId::new("../outside");
         let invalid = LoadSessionRequest::new(invalid_id, directory.path());
         assert!(matches!(
@@ -359,6 +385,76 @@ mod tests {
                 InvalidSessionRequest::ActiveElsewhere
             ))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_rebuilds_tools_from_client_stdio_declarations() {
+        let (directory, store, control) = control();
+        let (_session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read list; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}'; ",
+            "read until_closed"
+        );
+        let request =
+            LoadSessionRequest::new(session_id.clone(), directory.path()).mcp_servers(vec![
+                McpServer::Stdio(
+                    McpServerStdio::new("fixture", "/bin/sh")
+                        .args(vec!["-c".into(), script.into()]),
+                ),
+            ]);
+
+        control
+            .prepare_load_with_mcp(&request)
+            .await
+            .unwrap()
+            .complete_with(
+                |_| Ok::<_, ProtocolError>(()),
+                |_| Ok::<_, ProtocolError>(()),
+            )
+            .unwrap();
+        let guard = control.begin_prompt(&session_id).unwrap();
+        assert!(guard.tools().get("read_file").is_some());
+        assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
+    }
+
+    #[tokio::test]
+    async fn load_rejects_invalid_mcp_before_acquiring_the_session_lease() {
+        let (directory, store, control) = control();
+        let (session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let request = LoadSessionRequest::new(session_id, directory.path())
+            .mcp_servers(vec![McpServer::Stdio(McpServerStdio::new("", "/bin/echo"))]);
+
+        assert!(matches!(
+            control.prepare_load_with_mcp(&request).await,
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::InvalidMcpServers
+            ))
+        ));
+        store.try_acquire_run_lease(session.id()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_load_mcp_startup_releases_the_prepared_lease() {
+        let (directory, store, control) = control();
+        let (session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let request = LoadSessionRequest::new(session_id, directory.path()).mcp_servers(vec![
+            McpServer::Stdio(
+                McpServerStdio::new("broken", "/bin/sh")
+                    .args(vec!["-c".into(), "read initialize; exit 1".into()]),
+            ),
+        ]);
+
+        assert!(matches!(
+            control.prepare_load_with_mcp(&request).await,
+            Err(ControlError::Internal(_))
+        ));
+        store.try_acquire_run_lease(session.id()).unwrap();
     }
 
     #[test]

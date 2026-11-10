@@ -113,21 +113,19 @@ pub(crate) fn callback_bundle_with_setup_hook(
         .on_receive_request(
             async move |request: LoadSessionRequest, responder, connection| {
                 let control = Arc::clone(&load_control);
-                let transaction =
-                    tokio::task::spawn_blocking(move || control.prepare_load(&request))
-                        .await
-                        .map_err(ControlError::internal)
-                        .and_then(|result| result);
-                let transaction = match transaction {
-                    Ok(transaction) => transaction,
-                    Err(error) => return responder.respond_with_error(error.into()),
-                };
-                transaction
-                    .complete_with(
-                        |notification| connection.send_notification(notification),
-                        |response| responder.respond(response),
-                    )
-                    .map_err(ProtocolError::from)
+                let task_connection = connection.clone();
+                connection.spawn(async move {
+                    let transaction = match control.prepare_load_with_mcp(&request).await {
+                        Ok(transaction) => transaction,
+                        Err(error) => return responder.respond_with_error(error.into()),
+                    };
+                    transaction
+                        .complete_with(
+                            |notification| task_connection.send_notification(notification),
+                            |response| responder.respond(response),
+                        )
+                        .map_err(ProtocolError::from)
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
