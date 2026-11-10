@@ -28,6 +28,7 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_DISCOVERED_TOOLS: usize = 1024;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -793,20 +794,31 @@ impl std::error::Error for ToolCallError {
 pub(crate) async fn start_tool_registry(
     specs: &[StdioServerSpec],
 ) -> anyhow::Result<Arc<ToolRegistry>> {
+    start_tool_registry_with_timeout(specs, STARTUP_TIMEOUT).await
+}
+
+async fn start_tool_registry_with_timeout(
+    specs: &[StdioServerSpec],
+    startup_timeout: Duration,
+) -> anyhow::Result<Arc<ToolRegistry>> {
     let mut adapters = Vec::new();
     for (server_index, spec) in specs.iter().enumerate() {
         let mut process = StdioServerProcess::spawn(spec)
             .with_context(|| format!("failed to start MCP server {:?}", spec.name))?;
         let mut client = StdioMcpClient::from_process(&mut process)
             .with_context(|| format!("failed to connect MCP server {:?}", spec.name))?;
-        client
-            .initialize()
-            .await
-            .with_context(|| format!("failed to initialize MCP server {:?}", spec.name))?;
-        let tools = client
-            .list_tools()
-            .await
-            .with_context(|| format!("failed to discover MCP server {:?}", spec.name))?;
+        let tools = tokio::time::timeout(startup_timeout, async {
+            client
+                .initialize()
+                .await
+                .with_context(|| format!("failed to initialize MCP server {:?}", spec.name))?;
+            client
+                .list_tools()
+                .await
+                .with_context(|| format!("failed to discover MCP server {:?}", spec.name))
+        })
+        .await
+        .with_context(|| format!("MCP server {:?} startup timed out", spec.name))??;
         adapters.extend(tool_adapters(server_index, process, client, tools));
     }
     ToolRegistry::builtin_with(adapters)
@@ -1624,6 +1636,24 @@ mod tests {
                 "_meta": {"source": "fixture"}
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aggregate_mcp_startup_times_out_a_silent_server() {
+        let specs = vec![StdioServerSpec {
+            name: "silent".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "read initialize; sleep 10".into()],
+            env: Vec::new(),
+        }];
+
+        let error = start_tool_registry_with_timeout(&specs, Duration::from_millis(25))
+            .await
+            .err()
+            .expect("silent MCP server must time out");
+        assert!(error.to_string().contains("silent"));
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]
