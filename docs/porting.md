@@ -26,7 +26,7 @@
 | 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
 | 模型协议 | Chat Completions；核心无状态 Responses API（文本、推理摘要、本地函数工具、流式/非流式） | `src/model/` |
-| 重试 | 429/5xx/transport 指数退避重试；严格上下文溢出会强制运行 Phase 1–3，并在当前工具尾部可严格缩小时生成无工具、非流式 Last Words，原子持久化 Phase 4 后零延迟重试一次；全部恢复仍属于同一 agent round。`phase4_side_call_token_budget` 按逻辑用户轮累计每次实际 Phase 4 HTTP 尝试的估算输入 token：`-1` 不限、`0` 禁用、正数按上游的 charge-first 且严格小于上限准入；格式纠正和 429/5xx/transport 重试共享配额，新用户轮重置 | `src/config.rs`、`src/agent/events.rs`、`src/model/client.rs` |
+| 重试 | 429/5xx/transport 指数退避重试；严格上下文溢出会强制运行 Phase 1–3，并在当前工具尾部可严格缩小时生成无工具、非流式 Last Words，原子持久化 Phase 4 后零延迟重试一次；主动 Phase 4 未提交投影而原始请求随后溢出时，可在同一 turn breaker 下再次尝试 Last Words，成功投影后的 provider 请求仍不递归恢复；全部恢复仍属于同一 agent round。`phase4_side_call_token_budget` 按逻辑用户轮累计每次实际 Phase 4 HTTP 尝试的估算输入 token：`-1` 不限、`0` 禁用、正数按上游的 charge-first 且严格小于上限准入；格式纠正和 429/5xx/transport 重试共享配额，新用户轮重置 | `src/config.rs`、`src/agent/events.rs`、`src/model/client.rs` |
 
 ## 尚未移植
 

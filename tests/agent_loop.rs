@@ -591,6 +591,91 @@ async fn generates_last_words_before_retrying_a_large_current_tool_turn() {
 }
 
 #[tokio::test]
+async fn provider_overflow_retries_a_skipped_proactive_phase_four() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = calls.clone();
+    let note_body = "concrete progress detail ".repeat(30);
+    let note = format!("## Task\n{note_body}\n## Progress\n{note_body}\n## Next\n{note_body}");
+    let server =
+        MockServer::new(
+            move |_path, body| match calls_for_server.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => {
+                    assert_eq!(body["stream"], false);
+                    MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "too short"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+                    })
+                    .to_string(),
+                )
+                }
+                2 => {
+                    assert_eq!(body["stream"], true);
+                    context_overflow_response()
+                }
+                3 => {
+                    assert_eq!(body["stream"], false);
+                    MockResponse::json(
+                    200,
+                    &serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": note},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+                    })
+                    .to_string(),
+                )
+                }
+                4 => MockResponse::sse(&[&text_chunk("recovered"), &done_chunk("stop")]),
+                _ => panic!("unexpected provider call"),
+            },
+        );
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = mock_profile(server.base_url());
+    profile.context_window = Some(30_000);
+    profile.max_tokens = Some(3_000);
+    let agent = Agent::new(
+        Arc::new(ModelClient::from_profile(&profile).unwrap()),
+        Arc::new(ToolRegistry::builtin()),
+        Arc::new(AllowAll),
+        Arc::new(NoAsker),
+        agent_options(directory.path().to_path_buf(), 6),
+    );
+    let sink = RecordingSink::default();
+    let mut messages = vec![
+        Message::user("inspect the large result and continue"),
+        Message::assistant(AssistantMessage {
+            tool_calls: vec![icode::model::ToolCall {
+                id: "call_large".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"large.txt"}"#.into(),
+            }],
+            ..AssistantMessage::default()
+        }),
+        Message::tool("call_large", "read_file", "result ".repeat(2_500)),
+    ];
+
+    let turn = agent.run(&mut messages, &sink).await.unwrap();
+
+    assert_eq!(turn.text, "recovered");
+    assert_eq!(turn.rounds, 1);
+    assert_eq!(turn.usage.total_tokens, 45);
+    assert_eq!(server.request_count(), 5);
+    assert_eq!(*sink.failures.lock().unwrap(), vec![false]);
+    assert_eq!(*sink.progress.lock().unwrap(), vec![true]);
+    assert_eq!(sink.projections.lock().unwrap().len(), 1);
+    assert!(matches!(messages[2], Message::LastWords { .. }));
+    assert!(sink.events().iter().any(|event| {
+        event == "info:model context overflow; compacting current tool history and retrying once"
+    }));
+}
+
+#[tokio::test]
 async fn provider_overflow_phase_four_does_not_recurse_after_retry() {
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls_for_server = calls.clone();
