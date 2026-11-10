@@ -184,6 +184,7 @@ pub fn mock_profile(base_url: String) -> icode::config::ModelProfile {
         max_tokens: None,
         context_window: None,
         temperature: Some(0.0),
+        last_words_supplement: String::new(),
         stream: true,
     }
 }
