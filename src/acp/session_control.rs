@@ -250,7 +250,7 @@ fn validated_cwd(cwd: &Path) -> ControlResult<&str> {
 mod tests {
     use std::cell::RefCell;
 
-    use agent_client_protocol::v1::schema::{McpServer, McpServerStdio, SessionId};
+    use agent_client_protocol::v1::schema::{EnvVariable, McpServer, McpServerStdio, SessionId};
     use tempfile::TempDir;
 
     use super::*;
@@ -704,6 +704,7 @@ mod tests {
     async fn new_session_starts_mcp_tools_before_persisting() {
         let (directory, store, control) = control();
         let script = concat!(
+            "test \"$ICODE_MCP_PRIVATE_TEST\" = 'not-for-transcript' || exit 2; ",
             "pwd > mcp-cwd.txt; ",
             "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
             "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
@@ -713,7 +714,12 @@ mod tests {
             "read until_closed"
         );
         let request = NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
-            McpServerStdio::new("fixture", "/bin/sh").args(vec!["-c".into(), script.into()]),
+            McpServerStdio::new("fixture", "/bin/sh")
+                .args(vec!["-c".into(), script.into()])
+                .env(vec![EnvVariable::new(
+                    "ICODE_MCP_PRIVATE_TEST",
+                    "not-for-transcript",
+                )]),
         )]);
 
         let response = control.new_session(&request).await.unwrap();
@@ -729,7 +735,11 @@ mod tests {
             .unwrap(),
             std::fs::canonicalize(directory.path()).unwrap()
         );
-        assert!(store.load(&response.session_id.to_string()).is_ok());
+        let id = response.session_id.to_string();
+        assert!(store.load(&id).is_ok());
+        let transcript = std::fs::read_to_string(store.path(&id)).unwrap();
+        assert!(!transcript.contains("ICODE_MCP_PRIVATE_TEST"));
+        assert!(!transcript.contains("not-for-transcript"));
     }
 
     #[cfg(unix)]
