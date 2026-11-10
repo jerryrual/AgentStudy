@@ -32,8 +32,11 @@ impl ToolCall {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResponsesContinuation {
     pub id: String,
-    /// SHA-256 of endpoint, model and current system prompt.
+    /// SHA-256 of endpoint, model, authentication identity and system prompt.
     pub scope_sha256: String,
+    /// SHA-256 of the local message prefix sent before this response.
+    #[serde(default)]
+    pub input_sha256: String,
 }
 
 /// An assistant turn: optional text, optional reasoning and zero or more tool

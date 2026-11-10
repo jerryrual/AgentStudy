@@ -57,6 +57,7 @@ struct PreparedRequest {
     target_input: Option<u32>,
     compaction_triggered: bool,
     continuation_scope: Option<String>,
+    continuation_input_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -181,9 +182,14 @@ impl ModelClient {
         sink: &dyn EventSink,
     ) -> Result<Completion> {
         let prepared = self.prepare_request(messages, tools, false)?;
-        self.complete_body(&prepared.body, sink, prepared.continuation_scope.as_deref())
-            .await
-            .map_err(ClientError::into_error)
+        self.complete_body(
+            &prepared.body,
+            sink,
+            prepared.continuation_scope.as_deref(),
+            prepared.continuation_input_sha256.as_deref(),
+        )
+        .await
+        .map_err(ClientError::into_error)
     }
 
     /// Complete an agent request with atomic Phase 3 persistence metadata.
@@ -219,7 +225,12 @@ impl ModelClient {
                 Ok((retry, phase_four_usage)) => {
                     sink.info("compacted the current tool history into Last Words");
                     let completion = self
-                        .complete_body(&retry.body, sink, retry.continuation_scope.as_deref())
+                        .complete_body(
+                            &retry.body,
+                            sink,
+                            retry.continuation_scope.as_deref(),
+                            retry.continuation_input_sha256.as_deref(),
+                        )
                         .await
                         .map_err(ClientError::into_error)?;
                     return Ok(PersistentCompletion {
@@ -239,7 +250,12 @@ impl ModelClient {
         }
         Self::persist_prepared_compression(messages, &prepared.compression, sink)?;
         match self
-            .complete_body(&prepared.body, sink, prepared.continuation_scope.as_deref())
+            .complete_body(
+                &prepared.body,
+                sink,
+                prepared.continuation_scope.as_deref(),
+                prepared.continuation_input_sha256.as_deref(),
+            )
             .await
         {
             Ok(completion) => Ok(PersistentCompletion {
@@ -278,6 +294,7 @@ impl ModelClient {
                                     &phase_four.body,
                                     sink,
                                     phase_four.continuation_scope.as_deref(),
+                                    phase_four.continuation_input_sha256.as_deref(),
                                 )
                                 .await
                                 .map_err(ClientError::into_error)?;
@@ -302,7 +319,12 @@ impl ModelClient {
                 sink.info("model context overflow; compacting and retrying once");
                 Self::persist_prepared_compression(messages, &retry.compression, sink)?;
                 let completion = self
-                    .complete_body(&retry.body, sink, retry.continuation_scope.as_deref())
+                    .complete_body(
+                        &retry.body,
+                        sink,
+                        retry.continuation_scope.as_deref(),
+                        retry.continuation_input_sha256.as_deref(),
+                    )
                     .await
                     .map_err(ClientError::into_error)?;
                 Ok(PersistentCompletion {
@@ -519,6 +541,7 @@ impl ModelClient {
         body: &Value,
         completion: &mut Completion,
         continuation_scope: Option<&str>,
+        continuation_input_sha256: Option<&str>,
     ) -> Result<()> {
         if self.api_style != ApiStyle::Responses {
             return Ok(());
@@ -531,6 +554,9 @@ impl ModelClient {
         let scope = continuation_scope
             .filter(|scope| !scope.is_empty())
             .ok_or_else(|| anyhow!("stored Responses request is missing local scope identity"))?;
+        let input_sha256 = continuation_input_sha256
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| anyhow!("stored Responses request is missing local history identity"))?;
         let continuation = completion
             .message
             .responses_continuation
@@ -538,6 +564,7 @@ impl ModelClient {
             .filter(|handle| !handle.id.trim().is_empty())
             .ok_or_else(|| anyhow!("stored Responses result is missing a response id"))?;
         continuation.scope_sha256 = scope.to_string();
+        continuation.input_sha256 = input_sha256.to_string();
         Ok(())
     }
 
@@ -546,9 +573,16 @@ impl ModelClient {
         body: &Value,
         sink: &dyn EventSink,
         continuation_scope: Option<&str>,
+        continuation_input_sha256: Option<&str>,
     ) -> std::result::Result<Completion, ClientError> {
-        self.complete_body_with_side_call_budget(body, sink, None, continuation_scope)
-            .await
+        self.complete_body_with_side_call_budget(
+            body,
+            sink,
+            None,
+            continuation_scope,
+            continuation_input_sha256,
+        )
+        .await
     }
 
     async fn complete_body_with_side_call_budget(
@@ -557,6 +591,7 @@ impl ModelClient {
         sink: &dyn EventSink,
         side_call_budget: Option<(&dyn EventSink, u64)>,
         continuation_scope: Option<&str>,
+        continuation_input_sha256: Option<&str>,
     ) -> std::result::Result<Completion, ClientError> {
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
@@ -572,8 +607,13 @@ impl ModelClient {
             }
             match self.send_once(body, sink).await {
                 Ok(mut completion) => {
-                    self.finalize_responses_continuation(body, &mut completion, continuation_scope)
-                        .map_err(ClientError::Fatal)?;
+                    self.finalize_responses_continuation(
+                        body,
+                        &mut completion,
+                        continuation_scope,
+                        continuation_input_sha256,
+                    )
+                    .map_err(ClientError::Fatal)?;
                     return Ok(completion);
                 }
                 Err(error @ ClientError::ContextOverflow { .. }) => return Err(error),
@@ -638,7 +678,7 @@ impl ModelClient {
             })
             .unwrap_or_default();
         let mut hasher = Sha256::new();
-        for value in [&self.endpoint, &self.model, system] {
+        for value in [&self.endpoint, &self.model, &self.api_key, system] {
             hasher.update(value.as_bytes());
             hasher.update([0]);
         }
@@ -647,6 +687,19 @@ impl ModelClient {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    fn continuation_input_sha256(messages: &[Message]) -> Option<String> {
+        let encoded = serde_json::to_vec(messages).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(encoded);
+        Some(
+            hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
     }
 
     fn continuation_tail<'a>(&self, messages: &'a [Message]) -> Option<(&'a [Message], String)> {
@@ -660,7 +713,11 @@ impl ModelClient {
             return None;
         };
         let handle = message.responses_continuation.as_ref()?;
-        if handle.id.trim().is_empty() || handle.scope_sha256 != self.continuation_scope(messages) {
+        if handle.id.trim().is_empty()
+            || handle.scope_sha256 != self.continuation_scope(messages)
+            || handle.input_sha256.is_empty()
+            || handle.input_sha256 != Self::continuation_input_sha256(&messages[..index])?
+        {
             return None;
         }
         let tail = &messages[index + 1..];
@@ -799,6 +856,10 @@ impl ModelClient {
             continuation_scope: self
                 .responses_stored_continuation
                 .then(|| self.continuation_scope(prepared_messages.as_ref())),
+            continuation_input_sha256: self
+                .responses_stored_continuation
+                .then(|| Self::continuation_input_sha256(messages))
+                .flatten(),
         })
     }
 
@@ -889,6 +950,7 @@ impl ModelClient {
                     &body,
                     &crate::agent::NullSink,
                     Some((usage_sink, estimated_input)),
+                    None,
                     None,
                 )
                 .await

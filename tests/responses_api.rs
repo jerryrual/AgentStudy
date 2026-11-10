@@ -779,12 +779,20 @@ async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
     );
     messages.push(Message::assistant(second.message));
     messages.push(Message::user("third"));
-    messages[0] = Message::system("prompt B");
+    messages[1] = Message::user("changed first");
 
-    client.complete(&messages, &[], &sink).await.unwrap();
+    let third = client.complete(&messages, &[], &sink).await.unwrap();
+    messages.push(Message::assistant(third.message));
+    messages.push(Message::user("fourth"));
+    profile.api_key = "other-project-key".to_string();
+    ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(&messages, &[], &sink)
+        .await
+        .unwrap();
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0]["store"], true);
     assert!(requests[0].get("previous_response_id").is_none());
     assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
@@ -793,8 +801,10 @@ async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
     assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
     assert_eq!(requests[1]["input"][0]["content"][0]["text"], "second");
     assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(requests[2]["input"].as_array().unwrap().len(), 6);
+    assert!(requests[3].get("previous_response_id").is_none());
     assert_eq!(
-        requests[2]["input"].as_array().unwrap().len(),
+        requests[3]["input"].as_array().unwrap().len(),
         messages.len()
     );
 }

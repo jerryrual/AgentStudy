@@ -90,9 +90,9 @@ Responses profile 可设置 `"responses_web_search": true`，让 provider 在普
 `web_search`；该搜索不经过本地工具审批或网络策略，其 native call 会随会话持久化并在无状态请求中回放。
 Phase 4 Last Words side-call 始终不暴露该工具。还可显式设置
 `"responses_stored_continuation": true`：普通 Responses 结果会由 provider 远端存储，Rust 会把不透明
-response id 与 endpoint、model、当前 system prompt 的 SHA-256 scope 一起绑定到 assistant 会话记录；scope
-未变化且没有本地裁剪/投影时，下一次请求只发送新增后缀并携带 `previous_response_id`，否则完整回放并建立
-新锚点。该选项默认关闭；启用后数据受 provider 的远端保留策略约束，删除本地会话不会删除远端 response，
+response id 与 endpoint、model、认证身份、当前 system prompt 的 SHA-256 scope 及本地输入前缀摘要一起绑定到
+assistant 会话记录；scope 与前缀均未变化且没有本地裁剪/投影时，下一次请求只发送新增后缀并携带
+`previous_response_id`，否则完整回放并建立新锚点。该选项默认关闭；启用后数据受 provider 的远端保留策略约束，删除本地会话不会删除远端 response，
 过期或被 provider 拒绝的 response id 会显式报错。Last Words 始终 `store: false`，不会加入远端续传链。
 当请求输入估算达到或超过由模型配置派生的触发阈值时，当前 Rust 实现会在仅供该次请求使用的投影中执行
 分阶段裁剪：Phase 1 按从旧到新的顺序，将已完成旧轮次的工具结果替换为确定性摘要；仅当输入

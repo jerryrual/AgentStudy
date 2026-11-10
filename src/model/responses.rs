@@ -391,6 +391,7 @@ impl ResponsesAccumulator {
                     Box::new(ResponsesContinuation {
                         id,
                         scope_sha256: String::new(),
+                        input_sha256: String::new(),
                     })
                 }),
             },
