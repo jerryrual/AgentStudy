@@ -368,6 +368,7 @@ impl StreamableHttpJsonRpc {
     pub(crate) fn new(spec: HttpServerSpec) -> Result<Self, TransportError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(TransportError::Http)?;
@@ -409,17 +410,18 @@ impl StreamableHttpJsonRpc {
             .map(str::to_owned)
             .ok_or(TransportError::InvalidContentType)?;
         let body = bounded_http_body(response).await?;
-        let mut messages = if content_type.eq_ignore_ascii_case("application/json") {
+        let messages = if content_type.eq_ignore_ascii_case("application/json") {
             vec![decode_http_json(&body)?]
         } else if content_type.eq_ignore_ascii_case("text/event-stream") {
             decode_http_sse(&body)?
         } else {
             return Err(TransportError::InvalidContentType);
         };
-        let message = match messages.len() {
-            0 => return Err(TransportError::MissingResponse),
-            1 => messages.pop().expect("one response"),
-            _ => return Err(TransportError::MultipleResponses),
+        let mut messages = messages.into_iter();
+        let message = match (messages.next(), messages.next()) {
+            (None, _) => return Err(TransportError::MissingResponse),
+            (Some(message), None) => message,
+            (Some(_), Some(_)) => return Err(TransportError::MultipleResponses),
         };
         let response_object = message.as_object().ok_or(TransportError::InvalidEnvelope)?;
         if response_object.contains_key("method") || response_object.get("id") != Some(&expected_id)
