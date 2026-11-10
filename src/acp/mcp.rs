@@ -273,6 +273,7 @@ pub(crate) enum TransportError {
     InvalidSessionId,
     MissingResponse,
     MultipleResponses,
+    UnexpectedServerRequest,
 }
 
 impl std::fmt::Display for TransportError {
@@ -292,6 +293,9 @@ impl std::fmt::Display for TransportError {
             Self::MultipleResponses => {
                 formatter.write_str("MCP HTTP response contained multiple messages")
             }
+            Self::UnexpectedServerRequest => {
+                formatter.write_str("MCP HTTP server requests are not supported")
+            }
         }
     }
 }
@@ -310,7 +314,8 @@ impl std::error::Error for TransportError {
             | Self::InvalidContentType
             | Self::InvalidSessionId
             | Self::MissingResponse
-            | Self::MultipleResponses => None,
+            | Self::MultipleResponses
+            | Self::UnexpectedServerRequest => None,
         }
     }
 }
@@ -409,19 +414,12 @@ impl StreamableHttpJsonRpc {
             .map(str::trim)
             .map(str::to_owned)
             .ok_or(TransportError::InvalidContentType)?;
-        let body = bounded_http_body(response).await?;
-        let messages = if content_type.eq_ignore_ascii_case("application/json") {
-            vec![decode_http_json(&body)?]
+        let message = if content_type.eq_ignore_ascii_case("application/json") {
+            decode_http_json(&bounded_http_body(response).await?)?
         } else if content_type.eq_ignore_ascii_case("text/event-stream") {
-            decode_http_sse(&body)?
+            receive_http_sse(response, &expected_id).await?
         } else {
             return Err(TransportError::InvalidContentType);
-        };
-        let mut messages = messages.into_iter();
-        let message = match (messages.next(), messages.next()) {
-            (None, _) => return Err(TransportError::MissingResponse),
-            (Some(message), None) => message,
-            (Some(_), Some(_)) => return Err(TransportError::MultipleResponses),
         };
         let response_object = message.as_object().ok_or(TransportError::InvalidEnvelope)?;
         if response_object.contains_key("method") || response_object.get("id") != Some(&expected_id)
@@ -534,34 +532,108 @@ fn decode_http_json(body: &[u8]) -> Result<Value, TransportError> {
     Ok(message)
 }
 
-fn decode_http_sse(body: &[u8]) -> Result<Vec<Value>, TransportError> {
-    let text = std::str::from_utf8(body).map_err(|_| TransportError::InvalidEnvelope)?;
-    let mut messages = Vec::new();
-    let mut data = String::new();
-    for raw_line in text.split_inclusive('\n') {
-        let without_lf = raw_line.strip_suffix('\n').unwrap_or(raw_line);
-        let line = without_lf.strip_suffix('\r').unwrap_or(without_lf);
-        if line.is_empty() {
-            if !data.is_empty() {
-                messages.push(decode_http_json(data.as_bytes())?);
-                data.clear();
+#[derive(Default)]
+struct HttpSseDecoder {
+    buffer: Vec<u8>,
+    data: String,
+    total_bytes: usize,
+}
+
+impl HttpSseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Value>, TransportError> {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        if self.total_bytes > MAX_MESSAGE_BYTES {
+            return Err(TransportError::Oversized);
+        }
+        self.buffer.extend_from_slice(bytes);
+        let mut messages = Vec::new();
+        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buffer.drain(..=position).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
             }
-            continue;
+            self.consume_line(&line, &mut messages)?;
+        }
+        Ok(messages)
+    }
+
+    fn finish(&mut self) -> Result<Vec<Value>, TransportError> {
+        let mut messages = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            self.consume_line(&line, &mut messages)?;
+        }
+        self.flush_data(&mut messages)?;
+        Ok(messages)
+    }
+
+    fn consume_line(
+        &mut self,
+        line: &[u8],
+        messages: &mut Vec<Value>,
+    ) -> Result<(), TransportError> {
+        let line = std::str::from_utf8(line).map_err(|_| TransportError::InvalidEnvelope)?;
+        if line.is_empty() {
+            return self.flush_data(messages);
         }
         if line.starts_with(':') {
-            continue;
+            return Ok(());
         }
         if let Some(value) = line.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
+            if !self.data.is_empty() {
+                self.data.push('\n');
             }
-            data.push_str(value.strip_prefix(' ').unwrap_or(value));
+            self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
+        }
+        Ok(())
+    }
+
+    fn flush_data(&mut self, messages: &mut Vec<Value>) -> Result<(), TransportError> {
+        if !self.data.is_empty() {
+            messages.push(decode_http_json(self.data.as_bytes())?);
+            self.data.clear();
+        }
+        Ok(())
+    }
+}
+
+async fn receive_http_sse(
+    response: reqwest::Response,
+    expected_id: &Value,
+) -> Result<Value, TransportError> {
+    let mut stream = response.bytes_stream();
+    let mut decoder = HttpSseDecoder::default();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| TransportError::Http(error.without_url()))?;
+        if let Some(message) = select_http_sse_response(decoder.push(&chunk)?, expected_id)? {
+            return Ok(message);
         }
     }
-    if !data.is_empty() {
-        messages.push(decode_http_json(data.as_bytes())?);
+    if let Some(message) = select_http_sse_response(decoder.finish()?, expected_id)? {
+        return Ok(message);
     }
-    Ok(messages)
+    Err(TransportError::MissingResponse)
+}
+
+fn select_http_sse_response(
+    messages: Vec<Value>,
+    expected_id: &Value,
+) -> Result<Option<Value>, TransportError> {
+    for message in messages {
+        let object = message.as_object().ok_or(TransportError::InvalidEnvelope)?;
+        if object.contains_key("method") {
+            if object.contains_key("id") {
+                return Err(TransportError::UnexpectedServerRequest);
+            }
+            continue;
+        }
+        if object.get("id") != Some(expected_id) {
+            return Err(TransportError::InvalidEnvelope);
+        }
+        return Ok(Some(message));
+    }
+    Ok(None)
 }
 
 fn encode_frame(message: &Value) -> Result<Vec<u8>, TransportError> {
@@ -1431,11 +1503,25 @@ mod tests {
 
     #[test]
     fn streamable_http_preserves_multiple_messages_and_rejects_session_rotation() {
-        let messages = decode_http_sse(
-            b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notice\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
-        )
-        .unwrap();
-        assert_eq!(messages.len(), 2);
+        let mut decoder = HttpSseDecoder::default();
+        let messages = decoder
+            .push(
+                b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notice\"}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            )
+            .unwrap();
+        let response = select_http_sse_response(messages, &serde_json::json!(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["result"], serde_json::json!({}));
+        assert!(matches!(
+            select_http_sse_response(
+                vec![serde_json::json!({
+                    "jsonrpc": "2.0", "id": "server-1", "method": "sampling/createMessage"
+                })],
+                &serde_json::json!(1),
+            ),
+            Err(TransportError::UnexpectedServerRequest)
+        ));
 
         let spec = http_spec(&McpServerHttp::new("remote", "https://example.invalid/mcp")).unwrap();
         let mut transport = StreamableHttpJsonRpc::new(spec).unwrap();
@@ -1559,6 +1645,46 @@ mod tests {
             assert!(lower.contains("mcp-session-id: session-1"));
             assert!(lower.contains("mcp-protocol-version: 2025-06-18"));
         }
+    }
+
+    #[tokio::test]
+    async fn streamable_http_stops_after_matching_sse_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (close_sender, close_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let body = concat!(
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+                "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[]}}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = close_receiver.await;
+        });
+        let spec = http_spec(&McpServerHttp::new(
+            "remote",
+            format!("http://{address}/mcp"),
+        ))
+        .unwrap();
+        let mut transport = StreamableHttpJsonRpc::new(spec).unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.request(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}
+            })),
+        )
+        .await
+        .expect("matching SSE response should not wait for EOF")
+        .unwrap();
+        assert_eq!(response["result"]["tools"], serde_json::json!([]));
+        let _ = close_sender.send(());
+        server.await.unwrap();
     }
 
     #[cfg(unix)]
