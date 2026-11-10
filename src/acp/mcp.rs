@@ -5,20 +5,20 @@
 )]
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::v1::schema::McpServer;
-use anyhow::bail;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-use crate::tools::{truncate_output, Tool, ToolContext};
+use crate::tools::{truncate_output, Tool, ToolContext, ToolRegistry};
 
 const MAX_SERVERS: usize = 32;
 const MAX_ARGS: usize = 256;
@@ -28,6 +28,7 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_DISCOVERED_TOOLS: usize = 1024;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StdioServerSpec {
@@ -115,10 +116,20 @@ pub(crate) struct StdioServerProcess {
 
 impl StdioServerProcess {
     pub(crate) fn spawn(spec: &StdioServerSpec) -> std::io::Result<Self> {
+        Self::spawn_with_cwd(spec, None)
+    }
+
+    fn spawn_in(spec: &StdioServerSpec, cwd: &Path) -> std::io::Result<Self> {
+        Self::spawn_with_cwd(spec, Some(cwd))
+    }
+
+    fn spawn_with_cwd(spec: &StdioServerSpec, cwd: Option<&Path>) -> std::io::Result<Self> {
         let mut command = Command::new(&spec.command);
+        command.args(&spec.args).envs(spec.env.iter().cloned());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         command
-            .args(&spec.args)
-            .envs(spec.env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -790,6 +801,62 @@ impl std::error::Error for ToolCallError {
     }
 }
 
+async fn bounded_blocking<T, F>(timeout: Duration, operation: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
+        .await
+        .context("blocking operation timed out")?
+        .context("blocking operation task failed")
+}
+
+pub(crate) async fn start_tool_registry(
+    specs: &[StdioServerSpec],
+    cwd: &Path,
+) -> anyhow::Result<Arc<ToolRegistry>> {
+    start_tool_registry_with_timeout(specs, cwd, STARTUP_TIMEOUT).await
+}
+
+async fn start_tool_registry_with_timeout(
+    specs: &[StdioServerSpec],
+    cwd: &Path,
+    startup_timeout: Duration,
+) -> anyhow::Result<Arc<ToolRegistry>> {
+    let mut adapters = Vec::new();
+    for (server_index, spec) in specs.iter().enumerate() {
+        let started = tokio::time::Instant::now();
+        let owned_spec = spec.clone();
+        let owned_cwd = cwd.to_path_buf();
+        let mut process = bounded_blocking(startup_timeout, move || {
+            StdioServerProcess::spawn_in(&owned_spec, &owned_cwd)
+        })
+        .await
+        .with_context(|| format!("MCP server {:?} process spawn timed out", spec.name))?
+        .with_context(|| format!("failed to start MCP server {:?}", spec.name))?;
+        let remaining = startup_timeout.saturating_sub(started.elapsed());
+        let mut client = StdioMcpClient::from_process(&mut process)
+            .with_context(|| format!("failed to connect MCP server {:?}", spec.name))?;
+        let tools = tokio::time::timeout(remaining, async {
+            client
+                .initialize()
+                .await
+                .with_context(|| format!("failed to initialize MCP server {:?}", spec.name))?;
+            client
+                .list_tools()
+                .await
+                .with_context(|| format!("failed to discover MCP server {:?}", spec.name))
+        })
+        .await
+        .with_context(|| format!("MCP server {:?} startup timed out", spec.name))??;
+        adapters.extend(tool_adapters(server_index, process, client, tools));
+    }
+    ToolRegistry::builtin_with(adapters)
+        .map(Arc::new)
+        .context("failed to compose MCP tool registry")
+}
+
 pub(crate) struct McpServerHandle {
     client: Mutex<StdioMcpClient>,
     _process: StdioServerProcess,
@@ -922,6 +989,8 @@ fn render_tool_result(result: ToolCallResult) -> serde_json::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use agent_client_protocol::v1::schema::{EnvVariable, McpServerHttp, McpServerStdio};
 
     use crate::interaction::NoAsker;
@@ -1600,6 +1669,51 @@ mod tests {
                 "_meta": {"source": "fixture"}
             })
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_blocking_operation_drops_its_late_output() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let late_drop = Arc::clone(&dropped);
+        assert!(bounded_blocking(Duration::from_millis(10), move || {
+            std::thread::sleep(Duration::from_millis(50));
+            DropProbe(late_drop)
+        })
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late blocking output must be dropped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aggregate_mcp_startup_times_out_a_silent_server() {
+        let specs = vec![StdioServerSpec {
+            name: "silent".into(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "read initialize; sleep 10".into()],
+            env: Vec::new(),
+        }];
+
+        let error =
+            start_tool_registry_with_timeout(&specs, Path::new("/"), Duration::from_millis(25))
+                .await
+                .err()
+                .expect("silent MCP server must time out");
+        assert!(error.to_string().contains("silent"));
+        assert!(error.to_string().contains("timed out"));
     }
 
     #[test]

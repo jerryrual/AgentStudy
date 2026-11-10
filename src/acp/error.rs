@@ -12,6 +12,7 @@ use anyhow::Error;
 pub(crate) enum InvalidSessionRequest {
     AdditionalDirectories,
     McpServers,
+    InvalidMcpServers,
     CwdNotAbsolute,
     CwdNotUtf8,
     CwdContainsNul,
@@ -29,7 +30,8 @@ impl InvalidSessionRequest {
     fn message(self) -> &'static str {
         match self {
             Self::AdditionalDirectories => "additional workspace roots are not supported",
-            Self::McpServers => "MCP servers are not supported",
+            Self::McpServers => "MCP servers are not supported for loaded sessions",
+            Self::InvalidMcpServers => "invalid MCP server configuration",
             Self::CwdNotAbsolute => "cwd must be absolute",
             Self::CwdNotUtf8 => "cwd must be valid UTF-8",
             Self::CwdContainsNul => "cwd must not contain NUL",
@@ -121,7 +123,11 @@ mod tests {
             ),
             (
                 InvalidSessionRequest::McpServers,
-                "MCP servers are not supported",
+                "MCP servers are not supported for loaded sessions",
+            ),
+            (
+                InvalidSessionRequest::InvalidMcpServers,
+                "invalid MCP server configuration",
             ),
             (
                 InvalidSessionRequest::CwdNotAbsolute,

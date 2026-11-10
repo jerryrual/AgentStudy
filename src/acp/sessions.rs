@@ -13,6 +13,7 @@ use anyhow::{ensure, Result};
 use tokio::sync::watch;
 
 use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
+use crate::tools::ToolRegistry;
 
 use super::approval::{new_policy, ApprovalPolicy};
 use super::history_replay::replay_updates;
@@ -81,7 +82,17 @@ struct RegisteredSession {
     _run_lease: SessionRunLease,
     ready: AtomicBool,
     approval_policy: ApprovalPolicy,
+    tools: Arc<ToolRegistry>,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// A newly persisted session that is removed unless registered and committed.
+pub(crate) struct PreparedCreate {
+    store: SessionStore,
+    session_id: String,
+    session: Option<Session>,
+    run_lease: Option<SessionRunLease>,
+    committed: bool,
 }
 
 /// A validated load whose replay is complete but whose session is not exposed.
@@ -120,12 +131,57 @@ impl SessionRegistry {
         }
     }
 
+    /// Clone the persistent store without retaining this registry.
+    pub(crate) fn store(&self) -> SessionStore {
+        self.store.clone()
+    }
+
+    /// Persist and lease a session that rolls back unless committed.
+    pub(crate) fn prepare_create(
+        store: SessionStore,
+        cwd: &str,
+        model: &str,
+        agent: &str,
+    ) -> Result<PreparedCreate> {
+        let session = store.create(cwd, model, agent)?;
+        let session_id = session.id().to_string();
+        let mut prepared = PreparedCreate {
+            store,
+            session_id,
+            session: Some(session),
+            run_lease: None,
+            committed: false,
+        };
+        prepared.run_lease = Some(prepared.store.try_acquire_run_lease(&prepared.session_id)?);
+        Ok(prepared)
+    }
+
+    /// Register a prepared session and disable its persistence rollback.
+    pub(crate) fn commit_create(
+        &self,
+        mut prepared: PreparedCreate,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<SessionId> {
+        let session = prepared.session.take().expect("prepared session missing");
+        let run_lease = prepared
+            .run_lease
+            .take()
+            .expect("prepared session run lease missing");
+        let (session_id, _) = self.register(session, run_lease, true, tools)?;
+        prepared.committed = true;
+        Ok(session_id)
+    }
+
     /// Create and exclusively own a persistent session until this registry drops.
-    pub(crate) fn create(&self, cwd: &str, model: &str, agent: &str) -> Result<SessionId> {
-        let session = self.store.create(cwd, model, agent)?;
-        let run_lease = self.store.try_acquire_run_lease(session.id())?;
-        self.register(session, run_lease, true)
-            .map(|(session_id, _)| session_id)
+    pub(crate) fn create(
+        &self,
+        cwd: &str,
+        model: &str,
+        agent: &str,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<SessionId> {
+        let prepared = Self::prepare_create(self.store.clone(), cwd, model, agent)?;
+        self.commit_create(prepared, tools)
     }
 
     /// Validate and project a persisted session while holding its run lease.
@@ -184,6 +240,7 @@ impl SessionRegistry {
         session: Session,
         run_lease: SessionRunLease,
         ready: bool,
+        tools: Arc<ToolRegistry>,
     ) -> Result<(SessionId, Arc<RegisteredSession>)> {
         let session_id = SessionId::new(session.id());
         let mut sessions = lock(&self.sessions);
@@ -196,6 +253,7 @@ impl SessionRegistry {
             _run_lease: run_lease,
             ready: AtomicBool::new(ready),
             approval_policy: new_policy(),
+            tools,
             active_prompt: Mutex::new(None),
         });
         sessions.insert(session_id.clone(), Arc::clone(&registered));
@@ -261,6 +319,25 @@ impl SessionRegistry {
     }
 }
 
+impl Drop for PreparedCreate {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.run_lease.take();
+        self.session.take();
+        let _ = std::fs::remove_file(self.store.path(&self.session_id));
+        let _ = std::fs::remove_file(
+            self.store
+                .root()
+                .join(format!("{}.run.lock", self.session_id)),
+        );
+        if let Ok(archive_root) = self.store.archive_root(&self.session_id) {
+            let _ = std::fs::remove_dir(archive_root);
+        }
+    }
+}
+
 impl PreparedLoad {
     /// Return the stable ACP session ID that will be registered on activation.
     pub(crate) fn session_id(&self) -> SessionId {
@@ -281,7 +358,7 @@ impl PreparedLoad {
             updates: _,
         } = self;
         let (session_id, registered) = registry
-            .register(session, run_lease, false)
+            .register(session, run_lease, false, Arc::new(ToolRegistry::builtin()))
             .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
@@ -340,6 +417,10 @@ impl PromptGuard {
         Arc::clone(&self.registered.approval_policy)
     }
 
+    pub(crate) fn tools(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.registered.tools)
+    }
+
     /// Wait until the matching session receives a cancellation request.
     pub(crate) async fn cancelled(&mut self) {
         let _ = self.cancellation.wait_for(|cancelled| *cancelled).await;
@@ -379,7 +460,14 @@ mod tests {
     fn creates_a_persistent_session_with_the_same_acp_id() {
         let (_directory, store, registry) = registry();
 
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let id = session_id.to_string();
         let loaded = store.load(&id).unwrap();
 
@@ -392,9 +480,33 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_prepared_create_removes_persistence_and_lease_files() {
+        let (_directory, store, _registry) = registry();
+        let prepared =
+            SessionRegistry::prepare_create(store.clone(), "/workspace", "model-a", "build")
+                .unwrap();
+        let id = prepared.session_id.clone();
+        assert!(store.path(&id).exists());
+        assert!(store.root().join(format!("{id}.run.lock")).exists());
+
+        drop(prepared);
+
+        assert!(!store.path(&id).exists());
+        assert!(!store.root().join(format!("{id}.run.lock")).exists());
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
     fn holds_the_cross_process_run_lease_for_the_registered_lifetime() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let id = session_id.to_string();
 
         let error = store.try_acquire_run_lease(&id).unwrap_err();
@@ -464,15 +576,21 @@ mod tests {
     #[test]
     fn close_refuses_an_active_prompt_then_releases_the_idle_run_lease() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let tools = Arc::new(ToolRegistry::builtin());
+        let session_id = registry
+            .create("/workspace", "model-a", "build", Arc::clone(&tools))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&tools), 2);
         let id = session_id.to_string();
         let guard = registry.begin_prompt(&session_id).unwrap();
 
         assert!(!registry.close(&session_id));
+        assert_eq!(Arc::strong_count(&tools), 2);
         assert!(store.try_acquire_run_lease(&id).is_err());
 
         drop(guard);
         assert!(registry.close(&session_id));
+        assert_eq!(Arc::strong_count(&tools), 1);
         store.try_acquire_run_lease(&id).unwrap();
         assert!(!registry.close(&session_id));
     }
@@ -481,7 +599,14 @@ mod tests {
     fn concurrent_prompt_admission_has_exactly_one_winner() {
         let (_directory, _store, registry) = registry();
         let registry = Arc::new(registry);
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let mut attempts = Vec::new();
         for _ in 0..2 {
@@ -507,7 +632,14 @@ mod tests {
     #[tokio::test]
     async fn cancellation_wakes_the_prompt_but_keeps_the_slot_busy_until_drop() {
         let (_directory, _store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let mut guard = registry.begin_prompt(&session_id).unwrap();
         let (ready_tx, ready_rx) = oneshot::channel();
         let waiter = tokio::spawn(async move {
@@ -540,7 +672,14 @@ mod tests {
     #[test]
     fn detached_prompt_ownership_keeps_run_lease_until_worker_finishes() {
         let (_directory, store, registry) = registry();
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         let guard = registry.begin_prompt(&session_id).unwrap();
         let ownership = guard.ownership();
 
@@ -566,7 +705,14 @@ mod tests {
         ));
         assert!(!registry.cancel(&unknown));
 
-        let session_id = registry.create("/workspace", "model-a", "build").unwrap();
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "build",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
         assert!(!registry.cancel(&session_id));
         let guard = registry.begin_prompt(&session_id).unwrap();
         drop(guard);

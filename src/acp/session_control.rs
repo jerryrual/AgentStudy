@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::error::{ControlError, ControlResult, InvalidSessionRequest};
+use super::mcp;
 use super::sessions::{BeginPromptError, LoadError, PreparedLoad, PromptGuard, SessionRegistry};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
@@ -55,7 +56,7 @@ impl SessionControl {
     }
 
     /// Validate all setup fields before creating any durable session state.
-    pub(crate) fn new_session(
+    pub(crate) async fn new_session(
         &self,
         request: &NewSessionRequest,
     ) -> ControlResult<NewSessionResponse> {
@@ -64,13 +65,29 @@ impl SessionControl {
                 InvalidSessionRequest::AdditionalDirectories,
             ));
         }
-        if !request.mcp_servers.is_empty() {
-            return Err(ControlError::invalid(InvalidSessionRequest::McpServers));
-        }
-        let cwd = validated_cwd(&request.cwd)?;
+        let requested_cwd = request.cwd.clone();
+        let cwd = tokio::task::spawn_blocking(move || {
+            validated_cwd(&requested_cwd).map(|cwd| cwd.to_string())
+        })
+        .await
+        .map_err(ControlError::internal)??;
+        let specs = mcp::stdio_specs(&request.mcp_servers)
+            .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
+        let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
+            .await
+            .map_err(ControlError::internal)?;
+        let store = self.sessions.store();
+        let model = self.model.clone();
+        let agent = self.agent.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            SessionRegistry::prepare_create(store, &cwd, &model, &agent)
+        })
+        .await
+        .map_err(ControlError::internal)?
+        .map_err(ControlError::internal)?;
         let session_id = self
             .sessions
-            .create(cwd, &self.model, &self.agent)
+            .commit_create(prepared, tools)
             .map_err(ControlError::internal)?;
         Ok(NewSessionResponse::new(session_id))
     }
@@ -220,11 +237,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_session_validates_then_persists_the_requested_cwd_and_defaults() {
+    #[tokio::test]
+    async fn new_session_validates_then_persists_the_requested_cwd_and_defaults() {
         let (directory, store, control) = control();
         let response = control
             .new_session(&NewSessionRequest::new(directory.path()))
+            .await
             .unwrap();
         let loaded = store.load(&response.session_id.to_string()).unwrap();
 
@@ -233,8 +251,8 @@ mod tests {
         assert_eq!(loaded.meta.agent, "build");
     }
 
-    #[test]
-    fn rejected_setup_requests_create_no_persistent_session() {
+    #[tokio::test]
+    async fn rejected_setup_requests_create_no_persistent_session() {
         let (directory, store, control) = control();
         let file = directory.path().join("file.txt");
         std::fs::write(&file, "not a directory").unwrap();
@@ -257,22 +275,23 @@ mod tests {
                 InvalidSessionRequest::AdditionalDirectories,
             ),
             (
-                NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
-                    McpServerStdio::new("tools", "/bin/echo"),
-                )]),
-                InvalidSessionRequest::McpServers,
+                NewSessionRequest::new(directory.path())
+                    .mcp_servers(vec![McpServer::Stdio(McpServerStdio::new("", "/bin/echo"))]),
+                InvalidSessionRequest::InvalidMcpServers,
             ),
         ];
 
         for (request, reason) in cases {
             assert!(matches!(
-                control.new_session(&request),
+                control.new_session(&request).await,
                 Err(ControlError::Invalid(actual)) if actual == reason
             ));
         }
         #[cfg(unix)]
         assert!(matches!(
-            control.new_session(&NewSessionRequest::new(file.join("child"))),
+            control
+                .new_session(&NewSessionRequest::new(file.join("child")))
+                .await,
             Err(ControlError::Invalid(
                 InvalidSessionRequest::CwdNotDirectory
             ))
@@ -298,6 +317,15 @@ mod tests {
     #[test]
     fn load_classifies_client_identity_and_lease_failures() {
         let (directory, store, control) = control();
+        let unsupported_mcp =
+            LoadSessionRequest::new(SessionId::new("not-opened"), directory.path()).mcp_servers(
+                vec![McpServer::Stdio(McpServerStdio::new("tools", "/bin/echo"))],
+            );
+        assert!(matches!(
+            control.prepare_load(&unsupported_mcp),
+            Err(ControlError::Invalid(InvalidSessionRequest::McpServers))
+        ));
+
         let invalid_id = SessionId::new("../outside");
         let invalid = LoadSessionRequest::new(invalid_id, directory.path());
         assert!(matches!(
@@ -553,11 +581,61 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_session_starts_mcp_tools_before_persisting() {
+        let (directory, store, control) = control();
+        let script = concat!(
+            "pwd > mcp-cwd.txt; ",
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read list; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}'; ",
+            "read until_closed"
+        );
+        let request = NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
+            McpServerStdio::new("fixture", "/bin/sh").args(vec!["-c".into(), script.into()]),
+        )]);
+
+        let response = control.new_session(&request).await.unwrap();
+        let guard = control.begin_prompt(&response.session_id).unwrap();
+        assert!(guard.tools().get("read_file").is_some());
+        assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
+        assert_eq!(
+            std::fs::canonicalize(
+                std::fs::read_to_string(directory.path().join("mcp-cwd.txt"))
+                    .unwrap()
+                    .trim()
+            )
+            .unwrap(),
+            std::fs::canonicalize(directory.path()).unwrap()
+        );
+        assert!(store.load(&response.session_id.to_string()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_mcp_startup_creates_no_persistent_session() {
+        let (directory, store, control) = control();
+        let request = NewSessionRequest::new(directory.path()).mcp_servers(vec![McpServer::Stdio(
+            McpServerStdio::new("broken", "/bin/sh")
+                .args(vec!["-c".into(), "read initialize; exit 1".into()]),
+        )]);
+
+        assert!(matches!(
+            control.new_session(&request).await,
+            Err(ControlError::Internal(_))
+        ));
+        assert!(store.list().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn cancel_only_signals_the_matching_active_prompt() {
         let (directory, _store, control) = control();
         let response = control
             .new_session(&NewSessionRequest::new(directory.path()))
+            .await
             .unwrap();
         let unknown = CancelNotification::new(SessionId::new("unknown"));
         assert!(!control.cancel(&unknown));
