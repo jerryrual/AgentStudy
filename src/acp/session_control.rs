@@ -65,7 +65,12 @@ impl SessionControl {
                 InvalidSessionRequest::AdditionalDirectories,
             ));
         }
-        let cwd = validated_cwd(&request.cwd)?.to_string();
+        let requested_cwd = request.cwd.clone();
+        let cwd = tokio::task::spawn_blocking(move || {
+            validated_cwd(&requested_cwd).map(|cwd| cwd.to_string())
+        })
+        .await
+        .map_err(ControlError::internal)??;
         let specs = mcp::stdio_specs(&request.mcp_servers)
             .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
         let tools = mcp::start_tool_registry(&specs)
