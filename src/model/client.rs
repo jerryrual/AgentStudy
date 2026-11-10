@@ -35,6 +35,7 @@ pub struct ModelClient {
     http: HttpClient,
     api_style: ApiStyle,
     include_encrypted_reasoning: bool,
+    responses_web_search: bool,
     endpoint: String,
     api_key: String,
     model: String,
@@ -111,6 +112,7 @@ impl ModelClient {
             api_style: profile.api_style,
             include_encrypted_reasoning: profile.api_style == ApiStyle::Responses
                 && profile.provider.eq_ignore_ascii_case("openai"),
+            responses_web_search: profile.responses_web_search,
             endpoint,
             api_key,
             model: profile.model.clone(),
@@ -657,7 +659,10 @@ impl ModelClient {
                 self.stream,
                 self.temperature,
                 self.max_tokens,
-                self.include_encrypted_reasoning,
+                super::responses::RequestFeatures {
+                    include_encrypted_reasoning: self.include_encrypted_reasoning,
+                    web_search: self.responses_web_search,
+                },
             )
         } else {
             let api_messages: Vec<Value> = prepared_messages.iter().map(Message::to_api).collect();
@@ -693,6 +698,15 @@ impl ModelClient {
 
     /// Conservatively estimate the semantic history and tools sent by this API style.
     fn estimated_request_tokens(&self, messages: &[Message], tools: &[ToolDef]) -> u32 {
+        self.estimated_request_tokens_with_hosted(messages, tools, true)
+    }
+
+    fn estimated_request_tokens_with_hosted(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        allow_hosted_tools: bool,
+    ) -> u32 {
         let semantic_messages: Vec<Value> = messages
             .iter()
             .map(|message| match message {
@@ -708,7 +722,11 @@ impl ModelClient {
                 _ => message.to_api(),
             })
             .collect();
-        let semantic_tools: Vec<Value> = tools.iter().map(ToolDef::to_api).collect();
+        let mut semantic_tools: Vec<Value> = tools.iter().map(ToolDef::to_api).collect();
+        if allow_hosted_tools && self.api_style == ApiStyle::Responses && self.responses_web_search
+        {
+            semantic_tools.push(json!({"type": "web_search"}));
+        }
         crate::context_budget::estimate_json_tokens(&json!({
             "messages": semantic_messages,
             "tools": semantic_tools,
@@ -755,7 +773,8 @@ impl ModelClient {
         )));
         let mut usage = Usage::default();
         for attempt in 0..LAST_WORDS_GENERATION_ATTEMPTS {
-            let estimated_input = u64::from(self.estimated_request_tokens(&request, &[]));
+            let estimated_input =
+                u64::from(self.estimated_request_tokens_with_hosted(&request, &[], false));
             let body = self
                 .last_words_request_body(&request)
                 .map_err(|error| PhaseFourPrepareError::skipped(error, usage))?;
@@ -811,7 +830,7 @@ impl ModelClient {
             .max_tokens
             .unwrap_or(self.last_words_max_output_tokens)
             .min(self.last_words_max_output_tokens);
-        let estimated_input = self.estimated_request_tokens(messages, &[]);
+        let estimated_input = self.estimated_request_tokens_with_hosted(messages, &[], false);
         let mut body = if self.api_style == ApiStyle::Responses {
             super::responses::request_body(
                 messages,
@@ -820,7 +839,7 @@ impl ModelClient {
                 false,
                 self.temperature,
                 Some(output_limit),
-                false,
+                super::responses::RequestFeatures::default(),
             )
         } else {
             let mut body = json!({

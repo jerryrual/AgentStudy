@@ -178,6 +178,7 @@ pub fn mock_profile(base_url: String) -> icode::config::ModelProfile {
         name: "mock".to_string(),
         provider: "openai".to_string(),
         api_style: icode::config::ApiStyle::Chat,
+        responses_web_search: false,
         model: "mock-model".to_string(),
         base_url,
         api_key: "test-key".to_string(),

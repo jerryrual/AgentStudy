@@ -17,6 +17,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         name: "mock-responses".to_string(),
         provider: "openai".to_string(),
         api_style: ApiStyle::Responses,
+        responses_web_search: false,
         model: "gpt-test".to_string(),
         base_url: server.base_url(),
         api_key: "test-key".to_string(),
@@ -78,6 +79,7 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
     });
     let directory = tempfile::tempdir().unwrap();
     let mut profile = responses_profile(&server, true);
+    profile.responses_web_search = true;
     profile.context_window = Some(30_000);
     profile.max_tokens = Some(3_000);
     let agent = Agent::new(
@@ -116,6 +118,14 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
     let requests = server.requests();
     assert_eq!(requests[0]["stream"], false);
     assert_eq!(requests[1]["stream"], true);
+    let ordinary_tools = requests[1]["tools"].as_array().unwrap();
+    assert!(ordinary_tools.iter().any(|tool| tool["type"] == "function"));
+    assert_eq!(
+        ordinary_tools.last().unwrap(),
+        &json!({"type": "web_search"})
+    );
+    assert_eq!(requests[1]["tool_choice"], "auto");
+    assert_eq!(requests[1]["parallel_tool_calls"], true);
     assert!(requests[1]["input"].as_array().unwrap().iter().any(|item| {
         item["content"][0]["text"]
             .as_str()
@@ -150,6 +160,8 @@ async fn responses_stream_maps_stateless_history_and_assembles_output() {
                     "additionalProperties": false
                 },
                 "strict": false
+            }, {
+                "type": "web_search"
             }])
         );
         assert_eq!(
@@ -197,14 +209,19 @@ async fn responses_stream_maps_stateless_history_and_assembles_output() {
             r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#,
             r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"London is "}"#,
             r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":1,"content_index":0,"delta":"cooler. "}"#,
-            r#"{"type":"response.output_item.added","output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":2,"delta":"{\"city\":"}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":2,"delta":"\"London\"}"}"#,
-            r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}"}}"#,
-            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"Checking current conditions. "}]},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"London is cooler. ","annotations":[]}]},{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}","status":"completed"}],"usage":{"input_tokens":31,"output_tokens":9,"total_tokens":40}}}"#,
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}"#,
+            r#"{"type":"response.web_search_call.searching","output_index":2,"item_id":"ws_1"}"#,
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"London weather"}}}"#,
+            r#"{"type":"response.output_item.added","output_index":3,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":3,"delta":"{\"city\":"}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":3,"delta":"\"London\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":3,"item":{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"Checking current conditions. "}]},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"London is cooler. ","annotations":[]}]},{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"London weather"}},{"id":"fc_1","type":"function_call","call_id":"call_weather","name":"get_weather","arguments":"{\"city\":\"London\"}","status":"completed"}],"usage":{"input_tokens":31,"output_tokens":9,"total_tokens":40}}}"#,
         ])
     });
-    let client = ModelClient::from_profile(&responses_profile(&server, true)).unwrap();
+    let mut profile = responses_profile(&server, true);
+    profile.responses_web_search = true;
+    let client = ModelClient::from_profile(&profile).unwrap();
     assert_eq!(client.endpoint(), format!("{}/v1/responses", server.url()));
     let sink = RecordingSink::default();
     let messages = vec![
@@ -245,13 +262,15 @@ async fn responses_stream_maps_stateless_history_and_assembles_output() {
             arguments: r#"{"city":"London"}"#.to_string(),
         }]
     );
-    assert_eq!(completion.message.responses_items.len(), 3);
+    assert_eq!(completion.message.responses_items.len(), 4);
     assert_eq!(completion.message.responses_items[0]["id"], "rs_1");
     assert_eq!(
         completion.message.responses_items[0]["encrypted_content"],
         "opaque"
     );
-    assert_eq!(completion.message.responses_items[2]["id"], "fc_1");
+    assert_eq!(completion.message.responses_items[2]["id"], "ws_1");
+    assert_eq!(completion.message.responses_items[2]["status"], "completed");
+    assert_eq!(completion.message.responses_items[3]["id"], "fc_1");
     assert_eq!(completion.usage.prompt_tokens, 31);
     assert_eq!(completion.usage.completion_tokens, 9);
     assert_eq!(completion.usage.total_tokens, 40);
@@ -369,6 +388,65 @@ async fn responses_stream_ignores_empty_data_events() {
 }
 
 #[tokio::test]
+async fn responses_preserves_hosted_web_search_without_local_execution() {
+    let server = MockServer::new(|_, body| {
+        assert_eq!(body["tools"], json!([{"type": "web_search"}]));
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_search",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "Rust language"}
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Rust is a systems language.", "annotations": []}]
+                    }
+                ],
+                "usage": {"input_tokens": 4, "output_tokens": 3, "total_tokens": 7}
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_web_search = true;
+    let client = ModelClient::from_profile(&profile).unwrap();
+
+    let completion = client
+        .complete(
+            &[Message::user("What is Rust?")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.message.content.as_deref(),
+        Some("Rust is a systems language.")
+    );
+    assert!(completion.message.tool_calls.is_empty());
+    assert_eq!(completion.message.responses_items.len(), 2);
+    assert_eq!(
+        completion.message.responses_items[0],
+        json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust language"}
+        })
+    );
+}
+
+#[tokio::test]
 async fn responses_rejects_unsupported_executable_output_items() {
     let server = MockServer::new(|_, _| {
         MockResponse::json(
@@ -376,7 +454,7 @@ async fn responses_rejects_unsupported_executable_output_items() {
             &json!({
                 "id": "resp_1",
                 "status": "completed",
-                "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}],
+                "output": [{"type": "mcp_call", "id": "mcp_1", "status": "completed"}],
                 "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
             })
             .to_string(),

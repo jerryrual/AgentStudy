@@ -13,7 +13,8 @@
   工作目录 / token / 会话），支持流式 Markdown 渲染、工具调用卡片与审批弹窗。
 - **模型接入**：兼容 OpenAI Chat Completions 或核心无状态 Responses API 的服务，
   支持流式 SSE、推理摘要、token 用量统计、429/5xx 自动重试和本地函数工具；Responses
-  模式支持流式/非流式文本，但不支持已存储响应续传、服务端托管工具或图片。
+  模式支持流式/非流式文本和显式 opt-in 的 provider-hosted `web_search`，但不支持已存储响应续传、
+  后台响应、其他托管工具或图片。
 - **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
   写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
@@ -85,6 +86,9 @@ export ICODE_HOME="$HOME/.icode"
 设置后，每次请求都会以 UTF-8 字节数保守估算系统提示、对话历史和工具定义占用的 token，
 并将 `max_tokens`（Responses API 中为 `max_output_tokens`）下调到估算的剩余上下文以内；
 该限制不会调高配置的 `max_tokens`，Chat 与 Responses 对同一语义上下文使用相同估算。
+Responses profile 可设置 `"responses_web_search": true`，让 provider 在普通请求中运行托管
+`web_search`；该搜索不经过本地工具审批或网络策略，其 native call 会随会话持久化并在无状态请求中回放。
+Phase 4 Last Words side-call 始终不暴露该工具。
 当请求输入估算达到或超过由模型配置派生的触发阈值时，当前 Rust 实现会在仅供该次请求使用的投影中执行
 分阶段裁剪：Phase 1 按从旧到新的顺序，将已完成旧轮次的工具结果替换为确定性摘要；仅当输入
 仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍

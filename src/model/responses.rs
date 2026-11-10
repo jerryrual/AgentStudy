@@ -8,6 +8,12 @@ use serde_json::{json, Value};
 use super::{AssistantMessage, Completion, Message, ToolCall, ToolDef, Usage};
 use crate::agent::EventSink;
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct RequestFeatures {
+    pub include_encrypted_reasoning: bool,
+    pub web_search: bool,
+}
+
 pub(super) fn request_body(
     messages: &[Message],
     tools: &[ToolDef],
@@ -15,7 +21,7 @@ pub(super) fn request_body(
     stream: bool,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
-    include_encrypted_reasoning: bool,
+    features: RequestFeatures,
 ) -> Value {
     let mut input = Vec::new();
     for message in messages {
@@ -67,29 +73,33 @@ pub(super) fn request_body(
         "stream": stream,
         "store": false,
     });
+    let mut declarations: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            let mut parameters = tool.parameters.clone();
+            if let Some(object) = parameters.as_object_mut() {
+                object.insert("additionalProperties".to_string(), Value::Bool(false));
+            }
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": parameters,
+                "strict": false,
+            })
+        })
+        .collect();
+    if features.web_search {
+        declarations.push(json!({"type": "web_search"}));
+    }
+    if !declarations.is_empty() {
+        body["tools"] = Value::Array(declarations);
+    }
     if !tools.is_empty() {
-        body["tools"] = Value::Array(
-            tools
-                .iter()
-                .map(|tool| {
-                    let mut parameters = tool.parameters.clone();
-                    if let Some(object) = parameters.as_object_mut() {
-                        object.insert("additionalProperties".to_string(), Value::Bool(false));
-                    }
-                    json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": parameters,
-                        "strict": false,
-                    })
-                })
-                .collect(),
-        );
         body["tool_choice"] = json!("auto");
         body["parallel_tool_calls"] = json!(true);
     }
-    if include_encrypted_reasoning {
+    if features.include_encrypted_reasoning {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
     if let Some(temperature) = temperature {
@@ -272,6 +282,7 @@ impl ResponsesAccumulator {
                     }
                 }
             }
+            "web_search_call" => {}
             "" => {}
             item_type => self.unsupported_item = Some(item_type.to_string()),
         }
@@ -387,9 +398,39 @@ fn value_str<'a>(value: &'a Value, field: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_json, request_body, ResponsesAccumulator};
+    use super::{decode_json, request_body, RequestFeatures, ResponsesAccumulator};
     use crate::agent::NullSink;
     use crate::model::Message;
+
+    #[test]
+    fn replays_hosted_web_search_items_verbatim() {
+        let hosted = serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust"}
+        });
+        let body = request_body(
+            &[Message::assistant(crate::model::AssistantMessage {
+                responses_items: vec![hosted.clone()],
+                ..crate::model::AssistantMessage::default()
+            })],
+            &[],
+            "model",
+            true,
+            None,
+            None,
+            RequestFeatures {
+                web_search: true,
+                ..RequestFeatures::default()
+            },
+        );
+
+        assert_eq!(body["input"], serde_json::json!([hosted]));
+        assert_eq!(body["tools"], serde_json::json!([{"type": "web_search"}]));
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
 
     #[test]
     fn maps_last_words_as_stateless_user_context() {
@@ -403,7 +444,7 @@ mod tests {
             false,
             None,
             Some(128),
-            false,
+            RequestFeatures::default(),
         );
 
         assert_eq!(body["input"][1]["role"], "user");
@@ -427,7 +468,7 @@ mod tests {
             false,
             None,
             Some(128),
-            false,
+            RequestFeatures::default(),
         );
 
         assert_eq!(
