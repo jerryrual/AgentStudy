@@ -198,9 +198,7 @@ impl ModelClient {
             current_manifest.as_deref(),
         )?;
         let mut auxiliary_usage = Usage::default();
-        let mut phase_four_attempted = false;
         if self.phase_four_needed(&prepared, messages) {
-            phase_four_attempted = true;
             match self
                 .prepare_phase_four_retry(
                     messages,
@@ -249,7 +247,7 @@ impl ModelClient {
                     archive_pointer.as_deref(),
                     current_manifest.as_deref(),
                 )?;
-                if !phase_four_attempted && Self::phase_four_eligible(messages) {
+                if Self::phase_four_eligible(messages) {
                     match self
                         .prepare_phase_four_retry(
                             messages,

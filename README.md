@@ -100,8 +100,9 @@ TUI 和 `icode run` 会自动将一个最旧的先前已完成轮次持久化为
 包含工具调用，客户端会发起一次无工具、非流式、输出受限的 Last Words side-call；仅接受完整的
 `Task` / `Progress` / `Next` note。note 必须让正常请求的保守输入估算严格下降，并与当前轮次替换
 作为一条 `ContextProjection` 原子持久化，之后才会改变内存历史并继续同一 agent round。provider
-明示溢出时也可强制走此路径；第二次外层溢出直接返回。生成、校验、持久化或取消失败都会保留原始
-工具历史，TUI 通过事件队列屏障保证先前 assistant/tool 记录先落盘。Chat Completions 和无状态
+明示溢出时也可强制走此路径；若主动 Last Words 未提交投影、随后原始请求溢出，会在同一 turn breaker
+下再尝试一次 Last Words；成功投影后的 provider 请求仍不递归恢复，第二次外层溢出直接返回。生成、校验、
+持久化或取消失败都会保留原始工具历史，TUI 通过事件队列屏障保证先前 assistant/tool 记录先落盘。Chat Completions 和无状态
 Responses API 都使用同一语义。模型配置可选填 `last_words_supplement`（例如
 `"优先保留复现步骤、已排除原因和待验证假设。"`），在生成 Last Words 时强调容易丢失但对续写重要的信息；
 它只进入 Last Words side-call，不进入普通模型请求，最多 4000 个字符。模型配置还可用
