@@ -571,6 +571,7 @@ mod tests {
                     arguments: r#"{"path":"a"}"#.to_string(),
                 }],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "call-1".to_string(),
@@ -582,6 +583,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 responses_items: vec![],
+                responses_continuation: None,
             },
         ];
         let (_session, session_id) = persisted_session(&store, directory.path(), &records);
@@ -705,6 +707,7 @@ mod tests {
                 },
             ],
             responses_items: vec![],
+            responses_continuation: None,
         }];
         let (_corrupt, corrupt_id) = persisted_session(&store, directory.path(), &corrupt_records);
         let request = LoadSessionRequest::new(corrupt_id.clone(), directory.path());
@@ -735,6 +738,7 @@ mod tests {
                     reasoning: None,
                     tool_calls: vec![],
                     responses_items: vec![],
+                    responses_continuation: None,
                 },
             ];
             let (_session, session_id) = persisted_session(&store, directory.path(), &records);

@@ -93,6 +93,9 @@ pub struct ModelProfile {
     /// Enable provider-hosted web search for ordinary Responses requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub responses_web_search: bool,
+    /// Store ordinary Responses and continue them by provider response id.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub responses_stored_continuation: bool,
     /// Provider model identifier, e.g. `deepseek-chat`.
     pub model: String,
     /// Base URL; empty means the provider default.
@@ -146,6 +149,7 @@ impl ModelProfile {
             provider: "deepseek".to_string(),
             api_style: ApiStyle::Chat,
             responses_web_search: false,
+            responses_stored_continuation: false,
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "{{DEEPSEEK_API_KEY}}".to_string(),
@@ -339,6 +343,12 @@ impl Settings {
             if profile.responses_web_search && profile.api_style != ApiStyle::Responses {
                 bail!(
                     "model profile {:?} enables Responses web search with a non-Responses API style",
+                    profile.name
+                );
+            }
+            if profile.responses_stored_continuation && profile.api_style != ApiStyle::Responses {
+                bail!(
+                    "model profile {:?} enables Responses stored continuation with a non-Responses API style",
                     profile.name
                 );
             }
@@ -661,6 +671,36 @@ mod tests {
 
         let json = serde_json::to_value(profile).unwrap();
         assert_eq!(json.get("context_window"), None);
+    }
+
+    #[test]
+    fn responses_stored_continuation_is_opt_in_and_responses_only() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert!(!profile.responses_stored_continuation);
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("responses_stored_continuation"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].responses_stored_continuation = true;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("Responses stored continuation with a non-Responses API style"));
+
+        settings.models[0].api_style = ApiStyle::Responses;
+        settings.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["models"][0]["responses_stored_continuation"],
+            true
+        );
     }
 
     #[test]

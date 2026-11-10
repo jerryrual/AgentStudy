@@ -5,13 +5,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 
-use super::{AssistantMessage, Completion, Message, ToolCall, ToolDef, Usage};
+use super::{
+    AssistantMessage, Completion, Message, ResponsesContinuation, ToolCall, ToolDef, Usage,
+};
 use crate::agent::EventSink;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct RequestFeatures {
     pub include_encrypted_reasoning: bool,
     pub web_search: bool,
+    pub store: bool,
+    pub previous_response_id: Option<String>,
 }
 
 pub(super) fn request_body(
@@ -71,8 +75,11 @@ pub(super) fn request_body(
         "model": model,
         "input": input,
         "stream": stream,
-        "store": false,
+        "store": features.store,
     });
+    if let Some(previous_response_id) = &features.previous_response_id {
+        body["previous_response_id"] = json!(previous_response_id);
+    }
     let mut declarations: Vec<Value> = tools
         .iter()
         .map(|tool| {
@@ -125,6 +132,8 @@ pub(super) struct ResponsesAccumulator {
     incomplete: bool,
     refused: bool,
     unsupported_item: Option<String>,
+    response_id: Option<String>,
+    response_id_mismatch: bool,
 }
 
 impl ResponsesAccumulator {
@@ -136,6 +145,9 @@ impl ResponsesAccumulator {
             .and_then(Value::as_str)
             .unwrap_or_default()
         {
+            "response.created" => {
+                self.learn_response_id(event.get("response").unwrap_or(&event));
+            }
             "response.output_text.delta" => {
                 self.push_text(event_index(&event), value_str(&event, "delta"), sink);
             }
@@ -187,6 +199,9 @@ impl ResponsesAccumulator {
         if !self.terminal {
             bail!("Responses stream ended before a terminal event");
         }
+        if self.response_id_mismatch {
+            bail!("Responses API changed response id within one request");
+        }
         if self.incomplete && !self.calls.is_empty() {
             bail!("Responses API returned function calls in an incomplete response");
         }
@@ -206,7 +221,24 @@ impl ResponsesAccumulator {
         Ok(self.into_completion())
     }
 
+    fn learn_response_id(&mut self, response: &Value) {
+        let Some(id) = response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        match &self.response_id {
+            Some(existing) if existing != id => self.response_id_mismatch = true,
+            None => self.response_id = Some(id.to_string()),
+            Some(_) => {}
+        }
+    }
+
     fn learn_response(&mut self, response: &Value) {
+        self.learn_response_id(response);
         self.learn_usage(response.get("usage"));
         if let Some(output) = response.get("output").and_then(Value::as_array) {
             for (index, item) in output.iter().enumerate() {
@@ -355,6 +387,12 @@ impl ResponsesAccumulator {
                 reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 tool_calls,
                 responses_items,
+                responses_continuation: self.response_id.map(|id| {
+                    Box::new(ResponsesContinuation {
+                        id,
+                        scope_sha256: String::new(),
+                    })
+                }),
             },
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -454,6 +492,28 @@ mod tests {
         );
         assert_eq!(body["store"], false);
         assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn rejects_response_id_changes_between_stream_events() {
+        let mut accumulator = ResponsesAccumulator::default();
+        assert!(!accumulator
+            .apply(
+                r#"{"type":"response.created","response":{"id":"resp_a","status":"in_progress"}}"#,
+                &NullSink,
+            )
+            .unwrap());
+        assert!(accumulator
+            .apply(
+                r#"{"type":"response.completed","response":{"id":"resp_b","status":"completed","output":[]}}"#,
+                &NullSink,
+            )
+            .unwrap());
+
+        assert_eq!(
+            accumulator.finish().unwrap_err().to_string(),
+            "Responses API changed response id within one request"
+        );
     }
 
     #[test]

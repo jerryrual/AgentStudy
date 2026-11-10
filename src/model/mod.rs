@@ -4,4 +4,6 @@ pub mod sse;
 pub mod types;
 
 pub use client::ModelClient;
-pub use types::{AssistantMessage, Completion, Message, ToolCall, ToolDef, Usage};
+pub use types::{
+    AssistantMessage, Completion, Message, ResponsesContinuation, ToolCall, ToolDef, Usage,
+};

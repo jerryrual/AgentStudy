@@ -1136,6 +1136,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: calls.clone(),
                 responses_items: Vec::new(),
+                responses_continuation: None,
             }),
         ];
         let original_prefix = prefix.clone();
@@ -1203,6 +1204,7 @@ mod tests {
             reasoning: None,
             tool_calls: calls.clone(),
             responses_items: Vec::new(),
+            responses_continuation: None,
         })];
         let original_prefix = prefix.clone();
         let sink = SignalingCheckpointSink {

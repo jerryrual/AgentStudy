@@ -359,6 +359,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 responses_items: vec![],
+                responses_continuation: None,
             })
             .unwrap();
         let load_id = SessionId::new(loaded.id());

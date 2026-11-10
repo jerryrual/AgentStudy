@@ -930,6 +930,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             }),
             Message::tool("a", "read_file", "result"),
             Message::user("current"),
@@ -1078,6 +1079,7 @@ mod tests {
                     serde_json::json!({"type": "function_call", "name": "beta"}),
                     serde_json::json!({"type": "function_call", "name": "alpha"}),
                 ],
+                responses_continuation: None,
             }),
         ]);
         assert_eq!(

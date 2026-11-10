@@ -2559,6 +2559,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: Vec::new(),
                 responses_items: Vec::new(),
+                responses_continuation: None,
             },
         ];
 
