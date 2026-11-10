@@ -2172,6 +2172,7 @@ mod tests {
                 responses_continuation: Some(Box::new(ResponsesContinuation {
                     id: "resp_partial".into(),
                     scope_sha256: "scope".into(),
+                    input_sha256: "input".into(),
                 })),
             }),
             Message::tool("call_b", "grep", "B result"),
@@ -2509,6 +2510,7 @@ mod tests {
                 responses_continuation: Some(Box::new(ResponsesContinuation {
                     id: "resp_1".into(),
                     scope_sha256: "abc123".into(),
+                    input_sha256: "def456".into(),
                 })),
             })
             .unwrap();
@@ -2530,7 +2532,9 @@ mod tests {
             Message::Assistant { message }
                 if message.responses_items[0]["id"] == "fc_call_1"
                     && message.responses_continuation.as_ref().is_some_and(|handle| {
-                        handle.id == "resp_1" && handle.scope_sha256 == "abc123"
+                        handle.id == "resp_1"
+                            && handle.scope_sha256 == "abc123"
+                            && handle.input_sha256 == "def456"
                     })
         ));
         assert!(matches!(&messages[2], Message::Tool { name, .. } if name == "bash"));
