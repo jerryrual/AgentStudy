@@ -11,10 +11,10 @@
 
 - **TUI 对话界面**：基于 ratatui，包含对话视图、输入框、状态栏（模型 / 审批模式 /
   工作目录 / token / 会话），支持流式 Markdown 渲染、工具调用卡片与审批弹窗。
-- **模型接入**：兼容 OpenAI Chat Completions 或核心无状态 Responses API 的服务，
+- **模型接入**：兼容 OpenAI Chat Completions 或核心 Responses API 的服务，
   支持流式 SSE、推理摘要、token 用量统计、429/5xx 自动重试和本地函数工具；Responses
-  模式支持流式/非流式文本和显式 opt-in 的 provider-hosted `web_search`，但不支持已存储响应续传、
-  后台响应、其他托管工具或图片。
+  模式支持流式/非流式文本、显式 opt-in 的 provider-hosted `web_search`，以及默认关闭的 provider
+  存储续传，但不支持后台响应、其他托管工具或图片。
 - **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
   写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
@@ -88,7 +88,12 @@ export ICODE_HOME="$HOME/.icode"
 该限制不会调高配置的 `max_tokens`，Chat 与 Responses 对同一语义上下文使用相同估算。
 Responses profile 可设置 `"responses_web_search": true`，让 provider 在普通请求中运行托管
 `web_search`；该搜索不经过本地工具审批或网络策略，其 native call 会随会话持久化并在无状态请求中回放。
-Phase 4 Last Words side-call 始终不暴露该工具。
+Phase 4 Last Words side-call 始终不暴露该工具。还可显式设置
+`"responses_stored_continuation": true`：普通 Responses 结果会由 provider 远端存储，Rust 会把不透明
+response id 与 endpoint、model、当前 system prompt 的 SHA-256 scope 一起绑定到 assistant 会话记录；scope
+未变化且没有本地裁剪/投影时，下一次请求只发送新增后缀并携带 `previous_response_id`，否则完整回放并建立
+新锚点。该选项默认关闭；启用后数据受 provider 的远端保留策略约束，删除本地会话不会删除远端 response，
+过期或被 provider 拒绝的 response id 会显式报错。Last Words 始终 `store: false`，不会加入远端续传链。
 当请求输入估算达到或超过由模型配置派生的触发阈值时，当前 Rust 实现会在仅供该次请求使用的投影中执行
 分阶段裁剪：Phase 1 按从旧到新的顺序，将已完成旧轮次的工具结果替换为确定性摘要；仅当输入
 仍超过目标预算时，Phase 2 才按从旧到新的顺序移除已完成旧轮次的工具调用/结果批次；若此后仍

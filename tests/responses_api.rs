@@ -18,6 +18,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         provider: "openai".to_string(),
         api_style: ApiStyle::Responses,
         responses_web_search: false,
+        responses_stored_continuation: false,
         model: "gpt-test".to_string(),
         base_url: server.base_url(),
         api_key: "test-key".to_string(),
@@ -74,12 +75,13 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
         }
         MockResponse::sse(&[
             r#"{"type":"response.output_text.delta","output_index":0,"delta":"continued"}"#,
-            r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_after_phase_four","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued"}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"#,
         ])
     });
     let directory = tempfile::tempdir().unwrap();
     let mut profile = responses_profile(&server, true);
     profile.responses_web_search = true;
+    profile.responses_stored_continuation = true;
     profile.context_window = Some(30_000);
     profile.max_tokens = Some(3_000);
     let agent = Agent::new(
@@ -117,7 +119,11 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
     assert!(matches!(messages[2], Message::LastWords { .. }));
     let requests = server.requests();
     assert_eq!(requests[0]["stream"], false);
+    assert_eq!(requests[0]["store"], false);
+    assert!(requests[0].get("previous_response_id").is_none());
     assert_eq!(requests[1]["stream"], true);
+    assert_eq!(requests[1]["store"], true);
+    assert!(requests[1].get("previous_response_id").is_none());
     let ordinary_tools = requests[1]["tools"].as_array().unwrap();
     assert!(ordinary_tools.iter().any(|tool| tool["type"] == "function"));
     assert_eq!(
@@ -236,6 +242,7 @@ async fn responses_stream_maps_stateless_history_and_assembles_output() {
                 arguments: r#"{"city":"Paris"}"#.to_string(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         }),
         Message::tool("call_previous", "get_weather", r#"{"temperature_c":18}"#),
         Message::user("And London?"),
@@ -552,6 +559,7 @@ async fn responses_replays_native_output_items_without_reconstruction() {
                 arguments: "{}".to_string(),
             }],
             responses_items: native_items,
+            responses_continuation: None,
         }),
         Message::tool("call_1", "get_weather", "sunny"),
     ];
@@ -717,4 +725,142 @@ async fn agent_recovers_once_from_responses_context_overflow_with_stateless_summ
                 .and_then(|text| text.as_str())
                 == Some(CURRENT_USER)
     }));
+}
+
+#[tokio::test]
+async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = Arc::clone(&calls);
+    let server = MockServer::new(move |_, _| {
+        let call = calls_for_server.fetch_add(1, Ordering::SeqCst) + 1;
+        MockResponse::json(
+            200,
+            &json!({
+                "id": format!("resp_{call}"),
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_{call}"),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": format!("answer {call}"), "annotations": []}]
+                }],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let sink = RecordingSink::default();
+
+    let mut messages = vec![Message::system("prompt A"), Message::user("first")];
+    let first = client.complete(&messages, &[], &sink).await.unwrap();
+    assert_eq!(
+        first
+            .message
+            .responses_continuation
+            .as_ref()
+            .map(|handle| handle.id.as_str()),
+        Some("resp_1")
+    );
+    messages.push(Message::assistant(first.message));
+    messages.push(Message::user("second"));
+
+    let second = client.complete(&messages, &[], &sink).await.unwrap();
+    assert_eq!(
+        second
+            .message
+            .responses_continuation
+            .as_ref()
+            .map(|handle| handle.id.as_str()),
+        Some("resp_2")
+    );
+    messages.push(Message::assistant(second.message));
+    messages.push(Message::user("third"));
+    messages[0] = Message::system("prompt B");
+
+    client.complete(&messages, &[], &sink).await.unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["store"], true);
+    assert!(requests[0].get("previous_response_id").is_none());
+    assert_eq!(requests[0]["input"].as_array().unwrap().len(), 2);
+    assert_eq!(requests[1]["store"], true);
+    assert_eq!(requests[1]["previous_response_id"], "resp_1");
+    assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(requests[1]["input"][0]["content"][0]["text"], "second");
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(
+        requests[2]["input"].as_array().unwrap().len(),
+        messages.len()
+    );
+}
+
+#[tokio::test]
+async fn responses_stored_stream_requires_and_captures_one_response_id() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::sse(&[
+            r#"{"type":"response.created","response":{"id":"resp_stream","status":"in_progress"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_stream","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"done","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+        ])
+    });
+    let mut profile = responses_profile(&server, true);
+    profile.responses_stored_continuation = true;
+    let completion = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::system("prompt"), Message::user("hello")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion
+            .message
+            .responses_continuation
+            .as_ref()
+            .map(|handle| handle.id.as_str()),
+        Some("resp_stream")
+    );
+}
+
+#[tokio::test]
+async fn responses_stored_result_without_id_fails_closed() {
+    let server = MockServer::new(|_, _| {
+        MockResponse::json(
+            200,
+            &json!({
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "done", "annotations": []}]
+                }]
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    let error = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::system("prompt"), Message::user("hello")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("stored Responses result is missing a response id"));
 }

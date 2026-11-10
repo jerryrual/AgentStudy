@@ -36,6 +36,7 @@ pub(crate) fn replay_updates(records: &[Record]) -> Result<Vec<SessionUpdate>> {
                 reasoning,
                 tool_calls,
                 responses_items: _,
+                responses_continuation: _,
             } => {
                 flush_interrupted(&mut updates, &mut pending);
                 if let Some(reasoning) = reasoning {
@@ -151,6 +152,7 @@ mod tests {
                 reasoning: Some("reasoning".to_string()),
                 tool_calls: vec![call("call-1", "read_file", r#"{"path":"a"}"#)],
                 responses_items: vec![serde_json::json!({"providerSecret": "not replayed"})],
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "call-1".to_string(),
@@ -162,6 +164,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 responses_items: vec![],
+                responses_continuation: None,
             },
         ];
 
@@ -205,6 +208,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![call("one", "bash", "{}"), call("two", "grep", "{}")],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "two".to_string(),
@@ -235,6 +239,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![call("same", "bash", "{}")],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Compaction {
                 summary: "retained summary".to_string(),
@@ -245,6 +250,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![call("same", "grep", "{}")],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "same".to_string(),
@@ -271,6 +277,7 @@ mod tests {
             reasoning: None,
             tool_calls: vec![call("same", "bash", "{}"), call("same", "grep", "{}")],
             responses_items: vec![],
+            responses_continuation: None,
         }];
         assert_eq!(
             replay_updates(&duplicate).unwrap_err().to_string(),
@@ -283,6 +290,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![call("call-1", "bash", "{}")],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "call-1".to_string(),
@@ -300,6 +308,7 @@ mod tests {
             reasoning: None,
             tool_calls: vec![call("", "bash", "{}")],
             responses_items: vec![],
+            responses_continuation: None,
         }];
         assert_eq!(
             replay_updates(&empty).unwrap_err().to_string(),
@@ -318,6 +327,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![call("call-1", "bash", "{}")],
                 responses_items: vec![],
+                responses_continuation: None,
             },
             Record::Compaction {
                 summary: "internal summary".to_string(),
@@ -328,6 +338,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 responses_items: vec![],
+                responses_continuation: None,
             },
         ];
 

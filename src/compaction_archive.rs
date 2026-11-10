@@ -1879,6 +1879,7 @@ mod tests {
                     },
                 ],
                 responses_items: vec![serde_json::json!({"encrypted": "native-secret"})],
+                responses_continuation: None,
             }),
             Message::tool("call_a", "read_file", "result-a"),
             Message::tool("call_b", "grep", "result-b"),

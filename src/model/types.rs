@@ -28,6 +28,14 @@ impl ToolCall {
     }
 }
 
+/// A stored Responses handle, scoped to the model endpoint that created it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponsesContinuation {
+    pub id: String,
+    /// SHA-256 of endpoint, model and current system prompt.
+    pub scope_sha256: String,
+}
+
 /// An assistant turn: optional text, optional reasoning and zero or more tool
 /// calls.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,6 +49,9 @@ pub struct AssistantMessage {
     /// Provider-native Responses output items retained for stateless replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub responses_items: Vec<Value>,
+    /// Stored response id and its provider identity for server-side continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_continuation: Option<Box<ResponsesContinuation>>,
 }
 
 impl AssistantMessage {
@@ -50,6 +61,7 @@ impl AssistantMessage {
             reasoning: None,
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
+            responses_continuation: None,
         }
     }
 
@@ -303,6 +315,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let value = message.to_api();
         assert_eq!(value["role"], "assistant");

@@ -586,6 +586,7 @@ mod tests {
                     arguments: "{\"path\":\"a.txt\"}".to_string(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             }))
             .unwrap();
         app.session

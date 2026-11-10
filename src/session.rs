@@ -19,7 +19,7 @@ use crate::compaction_archive::{
     open_read_nofollow, replace_private_file, sync_directory, ArchiveStore,
     ArchivedContextProjection,
 };
-use crate::model::{AssistantMessage, Message, ToolCall};
+use crate::model::{AssistantMessage, Message, ResponsesContinuation, ToolCall};
 use crate::phase4_breaker::PhaseFourBreakerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +54,8 @@ pub enum Record {
         tool_calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         responses_items: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        responses_continuation: Option<Box<ResponsesContinuation>>,
     },
     Tool {
         call_id: String,
@@ -101,6 +103,7 @@ impl Record {
                 reasoning: message.reasoning.clone(),
                 tool_calls: message.tool_calls.clone(),
                 responses_items: message.responses_items.clone(),
+                responses_continuation: message.responses_continuation.clone(),
             }),
             Message::Tool {
                 call_id,
@@ -1037,6 +1040,7 @@ fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
         let mut retained_assistant = assistant.clone();
         retained_assistant.tool_calls = retained_calls;
         retained_assistant.responses_items = retained_responses_items;
+        retained_assistant.responses_continuation = None;
         shaped.push(Message::assistant(retained_assistant));
         shaped.extend(retained_results);
         index = next;
@@ -1233,6 +1237,7 @@ impl LoadedSession {
                     reasoning,
                     tool_calls,
                     responses_items,
+                    responses_continuation,
                 } => {
                     flush(&mut messages, &mut pending);
                     pending = tool_calls
@@ -1244,6 +1249,7 @@ impl LoadedSession {
                         reasoning: reasoning.clone(),
                         tool_calls: tool_calls.clone(),
                         responses_items: responses_items.clone(),
+                        responses_continuation: responses_continuation.clone(),
                     }));
                 }
                 Record::Tool {
@@ -1654,6 +1660,7 @@ mod tests {
             reasoning: None,
             tool_calls: Vec::new(),
             responses_items: Vec::new(),
+            responses_continuation: None,
         }
     }
 
@@ -1781,6 +1788,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: Vec::new(),
                 responses_items: Vec::new(),
+                responses_continuation: None,
             }),
         ];
         let mut second_breaker = first_breaker.clone();
@@ -1914,6 +1922,7 @@ mod tests {
                 arguments: r#"{"path":"README.md"}"#.into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let mut buffer = RecordBuffer::default();
         buffer.record(&session, &assistant).unwrap();
@@ -1951,6 +1960,7 @@ mod tests {
                 arguments: r#"{"path":"README.md"}"#.into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let tool = Message::tool("call_1", "read_file", "contents");
         let checkpoint_messages = vec![
@@ -2002,6 +2012,7 @@ mod tests {
                 },
             ],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let tool_c = Message::tool("call_c", "grep", "C result");
         let tool_a = Message::tool("call_a", "read_file", "A result");
@@ -2054,6 +2065,7 @@ mod tests {
             reasoning: None,
             tool_calls: calls.to_vec(),
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let checkpoint = vec![
             Message::system("captured system"),
@@ -2107,6 +2119,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         };
         assert!(shape_recovery_messages(&[
             Message::user("inspect"),
@@ -2156,6 +2169,10 @@ mod tests {
                     serde_json::json!({"type": "function_call", "call_id": "call_b"}),
                     serde_json::json!({"type": "message", "id": "msg_1"}),
                 ],
+                responses_continuation: Some(Box::new(ResponsesContinuation {
+                    id: "resp_partial".into(),
+                    scope_sha256: "scope".into(),
+                })),
             }),
             Message::tool("call_b", "grep", "B result"),
         ])
@@ -2166,6 +2183,7 @@ mod tests {
         };
         assert_eq!(message.tool_calls.len(), 1);
         assert_eq!(message.tool_calls[0].id, "call_b");
+        assert!(message.responses_continuation.is_none());
         assert_eq!(
             message
                 .responses_items
@@ -2188,6 +2206,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         for messages in [
             vec![Message::tool("orphan", "read_file", "result")],
@@ -2272,6 +2291,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         session.append_message(&assistant).unwrap();
         session
@@ -2358,6 +2378,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         };
         assert!(loaded(vec![user.clone(), call.clone()])
             .resumable_turn_messages()
@@ -2400,6 +2421,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             })
             .unwrap();
         session
@@ -2484,6 +2506,10 @@ mod tests {
                     "arguments": "{}",
                     "status": "completed"
                 })],
+                responses_continuation: Some(Box::new(ResponsesContinuation {
+                    id: "resp_1".into(),
+                    scope_sha256: "abc123".into(),
+                })),
             })
             .unwrap();
         session
@@ -2503,6 +2529,9 @@ mod tests {
             &messages[1],
             Message::Assistant { message }
                 if message.responses_items[0]["id"] == "fc_call_1"
+                    && message.responses_continuation.as_ref().is_some_and(|handle| {
+                        handle.id == "resp_1" && handle.scope_sha256 == "abc123"
+                    })
         ));
         assert!(matches!(&messages[2], Message::Tool { name, .. } if name == "bash"));
 
@@ -2589,6 +2618,7 @@ mod tests {
                     },
                 ],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             })
             .unwrap();
         session
@@ -2822,6 +2852,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             },
             Record::Compaction {
                 summary: "interrupted turn folded".into(),
@@ -3087,6 +3118,7 @@ mod tests {
                 },
             ],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         buffer.record(&session, &assistant).unwrap();
         buffer
@@ -3139,6 +3171,7 @@ mod tests {
                     "name": "read_file",
                     "arguments": "{}"
                 })],
+                responses_continuation: None,
             })
             .unwrap();
         session
@@ -3189,6 +3222,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             },
             Record::Tool {
                 call_id: "call_1".into(),
@@ -3228,6 +3262,7 @@ mod tests {
                     arguments: "{}".into(),
                 }],
                 responses_items: Vec::new(),
+                responses_continuation: None,
             },
             Record::ContextProjection {
                 projection: ContextProjection {
@@ -3408,6 +3443,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         let mut buffer = RecordBuffer::default();
         buffer.record(&session, &assistant).unwrap();
@@ -3539,6 +3575,7 @@ mod tests {
                 arguments: "{}".into(),
             }],
             responses_items: Vec::new(),
+            responses_continuation: None,
         });
         buffer.record(&session, &assistant).unwrap();
         buffer

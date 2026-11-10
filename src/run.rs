@@ -867,6 +867,7 @@ mod tests {
                 reasoning: None,
                 tool_calls: vec![],
                 responses_items: vec![],
+                responses_continuation: None,
             })
             .unwrap();
 
@@ -882,6 +883,7 @@ mod tests {
                         reasoning: None,
                         tool_calls: vec![],
                         responses_items: vec![],
+                        responses_continuation: None,
                     },
                 },
                 Message::user(" next "),
@@ -1054,6 +1056,7 @@ mod tests {
                 arguments: r#"{"pattern":"private-token"}"#.into(),
             }],
             responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
+            responses_continuation: None,
         }));
         sink.message_added(&Message::tool("call_1", "grep", "large result"));
         let projection = ContextProjection {
@@ -1075,6 +1078,7 @@ mod tests {
                     arguments: r#"{"pattern":"private-token"}"#.into(),
                 }],
                 responses_items: vec![serde_json::json!({"encrypted_content": "opaque-secret"})],
+                responses_continuation: None,
             }),
             Message::tool("call_1", "grep", "large result"),
         ];
