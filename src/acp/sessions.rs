@@ -185,6 +185,11 @@ impl SessionRegistry {
         self.commit_create(prepared, tools)
     }
 
+    /// Return whether this session is already registered in this process.
+    pub(crate) fn is_registered(&self, session_id: &SessionId) -> bool {
+        lock(&self.sessions).contains_key(session_id)
+    }
+
     /// Validate and project a persisted session while holding its run lease.
     pub(crate) fn prepare_load(
         self: &Arc<Self>,

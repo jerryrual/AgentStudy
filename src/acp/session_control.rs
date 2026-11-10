@@ -131,6 +131,11 @@ impl SessionControl {
         })
         .await
         .map_err(ControlError::internal)??;
+        if self.sessions.is_registered(&request.session_id) {
+            return Err(ControlError::invalid(
+                InvalidSessionRequest::AlreadyRegistered,
+            ));
+        }
         let registry = Arc::downgrade(&self.sessions);
         let store = self.sessions.store();
         let session_id = request.session_id.clone();
@@ -436,6 +441,23 @@ mod tests {
             ))
         ));
         store.try_acquire_run_lease(session.id()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn async_load_classifies_an_already_registered_session() {
+        let (directory, _store, control) = control();
+        let created = control
+            .new_session(&NewSessionRequest::new(directory.path()))
+            .await
+            .unwrap();
+        let request = LoadSessionRequest::new(created.session_id, directory.path());
+
+        assert!(matches!(
+            control.prepare_load_with_mcp(&request).await,
+            Err(ControlError::Invalid(
+                InvalidSessionRequest::AlreadyRegistered
+            ))
+        ));
     }
 
     #[cfg(unix)]
