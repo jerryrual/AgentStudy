@@ -70,8 +70,9 @@
 - 模型重试策略固定为 3 次指数退避；可通过 `ICODE_RETRY_BASE_MS` 调整基准间隔（测试用）。
 - 工具并发仅对 `read_file`、`list_dir`、`grep`、`glob` 开放；写操作、Shell、提问与
   todo 更新保持顺序执行，以保证审批、交互和会话状态的确定性。
-- Responses API 采用无状态完整历史重放；不支持已存储响应续传、服务端托管工具（如
-  `web_search`）或图片输入，遇到未支持的可执行输出类型会失败关闭。
+- Responses API 默认采用无状态完整历史重放；可通过 `responses_stored_continuation` 显式启用
+  provider 存储续传。不支持后台响应、除显式启用的 `web_search` 以外的托管工具或图片输入，
+  遇到未支持的可执行输出类型会失败关闭。
 - `icode run` 与 iCode 一样绕过审批；`--approval deny` 提供只读保护。
 
 ## 设计取向

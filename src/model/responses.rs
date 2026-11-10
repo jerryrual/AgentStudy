@@ -495,6 +495,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_response_id_changes_between_stream_events() {
+        let mut accumulator = ResponsesAccumulator::default();
+        assert!(!accumulator
+            .apply(
+                r#"{"type":"response.created","response":{"id":"resp_a","status":"in_progress"}}"#,
+                &NullSink,
+            )
+            .unwrap());
+        assert!(accumulator
+            .apply(
+                r#"{"type":"response.completed","response":{"id":"resp_b","status":"completed","output":[]}}"#,
+                &NullSink,
+            )
+            .unwrap());
+
+        assert_eq!(
+            accumulator.finish().unwrap_err().to_string(),
+            "Responses API changed response id within one request"
+        );
+    }
+
+    #[test]
     fn maps_injected_user_without_leaking_identity() {
         let body = request_body(
             &[Message::injected_user(
