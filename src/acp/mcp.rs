@@ -547,7 +547,7 @@ impl HttpSseDecoder {
         }
         self.buffer.extend_from_slice(bytes);
         let mut messages = Vec::new();
-        let buffer = std::mem::take(&mut self.buffer);
+        let mut buffer = std::mem::take(&mut self.buffer);
         let mut start = 0;
         while let Some(offset) = buffer[start..].iter().position(|byte| *byte == b'\n') {
             let end = start + offset;
@@ -556,7 +556,8 @@ impl HttpSseDecoder {
             self.consume_line(line, &mut messages)?;
             start = end + 1;
         }
-        self.buffer.extend_from_slice(&buffer[start..]);
+        buffer.drain(..start);
+        self.buffer = buffer;
         Ok(messages)
     }
 
