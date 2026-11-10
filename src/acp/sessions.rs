@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
 use anyhow::{ensure, Result};
@@ -97,10 +97,11 @@ pub(crate) struct PreparedCreate {
 
 /// A validated load whose replay is complete but whose session is not exposed.
 pub(crate) struct PreparedLoad {
-    registry: Arc<SessionRegistry>,
+    registry: Weak<SessionRegistry>,
     session: Session,
     run_lease: SessionRunLease,
     updates: Vec<SessionUpdate>,
+    tools: Arc<ToolRegistry>,
 }
 
 /// A load registered as pending while its response is admitted.
@@ -184,6 +185,11 @@ impl SessionRegistry {
         self.commit_create(prepared, tools)
     }
 
+    /// Return whether this session is already registered in this process.
+    pub(crate) fn is_registered(&self, session_id: &SessionId) -> bool {
+        lock(&self.sessions).contains_key(session_id)
+    }
+
     /// Validate and project a persisted session while holding its run lease.
     pub(crate) fn prepare_load(
         self: &Arc<Self>,
@@ -193,9 +199,23 @@ impl SessionRegistry {
         if lock(&self.sessions).contains_key(session_id) {
             return Err(LoadError::AlreadyRegistered);
         }
+        Self::prepare_load_detached(
+            Arc::downgrade(self),
+            self.store.clone(),
+            session_id.clone(),
+            expected_cwd.to_string(),
+        )
+    }
+
+    /// Perform blocking load I/O while retaining only a weak registry reference.
+    pub(crate) fn prepare_load_detached(
+        registry: Weak<Self>,
+        store: SessionStore,
+        session_id: SessionId,
+        expected_cwd: String,
+    ) -> std::result::Result<PreparedLoad, LoadError> {
         let id = session_id.to_string();
-        let run_lease = self
-            .store
+        let run_lease = store
             .try_acquire_run_lease(&id)
             .map_err(|error| match error {
                 RunLeaseError::InvalidSessionId(_) => LoadError::InvalidSessionId,
@@ -203,7 +223,7 @@ impl SessionRegistry {
                 RunLeaseError::ActiveElsewhere { .. } => LoadError::ActiveElsewhere,
                 RunLeaseError::Internal(error) => LoadError::Internal(error),
             })?;
-        let loaded = self.store.load(&id).map_err(|error| {
+        let loaded = store.load(&id).map_err(|error| {
             if error.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
@@ -223,15 +243,15 @@ impl SessionRegistry {
             return Err(LoadError::CwdMismatch);
         }
         let updates = replay_updates(&loaded.records).map_err(LoadError::Internal)?;
-        let session = self
-            .store
+        let session = store
             .reopen_loaded(&id, loaded)
             .map_err(LoadError::Internal)?;
         Ok(PreparedLoad {
-            registry: Arc::clone(self),
+            registry,
             session,
             run_lease,
             updates,
+            tools: Arc::new(ToolRegistry::builtin()),
         })
     }
 
@@ -349,6 +369,11 @@ impl PreparedLoad {
         &self.updates
     }
 
+    /// Replace built-ins with the registry reconstructed for this load.
+    pub(crate) fn set_tools(&mut self, tools: Arc<ToolRegistry>) {
+        self.tools = tools;
+    }
+
     /// Register this load as pending while its protocol response is admitted.
     pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
         let PreparedLoad {
@@ -356,9 +381,13 @@ impl PreparedLoad {
             session,
             run_lease,
             updates: _,
+            tools,
         } = self;
+        let registry = registry.upgrade().ok_or_else(|| {
+            LoadError::Internal(anyhow::anyhow!("ACP session registry was released"))
+        })?;
         let (session_id, registered) = registry
-            .register(session, run_lease, false, Arc::new(ToolRegistry::builtin()))
+            .register(session, run_lease, false, tools)
             .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
