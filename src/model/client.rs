@@ -17,7 +17,6 @@ use crate::config::{resolve_api_key, ApiStyle, ModelProfile};
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_ERROR_BODY: usize = 600;
-const LAST_WORDS_MAX_OUTPUT: u32 = 1024;
 const LAST_WORDS_MIN_CHARS: usize = 300;
 const LAST_WORDS_GENERATION_ATTEMPTS: usize = 2;
 const LAST_WORDS_SYSTEM_PROMPT: &str = r#"You write a durable progress note so a coding agent can continue after its current tool-call history is removed.
@@ -42,6 +41,7 @@ pub struct ModelClient {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     context_window: Option<u32>,
+    last_words_max_output_tokens: u32,
     last_words_supplement: String,
     stream: bool,
     retry_base: Duration,
@@ -117,6 +117,7 @@ impl ModelClient {
             temperature: profile.temperature,
             max_tokens: profile.max_tokens,
             context_window: profile.context_window,
+            last_words_max_output_tokens: profile.last_words_max_output_tokens,
             last_words_supplement: profile.last_words_supplement.trim().to_string(),
             stream: profile.stream,
             retry_base,
@@ -810,8 +811,8 @@ impl ModelClient {
     fn last_words_request_body(&self, messages: &[Message]) -> Result<Value> {
         let output_limit = self
             .max_tokens
-            .unwrap_or(LAST_WORDS_MAX_OUTPUT)
-            .min(LAST_WORDS_MAX_OUTPUT);
+            .unwrap_or(self.last_words_max_output_tokens)
+            .min(self.last_words_max_output_tokens);
         let estimated_input = self.estimated_request_tokens(messages, &[]);
         let mut body = if self.api_style == ApiStyle::Responses {
             super::responses::request_body(
@@ -1707,6 +1708,9 @@ mod tests {
         for api_style in [ApiStyle::Chat, ApiStyle::Responses] {
             let mut client = budget_client(api_style);
             client.stream = true;
+            client.context_window = None;
+            client.max_tokens = Some(5_000);
+            client.last_words_max_output_tokens = 2_000;
             let body = client
                 .last_words_request_body(&[
                     Message::system(LAST_WORDS_SYSTEM_PROMPT),
@@ -1727,7 +1731,18 @@ mod tests {
             } else {
                 body["max_tokens"].as_u64().unwrap()
             };
-            assert!((1..=u64::from(LAST_WORDS_MAX_OUTPUT)).contains(&limit));
+            assert_eq!(limit, 2_000);
+
+            client.max_tokens = Some(1_500);
+            let capped = client
+                .last_words_request_body(&[Message::user("transcript")])
+                .unwrap();
+            let capped_limit = if api_style == ApiStyle::Responses {
+                capped["max_output_tokens"].as_u64().unwrap()
+            } else {
+                capped["max_tokens"].as_u64().unwrap()
+            };
+            assert_eq!(capped_limit, 1_500);
         }
     }
 

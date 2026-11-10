@@ -19,6 +19,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const DEFAULT_PROFILE: &str = "deepseek";
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_LAST_WORDS_MAX_OUTPUT_TOKENS: u32 = 1_024;
+const MIN_LAST_WORDS_MAX_OUTPUT_TOKENS: u32 = 1_000;
+const MAX_LAST_WORDS_MAX_OUTPUT_TOKENS: u32 = 64_000;
 const MAX_LAST_WORDS_SUPPLEMENT_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -102,6 +105,12 @@ pub struct ModelProfile {
     pub context_window: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Maximum output tokens requested for a Phase 4 Last Words side call.
+    #[serde(
+        default = "default_last_words_max_output_tokens",
+        skip_serializing_if = "is_default_last_words_max_output_tokens"
+    )]
+    pub last_words_max_output_tokens: u32,
     /// Optional trusted-local emphasis appended to Phase 4 Last Words instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_words_supplement: String,
@@ -112,6 +121,14 @@ pub struct ModelProfile {
 
 fn default_stream() -> bool {
     true
+}
+
+fn default_last_words_max_output_tokens() -> u32 {
+    DEFAULT_LAST_WORDS_MAX_OUTPUT_TOKENS
+}
+
+fn is_default_last_words_max_output_tokens(value: &u32) -> bool {
+    *value == DEFAULT_LAST_WORDS_MAX_OUTPUT_TOKENS
 }
 
 impl ModelProfile {
@@ -127,6 +144,7 @@ impl ModelProfile {
             max_tokens: Some(8192),
             context_window: Some(128_000),
             temperature: Some(0.1),
+            last_words_max_output_tokens: default_last_words_max_output_tokens(),
             last_words_supplement: String::new(),
             stream: true,
         }
@@ -309,6 +327,14 @@ impl Settings {
             }
             if profile.model.trim().is_empty() {
                 bail!("model profile {:?} has an empty model id", profile.name);
+            }
+            if !(MIN_LAST_WORDS_MAX_OUTPUT_TOKENS..=MAX_LAST_WORDS_MAX_OUTPUT_TOKENS)
+                .contains(&profile.last_words_max_output_tokens)
+            {
+                bail!(
+                    "model profile {:?} Last Words max output tokens must be between {MIN_LAST_WORDS_MAX_OUTPUT_TOKENS} and {MAX_LAST_WORDS_MAX_OUTPUT_TOKENS}",
+                    profile.name
+                );
             }
             if profile.last_words_supplement.chars().count() > MAX_LAST_WORDS_SUPPLEMENT_CHARS {
                 bail!(
@@ -621,6 +647,43 @@ mod tests {
 
         let json = serde_json::to_value(profile).unwrap();
         assert_eq!(json.get("context_window"), None);
+    }
+
+    #[test]
+    fn last_words_output_limit_is_backward_compatible_and_bounded() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.last_words_max_output_tokens,
+            DEFAULT_LAST_WORDS_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("last_words_max_output_tokens"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].last_words_max_output_tokens = MIN_LAST_WORDS_MAX_OUTPUT_TOKENS - 1;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("Last Words max output tokens must be between"));
+
+        settings.models[0].last_words_max_output_tokens = MAX_LAST_WORDS_MAX_OUTPUT_TOKENS + 1;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("Last Words max output tokens must be between"));
+
+        settings.models[0].last_words_max_output_tokens = 20_000;
+        settings.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["models"][0]["last_words_max_output_tokens"],
+            20_000
+        );
     }
 
     #[test]

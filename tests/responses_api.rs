@@ -23,6 +23,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         max_tokens: Some(512),
         context_window: None,
         temperature: None,
+        last_words_max_output_tokens: 1_024,
         last_words_supplement: String::new(),
         stream,
     }

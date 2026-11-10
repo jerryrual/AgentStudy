@@ -104,7 +104,9 @@ TUI 和 `icode run` 会自动将一个最旧的先前已完成轮次持久化为
 工具历史，TUI 通过事件队列屏障保证先前 assistant/tool 记录先落盘。Chat Completions 和无状态
 Responses API 都使用同一语义。模型配置可选填 `last_words_supplement`（例如
 `"优先保留复现步骤、已排除原因和待验证假设。"`），在生成 Last Words 时强调容易丢失但对续写重要的信息；
-它只进入 Last Words side-call，不进入普通模型请求，最多 4000 个字符。
+它只进入 Last Words side-call，不进入普通模型请求，最多 4000 个字符。模型配置还可用
+`last_words_max_output_tokens` 调整 side-call 输出上限（1000–64000，默认 1024）；实际值不会超过模型的
+`max_tokens`，也会继续受剩余上下文预算限制。
 
 API 密钥有三种写法：
 
