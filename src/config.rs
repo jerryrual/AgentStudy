@@ -296,6 +296,9 @@ pub struct ModelProfile {
     /// Enable provider-hosted web search for ordinary Responses requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub responses_web_search: bool,
+    /// Enable a provider-hosted isolated Python container for ordinary Responses requests.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub responses_code_interpreter: bool,
     /// Provider-hosted file search for ordinary Responses requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_file_search: Option<ResponsesFileSearchConfig>,
@@ -358,6 +361,7 @@ impl ModelProfile {
             provider: "deepseek".to_string(),
             api_style: ApiStyle::Chat,
             responses_web_search: false,
+            responses_code_interpreter: false,
             responses_file_search: None,
             responses_stored_continuation: false,
             responses_background: false,
@@ -556,6 +560,21 @@ impl Settings {
                     "model profile {:?} enables Responses web search with a non-Responses API style",
                     profile.name
                 );
+            }
+            if profile.responses_code_interpreter {
+                if profile.api_style != ApiStyle::Responses {
+                    bail!(
+                        "model profile {:?} enables Responses code interpreter with a non-Responses API style",
+                        profile.name
+                    );
+                }
+                if !profile.provider.eq_ignore_ascii_case("openai") {
+                    bail!(
+                        "model profile {:?} enables Responses code interpreter for unsupported provider {:?}",
+                        profile.name,
+                        profile.provider
+                    );
+                }
             }
             if let Some(file_search) = &profile.responses_file_search {
                 if profile.api_style != ApiStyle::Responses {
@@ -1287,6 +1306,40 @@ mod tests {
         settings.normalise().unwrap();
         assert_eq!(
             serde_json::to_value(&settings).unwrap()["models"][0]["responses_web_search"],
+            true
+        );
+    }
+
+    #[test]
+    fn responses_code_interpreter_is_opt_in_and_openai_responses_only() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert!(!profile.responses_code_interpreter);
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("responses_code_interpreter"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].responses_code_interpreter = true;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("non-Responses API style"));
+
+        settings.models[0].api_style = ApiStyle::Responses;
+        let error = settings.normalise().unwrap_err().to_string();
+        assert!(error.contains("unsupported provider"));
+
+        settings.models[0].provider = "openai".into();
+        settings.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["models"][0]["responses_code_interpreter"],
             true
         );
     }

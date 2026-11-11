@@ -15,6 +15,7 @@ use crate::config::{ResponsesFileSearchFilter, ResponsesFileSearchRankingOptions
 pub(super) struct RequestFeatures {
     pub include_encrypted_reasoning: bool,
     pub web_search: bool,
+    pub code_interpreter: bool,
     pub file_search_vector_store_ids: Vec<String>,
     pub file_search_filters: Option<ResponsesFileSearchFilter>,
     pub file_search_max_num_results: Option<u8>,
@@ -108,6 +109,15 @@ pub(super) fn request_body(
         .collect();
     if features.web_search {
         declarations.push(json!({"type": "web_search"}));
+    }
+    if features.code_interpreter {
+        declarations.push(json!({
+            "type": "code_interpreter",
+            "container": {
+                "type": "auto",
+                "network_policy": {"type": "disabled"}
+            }
+        }));
     }
     if file_search {
         let mut declaration = json!({
@@ -347,7 +357,7 @@ impl ResponsesAccumulator {
                     }
                 }
             }
-            "web_search_call" | "file_search_call" => {}
+            "web_search_call" | "file_search_call" | "code_interpreter_call" => {}
             "" => {}
             item_type => self.unsupported_item = Some(item_type.to_string()),
         }
@@ -536,6 +546,37 @@ mod tests {
             serde_json::json!(["reasoning.encrypted_content", "file_search_call.results"])
         );
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn preserves_code_interpreter_calls_after_informational_stream_events() {
+        let mut accumulator = ResponsesAccumulator::default();
+        assert!(!accumulator
+            .apply(
+                r#"{"type":"response.code_interpreter_call_code.delta","output_index":0,"delta":"print(42)"}"#,
+                &NullSink,
+            )
+            .unwrap());
+        assert!(!accumulator
+            .apply(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"code_interpreter_call","id":"ci_1","code":"print(42)","container_id":"cntr_1","outputs":[{"type":"logs","logs":"42\n"}],"status":"completed"}}"#,
+                &NullSink,
+            )
+            .unwrap());
+        assert!(accumulator
+            .apply(
+                r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"code_interpreter_call","id":"ci_1","code":"print(42)","container_id":"cntr_1","outputs":[{"type":"logs","logs":"42\n"}],"status":"completed"},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"42","annotations":[]}]}]}}"#,
+                &NullSink,
+            )
+            .unwrap());
+
+        let completion = accumulator.finish().unwrap();
+        assert!(completion.message.tool_calls.is_empty());
+        assert_eq!(completion.message.content.as_deref(), Some("42"));
+        assert_eq!(
+            completion.message.responses_items[0]["type"],
+            "code_interpreter_call"
+        );
     }
 
     #[test]

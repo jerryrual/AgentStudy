@@ -24,6 +24,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         provider: "openai".to_string(),
         api_style: ApiStyle::Responses,
         responses_web_search: false,
+        responses_code_interpreter: false,
         responses_file_search: None,
         responses_stored_continuation: false,
         responses_background: false,
@@ -89,6 +90,7 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
     let directory = tempfile::tempdir().unwrap();
     let mut profile = responses_profile(&server, true);
     profile.responses_web_search = true;
+    profile.responses_code_interpreter = true;
     profile.responses_stored_continuation = true;
     profile.context_window = Some(30_000);
     profile.max_tokens = Some(3_000);
@@ -134,9 +136,18 @@ async fn responses_phase_four_generates_last_words_without_tools_or_streaming() 
     assert!(requests[1].get("previous_response_id").is_none());
     let ordinary_tools = requests[1]["tools"].as_array().unwrap();
     assert!(ordinary_tools.iter().any(|tool| tool["type"] == "function"));
+    assert!(ordinary_tools
+        .iter()
+        .any(|tool| tool == &json!({"type": "web_search"})));
     assert_eq!(
         ordinary_tools.last().unwrap(),
-        &json!({"type": "web_search"})
+        &json!({
+            "type": "code_interpreter",
+            "container": {
+                "type": "auto",
+                "network_policy": {"type": "disabled"}
+            }
+        })
     );
     assert_eq!(requests[1]["tool_choice"], "auto");
     assert_eq!(requests[1]["parallel_tool_calls"], true);
@@ -459,6 +470,103 @@ async fn responses_preserves_hosted_web_search_without_local_execution() {
             "status": "completed",
             "action": {"type": "search", "query": "Rust language"}
         })
+    );
+}
+
+#[tokio::test]
+async fn responses_preserves_and_replays_hosted_code_interpreter_calls() {
+    let server = MockServer::new(|_, body| {
+        if body["input"].as_array().unwrap().len() == 1 {
+            assert_eq!(
+                body["tools"],
+                json!([{
+                    "type": "code_interpreter",
+                    "container": {
+                        "type": "auto",
+                        "network_policy": {"type": "disabled"}
+                    }
+                }])
+            );
+            assert!(body["tools"][0]["container"].get("file_ids").is_none());
+            assert!(body["tools"][0]["container"].get("memory_limit").is_none());
+            assert!(body["tools"][0].get("allowed_callers").is_none());
+            assert!(body.get("tool_choice").is_none());
+            return MockResponse::json(
+                200,
+                &json!({
+                    "id": "resp_python",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "code_interpreter_call",
+                            "id": "ci_1",
+                            "code": "print(6 * 7)",
+                            "container_id": "cntr_1",
+                            "outputs": [{"type":"logs","logs":"42\n"}],
+                            "status": "completed"
+                        },
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type":"output_text","text":"The result is 42.","annotations":[]}]
+                        }
+                    ],
+                    "usage": {"input_tokens":4,"output_tokens":3,"total_tokens":7}
+                })
+                .to_string(),
+            );
+        }
+        assert_eq!(body["input"][1]["type"], "code_interpreter_call");
+        assert_eq!(body["input"][1]["container_id"], "cntr_1");
+        assert_eq!(body["input"][1]["outputs"][0]["logs"], "42\n");
+        MockResponse::json(
+            200,
+            &json!({
+                "id":"resp_explanation",
+                "status":"completed",
+                "output":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"Six times seven is 42.","annotations":[]}]
+                }],
+                "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_code_interpreter = true;
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let first = client
+        .complete(
+            &[Message::user("Calculate six times seven")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.message.content.as_deref(), Some("The result is 42."));
+    assert!(first.message.tool_calls.is_empty());
+    assert_eq!(first.message.responses_items.len(), 2);
+    assert_eq!(
+        first.message.responses_items[0]["type"],
+        "code_interpreter_call"
+    );
+
+    let messages = vec![
+        Message::user("Calculate six times seven"),
+        Message::assistant(first.message),
+        Message::user("Explain the result"),
+    ];
+    let second = client
+        .complete(&messages, &[], &RecordingSink::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.message.content.as_deref(),
+        Some("Six times seven is 42.")
     );
 }
 
@@ -1035,6 +1143,15 @@ async fn responses_file_search_configuration_changes_force_full_stored_replay() 
             value: ResponsesFileSearchFilterValue::String("engineering".into()),
         }),
     );
+    let third_input_len = messages.len();
+    let third = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(&messages, &[], &sink)
+        .await
+        .unwrap();
+    messages.push(Message::assistant(third.message));
+    messages.push(Message::user("fourth"));
+    profile.responses_code_interpreter = true;
     ModelClient::from_profile(&profile)
         .unwrap()
         .complete(&messages, &[], &sink)
@@ -1042,7 +1159,7 @@ async fn responses_file_search_configuration_changes_force_full_stored_replay() 
         .unwrap();
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 4);
     assert!(requests[1].get("previous_response_id").is_none());
     assert_eq!(
         requests[1]["input"].as_array().unwrap().len(),
@@ -1056,11 +1173,26 @@ async fn responses_file_search_configuration_changes_force_full_stored_replay() 
     assert!(requests[2].get("previous_response_id").is_none());
     assert_eq!(
         requests[2]["input"].as_array().unwrap().len(),
-        messages.len()
+        third_input_len
     );
     assert_eq!(
         requests[2]["tools"][0]["filters"],
         json!({"type":"eq","key":"department","value":"engineering"})
+    );
+    assert!(requests[3].get("previous_response_id").is_none());
+    assert_eq!(
+        requests[3]["input"].as_array().unwrap().len(),
+        messages.len()
+    );
+    assert_eq!(
+        requests[3]["tools"][0],
+        json!({
+            "type":"code_interpreter",
+            "container": {
+                "type":"auto",
+                "network_policy": {"type":"disabled"}
+            }
+        })
     );
 }
 
