@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agent_client_protocol::v1::schema::{
     CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
-    StopReason,
+    ResumeSessionRequest, StopReason,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, Error as ProtocolError};
 
@@ -88,6 +88,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let initialize_notices = Arc::clone(&notices);
     let prompt_notices = notices;
     let load_control = Arc::clone(&control);
+    let resume_control = Arc::clone(&control);
     let close_control = Arc::clone(&control);
     let delete_control = Arc::clone(&control);
     let prompt_control = Arc::clone(&control);
@@ -142,6 +143,21 @@ pub(crate) fn callback_bundle_with_setup_hook(
                             |notification| task_connection.send_notification(notification),
                             |response| responder.respond(response),
                         )
+                        .map_err(ProtocolError::from)
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ResumeSessionRequest, responder, connection| {
+                let control = Arc::clone(&resume_control);
+                connection.spawn(async move {
+                    let transaction = match control.prepare_resume_with_mcp(&request).await {
+                        Ok(transaction) => transaction,
+                        Err(error) => return responder.respond_with_error(error.into()),
+                    };
+                    transaction
+                        .complete_with(|response| responder.respond(response))
                         .map_err(ProtocolError::from)
                 })
             },
@@ -310,8 +326,9 @@ mod tests {
         CloseSessionResponse, ContentBlock, DeleteSessionRequest, DeleteSessionResponse,
         InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionResponse,
         McpServer, McpServerStdio, NewSessionResponse, NoticeCapabilities, PromptRequest,
-        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-        SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
+        ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
+        SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
+        SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -406,6 +423,15 @@ mod tests {
             })
             .unwrap();
         let load_id = SessionId::new(loaded.id());
+        let resumed = store
+            .create(directory.path().to_str().unwrap(), "model-a", "build")
+            .unwrap();
+        resumed
+            .append(&Record::User {
+                text: "do not replay".to_string(),
+            })
+            .unwrap();
+        let resume_id = SessionId::new(resumed.id());
 
         let cancel_id = sessions
             .create(
@@ -449,7 +475,8 @@ mod tests {
                                     )
                                     .close(SessionCloseCapabilities::new())
                                     .delete(SessionDeleteCapabilities::new())
-                                    .list(SessionListCapabilities::new()),
+                                    .list(SessionListCapabilities::new())
+                                    .resume(SessionResumeCapabilities::new()),
                             )
                     );
 
@@ -476,6 +503,23 @@ mod tests {
                         .await
                         .unwrap_err();
                     assert_eq!(invalid.code, ErrorCode::INVALID_PARAMS);
+
+                    let resumed: ResumeSessionResponse = connection
+                        .send_request(ResumeSessionRequest::new(
+                            resume_id.clone(),
+                            directory.path(),
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(resumed, ResumeSessionResponse::new());
+                    assert!(notifications
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_empty());
+                    let _: CloseSessionResponse = connection
+                        .send_request(CloseSessionRequest::new(resume_id))
+                        .block_task()
+                        .await?;
 
                     #[cfg(unix)]
                     {
