@@ -14,6 +14,8 @@ use crate::agent::EventSink;
 pub(super) struct RequestFeatures {
     pub include_encrypted_reasoning: bool,
     pub web_search: bool,
+    pub file_search_vector_store_ids: Vec<String>,
+    pub file_search_max_num_results: Option<u8>,
     pub store: bool,
     pub background: bool,
     pub previous_response_id: Option<String>,
@@ -84,6 +86,7 @@ pub(super) fn request_body(
     if let Some(previous_response_id) = &features.previous_response_id {
         body["previous_response_id"] = json!(previous_response_id);
     }
+    let file_search = !features.file_search_vector_store_ids.is_empty();
     let mut declarations: Vec<Value> = tools
         .iter()
         .map(|tool| {
@@ -103,6 +106,16 @@ pub(super) fn request_body(
     if features.web_search {
         declarations.push(json!({"type": "web_search"}));
     }
+    if file_search {
+        let mut declaration = json!({
+            "type": "file_search",
+            "vector_store_ids": features.file_search_vector_store_ids,
+        });
+        if let Some(maximum) = features.file_search_max_num_results {
+            declaration["max_num_results"] = json!(maximum);
+        }
+        declarations.push(declaration);
+    }
     if !declarations.is_empty() {
         body["tools"] = Value::Array(declarations);
     }
@@ -110,8 +123,15 @@ pub(super) fn request_body(
         body["tool_choice"] = json!("auto");
         body["parallel_tool_calls"] = json!(true);
     }
+    let mut include = Vec::new();
     if features.include_encrypted_reasoning {
-        body["include"] = json!(["reasoning.encrypted_content"]);
+        include.push("reasoning.encrypted_content");
+    }
+    if file_search {
+        include.push("file_search_call.results");
+    }
+    if !include.is_empty() {
+        body["include"] = json!(include);
     }
     if let Some(temperature) = temperature {
         body["temperature"] = json!(temperature);
@@ -318,7 +338,7 @@ impl ResponsesAccumulator {
                     }
                 }
             }
-            "web_search_call" => {}
+            "web_search_call" | "file_search_call" => {}
             "" => {}
             item_type => self.unsupported_item = Some(item_type.to_string()),
         }
@@ -444,6 +464,70 @@ mod tests {
     use super::{decode_json, request_body, RequestFeatures, ResponsesAccumulator};
     use crate::agent::NullSink;
     use crate::model::Message;
+
+    #[test]
+    fn declares_and_replays_hosted_file_search_items_verbatim() {
+        let hosted = serde_json::json!({
+            "type": "file_search_call",
+            "id": "fs_1",
+            "queries": ["Rust ownership"],
+            "status": "completed",
+            "results": [{
+                "file_id": "file_1",
+                "filename": "guide.md",
+                "score": 0.9,
+                "text": "Ownership has one owner."
+            }]
+        });
+        let message = serde_json::json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "See the guide.",
+                "annotations": [{
+                    "type": "file_citation",
+                    "file_id": "file_1",
+                    "filename": "guide.md",
+                    "index": 3
+                }]
+            }]
+        });
+        let body = request_body(
+            &[Message::assistant(crate::model::AssistantMessage {
+                responses_items: vec![hosted.clone(), message.clone()],
+                ..crate::model::AssistantMessage::default()
+            })],
+            &[],
+            "model",
+            false,
+            None,
+            None,
+            RequestFeatures {
+                include_encrypted_reasoning: true,
+                file_search_vector_store_ids: vec!["vs_docs".into()],
+                file_search_max_num_results: Some(20),
+                ..RequestFeatures::default()
+            },
+        );
+
+        assert_eq!(body["input"], serde_json::json!([hosted, message]));
+        assert_eq!(
+            body["tools"],
+            serde_json::json!([{
+                "type": "file_search",
+                "vector_store_ids": ["vs_docs"],
+                "max_num_results": 20
+            }])
+        );
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content", "file_search_call.results"])
+        );
+        assert!(body.get("tool_choice").is_none());
+    }
 
     #[test]
     fn replays_hosted_web_search_items_verbatim() {
