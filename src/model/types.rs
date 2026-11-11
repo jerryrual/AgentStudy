@@ -6,7 +6,8 @@ use std::io::Cursor;
 
 use anyhow::{ensure, Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use image::{ImageFormat, ImageReader, Limits};
+use image::codecs::gif::GifDecoder;
+use image::{AnimationDecoder, ImageDecoder, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -92,6 +93,7 @@ pub(crate) const MAX_SESSION_IMAGES: usize = 256;
 const MAX_ENCODED_IMAGE_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
 const MAX_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+const MAX_GIF_FRAMES: usize = 256;
 
 /// One embedded image supplied by a user-facing protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,15 +123,50 @@ impl ImageInput {
         data: String,
         remaining_bytes: usize,
     ) -> Result<(Self, usize)> {
-        let mut image = Self {
+        let image = Self {
             media_type,
             data,
             validated_key: None,
         };
         let (format, decoded) = image.decode_payload()?;
+        Self::validated_decoded(image, format, decoded, remaining_bytes)
+    }
+
+    pub(crate) fn validated_bytes(
+        decoded: Vec<u8>,
+        remaining_bytes: usize,
+    ) -> Result<(Self, usize)> {
+        ensure!(!decoded.is_empty(), "image file must not be empty");
+        ensure!(
+            decoded.len() <= MAX_IMAGE_BYTES,
+            "image exceeds the {MAX_IMAGE_BYTES}-byte decoded limit"
+        );
+        let format =
+            image::guess_format(&decoded).context("unsupported or unrecognized image format")?;
+        let media_type = match format {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::WebP => "image/webp",
+            _ => anyhow::bail!("unsupported image format: {format:?}"),
+        };
+        let image = Self {
+            media_type: media_type.to_string(),
+            data: BASE64_STANDARD.encode(&decoded),
+            validated_key: None,
+        };
+        Self::validated_decoded(image, format, decoded, remaining_bytes)
+    }
+
+    fn validated_decoded(
+        mut image: Self,
+        format: ImageFormat,
+        decoded: Vec<u8>,
+        remaining_bytes: usize,
+    ) -> Result<(Self, usize)> {
         ensure!(
             decoded.len() <= remaining_bytes,
-            "ACP prompt images exceed their aggregate limit"
+            "prompt images exceed their aggregate limit"
         );
         image.decode_image(format, &decoded)?;
         image.validated_key = Some(validation_cache_key(&image.media_type, &decoded));
@@ -144,7 +181,7 @@ impl ImageInput {
         let (format, decoded) = self.decode_payload()?;
         ensure!(
             decoded.len() <= remaining_bytes,
-            "ACP image bytes exceed their session limit"
+            "image bytes exceed their remaining limit"
         );
         let key = validation_cache_key(&self.media_type, &decoded);
         if self.validated_key != Some(key) && !validated.contains(&key) {
@@ -179,21 +216,57 @@ impl ImageInput {
     }
 
     fn decode_image(&self, format: ImageFormat, decoded: &[u8]) -> Result<()> {
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
-        limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+        if format == ImageFormat::Gif {
+            return self.decode_gif_frames(decoded);
+        }
         let mut reader = ImageReader::with_format(Cursor::new(decoded), format);
-        reader.limits(limits);
+        reader.limits(image_decode_limits());
         reader
             .decode()
-            .with_context(|| format!("ACP image data is not a valid {} image", self.media_type))?;
+            .with_context(|| format!("image data is not a valid {} image", self.media_type))?;
+        Ok(())
+    }
+
+    fn decode_gif_frames(&self, decoded: &[u8]) -> Result<()> {
+        let mut decoder = GifDecoder::new(Cursor::new(decoded))
+            .context("image data is not a valid image/gif image")?;
+        decoder
+            .set_limits(image_decode_limits())
+            .context("GIF exceeds image decode limits")?;
+        let mut frame_count = 0usize;
+        let mut decoded_bytes = 0u64;
+        for frame in decoder.into_frames() {
+            let frame = frame.context("image data contains an invalid GIF frame")?;
+            frame_count = frame_count
+                .checked_add(1)
+                .context("GIF frame count overflowed")?;
+            ensure!(
+                frame_count <= MAX_GIF_FRAMES,
+                "GIF exceeds the {MAX_GIF_FRAMES}-frame limit"
+            );
+            decoded_bytes = decoded_bytes
+                .checked_add(frame.buffer().as_raw().len() as u64)
+                .context("GIF decoded byte count overflowed")?;
+            ensure!(
+                decoded_bytes <= MAX_IMAGE_DECODE_ALLOC,
+                "GIF frames exceed the {MAX_IMAGE_DECODE_ALLOC}-byte decoded limit"
+            );
+        }
+        ensure!(frame_count > 0, "GIF image contains no frames");
         Ok(())
     }
 
     fn placeholder(&self) -> String {
         format!("[image: {}]", self.media_type)
     }
+}
+
+fn image_decode_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+    limits
 }
 
 fn validation_cache_key(media_type: &str, bytes: &[u8]) -> [u8; 32] {
@@ -235,6 +308,24 @@ impl UserContent {
         }
     }
 
+    pub(crate) fn has_images(&self) -> bool {
+        matches!(
+            self,
+            Self::Parts(parts)
+                if parts
+                    .iter()
+                    .any(|part| matches!(part, UserContentPart::Image { .. }))
+        )
+    }
+
+    pub(crate) fn validate_prompt_images(&self) -> Result<(usize, usize)> {
+        self.validate_images(
+            MAX_PROMPT_IMAGE_BYTES,
+            MAX_PROMPT_IMAGES,
+            &mut HashSet::new(),
+        )
+    }
+
     pub(crate) fn validate_images(
         &self,
         max_bytes: usize,
@@ -250,19 +341,13 @@ impl UserContent {
             let UserContentPart::Image { image } = part else {
                 continue;
             };
-            count = count.checked_add(1).context("ACP image count overflowed")?;
-            ensure!(
-                count <= max_count,
-                "ACP image count exceeds its session limit"
-            );
+            count = count.checked_add(1).context("image count overflowed")?;
+            ensure!(count <= max_count, "image count exceeds its limit");
             let remaining_bytes = max_bytes.saturating_sub(bytes);
             bytes = bytes
                 .checked_add(image.validate_persisted(remaining_bytes, validated)?)
-                .context("ACP image byte count overflowed")?;
-            ensure!(
-                bytes <= max_bytes,
-                "ACP image bytes exceed their session limit"
-            );
+                .context("image byte count overflowed")?;
+            ensure!(bytes <= max_bytes, "image bytes exceed their limit");
         }
         Ok((bytes, count))
     }
@@ -625,6 +710,19 @@ mod tests {
             .validate_images(MAX_IMAGE_BYTES, 0, &mut HashSet::new())
             .unwrap_err();
         assert!(error.to_string().contains("count exceeds"), "{error:#}");
+    }
+
+    #[test]
+    fn animated_gif_validation_enforces_the_frame_limit() {
+        use image::codecs::gif::GifEncoder;
+        use image::{Frame, RgbaImage};
+
+        let mut encoded = Vec::new();
+        GifEncoder::new(&mut encoded)
+            .encode_frames((0..=MAX_GIF_FRAMES).map(|_| Frame::new(RgbaImage::new(1, 1))))
+            .unwrap();
+        let error = ImageInput::validated_bytes(encoded, MAX_IMAGE_BYTES).unwrap_err();
+        assert!(error.to_string().contains("frame limit"), "{error:#}");
     }
 
     #[test]

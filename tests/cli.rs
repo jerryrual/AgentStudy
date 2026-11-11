@@ -1,11 +1,13 @@
 mod common;
 
+use std::io::Cursor;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use common::*;
 use fs2::FileExt;
+use image::{DynamicImage, ImageFormat};
 use serde_json::{json, Value};
 
 fn settings_json(base_url: &str) -> String {
@@ -33,6 +35,16 @@ fn icode() -> Command {
 
 fn write_settings(home: &std::path::Path, base_url: &str) {
     std::fs::write(home.join("settings.json"), settings_json(base_url)).unwrap();
+}
+
+fn write_vision_settings(home: &std::path::Path, base_url: &str) {
+    let mut settings: Value = serde_json::from_str(&settings_json(base_url)).unwrap();
+    settings["models"][0]["vision"] = Value::Bool(true);
+    std::fs::write(
+        home.join("settings.json"),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -98,6 +110,112 @@ fn run_json_returns_a_machine_readable_result() {
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[1]["content"], "hello");
     assert!(!requests[0]["tools"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn run_attaches_ordered_images_relative_to_cwd() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("described"), &done_chunk("stop")])
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_vision_settings(home.path(), &server.base_url());
+
+    let mut png = Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(2, 1)
+        .write_to(&mut png, ImageFormat::Png)
+        .unwrap();
+    std::fs::write(work.path().join("first.data"), png.into_inner()).unwrap();
+    let mut gif = Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(1, 2)
+        .write_to(&mut gif, ImageFormat::Gif)
+        .unwrap();
+    std::fs::write(work.path().join("second.data"), gif.into_inner()).unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "describe both",
+            "--image",
+            "first.data",
+            "--image",
+            "second.data",
+            "--json",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let content = requests[0]["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0], json!({"type": "text", "text": "describe both"}));
+    assert!(content[1]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+    assert!(content[2]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/gif;base64,"));
+
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session_id = payload["session_id"].as_str().unwrap();
+    write_settings(home.path(), &server.base_url());
+    let resumed = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "continue",
+            "--session",
+            session_id,
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!resumed.status.success());
+    assert!(String::from_utf8_lossy(&resumed.stderr).contains("image-bearing session"));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn invalid_cli_image_fails_before_session_or_provider_io() {
+    let server = MockServer::new(|_path, _body| {
+        MockResponse::sse(&[&text_chunk("unexpected"), &done_chunk("stop")])
+    });
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    write_vision_settings(home.path(), &server.base_url());
+    std::fs::write(work.path().join("bad.png"), b"not an image").unwrap();
+
+    let output = icode()
+        .env("ICODE_HOME", home.path())
+        .args([
+            "run",
+            "describe",
+            "--image",
+            "bad.png",
+            "--cwd",
+            work.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(server.requests().is_empty());
+    let sessions = home.path().join("sessions");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(sessions).unwrap().next().is_none(),
+        "image preflight must not create a session"
+    );
 }
 
 #[test]
