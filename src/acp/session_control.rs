@@ -9,12 +9,15 @@ use std::sync::Arc;
 
 use super::error::{ControlError, ControlResult, InvalidSessionRequest};
 use super::mcp;
-use super::sessions::{BeginPromptError, LoadError, PreparedLoad, PromptGuard, SessionRegistry};
+use super::sessions::{
+    BeginPromptError, CloseError, LoadError, PreparedLoad, PromptGuard, SessionRegistry,
+};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
-    AgentCapabilities, CancelNotification, InitializeRequest, InitializeResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionNotification,
+    AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionNotification,
 };
 use agent_client_protocol::Error as ProtocolError;
 
@@ -56,7 +59,8 @@ impl SessionControl {
                 .load_session(true)
                 .session_capabilities(
                     SessionCapabilities::new()
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
+                        .close(SessionCloseCapabilities::new()),
                 ),
         )
     }
@@ -172,6 +176,23 @@ impl SessionControl {
             })
     }
 
+    /// Cancel active work, drain it, and release one registered session.
+    pub(crate) async fn close(
+        &self,
+        request: &CloseSessionRequest,
+    ) -> ControlResult<CloseSessionResponse> {
+        self.sessions
+            .close(&request.session_id)
+            .await
+            .map_err(|error| match error {
+                CloseError::SessionNotFound => {
+                    ControlError::SessionNotFound(request.session_id.clone())
+                }
+                CloseError::Loading => ControlError::invalid(InvalidSessionRequest::CloseLoading),
+            })?;
+        Ok(CloseSessionResponse::new())
+    }
+
     /// Forward a fire-and-forget cancellation to the matching active prompt.
     pub(crate) fn cancel(&self, notification: &CancelNotification) -> bool {
         self.sessions.cancel(&notification.session_id)
@@ -284,10 +305,10 @@ mod tests {
                 AgentCapabilities::new()
                     .load_session(true)
                     .session_capabilities(
-                        SessionCapabilities::new().additional_directories(
-                            SessionAdditionalDirectoriesCapabilities::new(),
-                        )
-                    )
+                    SessionCapabilities::new()
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new(),)
+                        .close(SessionCloseCapabilities::new()),
+                )
             );
         }
     }
@@ -304,6 +325,48 @@ mod tests {
         assert_eq!(loaded.meta.cwd, directory.path().to_str().unwrap());
         assert_eq!(loaded.meta.model, "model-a");
         assert_eq!(loaded.meta.agent, "build");
+    }
+
+    #[tokio::test]
+    async fn close_cancels_drains_and_preserves_the_persisted_session() {
+        let (directory, store, control) = control();
+        let response = control
+            .new_session(&NewSessionRequest::new(directory.path()))
+            .await
+            .unwrap();
+        let session_id = response.session_id;
+        let id = session_id.to_string();
+        let mut guard = control.begin_prompt(&session_id).unwrap();
+        let close_control = Arc::new(control);
+        let close_request = CloseSessionRequest::new(session_id.clone());
+        let close_task = {
+            let close_control = Arc::clone(&close_control);
+            tokio::spawn(async move { close_control.close(&close_request).await })
+        };
+
+        guard.cancelled().await;
+        assert!(matches!(
+            close_control.begin_prompt(&session_id),
+            Err(ControlError::SessionNotFound(_))
+        ));
+        assert!(!close_task.is_finished());
+        drop(guard);
+        assert_eq!(
+            close_task.await.unwrap().unwrap(),
+            CloseSessionResponse::new()
+        );
+        store.try_acquire_run_lease(&id).unwrap();
+        assert!(store.path(&id).exists());
+
+        let error = close_control
+            .close(&CloseSessionRequest::new(session_id.clone()))
+            .await
+            .unwrap_err();
+        let protocol: ProtocolError = error.into();
+        assert_eq!(
+            protocol,
+            agent_client_protocol::v1::schema::Error::session_not_found(session_id).into()
+        );
     }
 
     #[tokio::test]
@@ -527,7 +590,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(control.sessions.close(&created.session_id));
+        control.sessions.close(&created.session_id).await.unwrap();
 
         let replacement = vec![directory.path().join("load-root")];
         control
@@ -541,7 +604,7 @@ mod tests {
         let guard = control.begin_prompt(&created.session_id).unwrap();
         assert_eq!(guard.additional_directories(), replacement);
         drop(guard);
-        assert!(control.sessions.close(&created.session_id));
+        control.sessions.close(&created.session_id).await.unwrap();
 
         control
             .prepare_load(&LoadSessionRequest::new(
@@ -607,7 +670,7 @@ mod tests {
                         .unwrap()
                         .to_string()
                         .contains("still loading"));
-                    assert!(!control.sessions.close(&session_id));
+                    assert!(control.sessions.is_registered(&session_id));
                     assert!(!control.sessions.cancel(&session_id));
                     events
                         .borrow_mut()
@@ -622,7 +685,7 @@ mod tests {
                         .unwrap()
                         .to_string()
                         .contains("still loading"));
-                    assert!(!control.sessions.close(&session_id));
+                    assert!(control.sessions.is_registered(&session_id));
                     assert!(!control.sessions.cancel(&session_id));
                     events
                         .borrow_mut()

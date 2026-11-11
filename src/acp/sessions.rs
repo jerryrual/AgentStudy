@@ -39,6 +39,13 @@ impl std::fmt::Display for BeginPromptError {
 
 impl std::error::Error for BeginPromptError {}
 
+/// A classified failure while closing one registered ACP session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseError {
+    SessionNotFound,
+    Loading,
+}
+
 /// A classified failure while preparing or activating an ACP session load.
 #[derive(Debug)]
 pub(crate) enum LoadError {
@@ -325,17 +332,33 @@ impl SessionRegistry {
         })
     }
 
-    /// Release an idle registered session and its run lease.
-    pub(crate) fn close(&self, session_id: &SessionId) -> bool {
-        let mut sessions = lock(&self.sessions);
-        let Some(registered) = sessions.get(session_id) else {
-            return false;
+    /// Stop admitting prompts, cancel active work, and release the registered session.
+    pub(crate) async fn close(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<(), CloseError> {
+        let (registered, cancellation) = {
+            let mut sessions = lock(&self.sessions);
+            let registered = sessions
+                .get(session_id)
+                .ok_or(CloseError::SessionNotFound)?;
+            if !registered.ready.load(Ordering::Acquire) {
+                return Err(CloseError::Loading);
+            }
+            let registered = sessions
+                .remove(session_id)
+                .expect("registered session disappeared while locked");
+            let cancellation = lock(&registered.active_prompt).clone();
+            if let Some(cancel) = cancellation.as_ref() {
+                cancel.send_replace(true);
+            }
+            (registered, cancellation)
         };
-        if !registered.ready.load(Ordering::Acquire) || lock(&registered.active_prompt).is_some() {
-            return false;
+        if let Some(cancel) = cancellation {
+            cancel.closed().await;
         }
-        sessions.remove(session_id);
-        true
+        drop(registered);
+        Ok(())
     }
 
     /// Request cancellation without marking the prompt idle before it exits.
@@ -629,26 +652,38 @@ mod tests {
         store.try_acquire_run_lease(&id).unwrap();
     }
 
-    #[test]
-    fn close_refuses_an_active_prompt_then_releases_the_idle_run_lease() {
+    #[tokio::test]
+    async fn close_cancels_an_active_prompt_then_releases_the_run_lease() {
         let (_directory, store, registry) = registry();
+        let registry = Arc::new(registry);
         let tools = Arc::new(ToolRegistry::builtin());
         let session_id = registry
             .create("/workspace", "model-a", "build", Arc::clone(&tools))
             .unwrap();
         assert_eq!(Arc::strong_count(&tools), 2);
         let id = session_id.to_string();
-        let guard = registry.begin_prompt(&session_id).unwrap();
+        let mut guard = registry.begin_prompt(&session_id).unwrap();
+        let close_registry = Arc::clone(&registry);
+        let close_id = session_id.clone();
+        let close = tokio::spawn(async move { close_registry.close(&close_id).await });
 
-        assert!(!registry.close(&session_id));
+        guard.cancelled().await;
+        assert!(matches!(
+            registry.begin_prompt(&session_id),
+            Err(BeginPromptError::SessionNotFound)
+        ));
+        assert!(!close.is_finished());
         assert_eq!(Arc::strong_count(&tools), 2);
         assert!(store.try_acquire_run_lease(&id).is_err());
 
         drop(guard);
-        assert!(registry.close(&session_id));
+        close.await.unwrap().unwrap();
         assert_eq!(Arc::strong_count(&tools), 1);
         store.try_acquire_run_lease(&id).unwrap();
-        assert!(!registry.close(&session_id));
+        assert_eq!(
+            registry.close(&session_id).await,
+            Err(CloseError::SessionNotFound)
+        );
     }
 
     #[test]
