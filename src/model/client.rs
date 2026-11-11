@@ -15,7 +15,7 @@ use super::sse::SseParser;
 use super::types::{AssistantMessage, Completion, Message, ToolCall, ToolDef, Usage};
 use crate::agent::EventSink;
 use crate::config::{
-    resolve_api_key, ApiStyle, ModelProfile, ResponsesFileSearchRanker,
+    resolve_api_key, ApiStyle, ModelProfile, ResponsesFileSearchFilter, ResponsesFileSearchRanker,
     ResponsesFileSearchRankingOptions,
 };
 
@@ -44,6 +44,7 @@ pub struct ModelClient {
     include_encrypted_reasoning: bool,
     responses_web_search: bool,
     responses_file_search_vector_store_ids: Vec<String>,
+    responses_file_search_filters: Option<ResponsesFileSearchFilter>,
     responses_file_search_max_num_results: Option<u8>,
     responses_file_search_ranking_options: Option<ResponsesFileSearchRankingOptions>,
     responses_stored_continuation: bool,
@@ -115,6 +116,13 @@ impl ModelClient {
                 "background Responses require an OpenAI Responses profile with stored continuation enabled and streaming disabled"
             );
         }
+        if let Some(filter) = profile
+            .responses_file_search
+            .as_ref()
+            .and_then(|config| config.filters.as_ref())
+        {
+            filter.validate()?;
+        }
         if let Some(ranking) = profile
             .responses_file_search
             .as_ref()
@@ -149,6 +157,10 @@ impl ModelClient {
                 .as_ref()
                 .map(|config| config.vector_store_ids.clone())
                 .unwrap_or_default(),
+            responses_file_search_filters: profile
+                .responses_file_search
+                .as_ref()
+                .and_then(|config| config.filters.clone()),
             responses_file_search_max_num_results: profile
                 .responses_file_search
                 .as_ref()
@@ -743,6 +755,14 @@ impl ModelClient {
             hasher.update((id.len() as u64).to_be_bytes());
             hasher.update(id.as_bytes());
         }
+        if let Some(filter) = &self.responses_file_search_filters {
+            let encoded = json!(filter).to_string();
+            hasher.update([1]);
+            hasher.update((encoded.len() as u64).to_be_bytes());
+            hasher.update(encoded.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
         if let Some(ranking) = &self.responses_file_search_ranking_options {
             hasher.update([1]);
             hasher.update([match ranking.ranker {
@@ -909,6 +929,7 @@ impl ModelClient {
                     file_search_vector_store_ids: self
                         .responses_file_search_vector_store_ids
                         .clone(),
+                    file_search_filters: self.responses_file_search_filters.clone(),
                     file_search_max_num_results: self.responses_file_search_max_num_results,
                     file_search_ranking_options: self.responses_file_search_ranking_options.clone(),
                     store: self.responses_stored_continuation,
@@ -994,6 +1015,9 @@ impl ModelClient {
                 "type": "file_search",
                 "vector_store_ids": self.responses_file_search_vector_store_ids,
             });
+            if let Some(filters) = &self.responses_file_search_filters {
+                declaration["filters"] = json!(filters);
+            }
             if let Some(maximum) = self.responses_file_search_max_num_results {
                 declaration["max_num_results"] = json!(maximum);
             }
