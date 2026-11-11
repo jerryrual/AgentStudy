@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
-    CancelNotification, CloseSessionRequest, InitializeRequest, ListSessionsRequest,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, StopReason,
+    CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
+    ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
+    StopReason,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, Error as ProtocolError};
 
@@ -88,6 +89,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let prompt_notices = notices;
     let load_control = Arc::clone(&control);
     let close_control = Arc::clone(&control);
+    let delete_control = Arc::clone(&control);
     let prompt_control = Arc::clone(&control);
     let prompt_runtime = runtime;
     let cancel_control = control;
@@ -151,6 +153,17 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 connection.spawn(async move {
                     responder.respond_with_result(
                         control.close(&request).await.map_err(ProtocolError::from),
+                    )
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: DeleteSessionRequest, responder, connection| {
+                let control = Arc::clone(&delete_control);
+                connection.spawn(async move {
+                    responder.respond_with_result(
+                        control.delete(&request).await.map_err(ProtocolError::from),
                     )
                 })
             },
@@ -294,11 +307,11 @@ mod tests {
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::v1::schema::{
         AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest,
-        CloseSessionResponse, ContentBlock, InitializeResponse, ListSessionsRequest,
-        ListSessionsResponse, LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse,
-        NoticeCapabilities, PromptRequest, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionCloseCapabilities, SessionId, SessionListCapabilities,
-        SessionNotification,
+        CloseSessionResponse, ContentBlock, DeleteSessionRequest, DeleteSessionResponse,
+        InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionResponse,
+        McpServer, McpServerStdio, NewSessionResponse, NoticeCapabilities, PromptRequest,
+        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+        SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -435,6 +448,7 @@ mod tests {
                                         SessionAdditionalDirectoriesCapabilities::new(),
                                     )
                                     .close(SessionCloseCapabilities::new())
+                                    .delete(SessionDeleteCapabilities::new())
                                     .list(SessionListCapabilities::new()),
                             )
                     );
@@ -524,11 +538,30 @@ mod tests {
                         .unwrap_err();
                     assert_eq!(invalid_cursor.code, ErrorCode::INVALID_PARAMS);
                     let closed_again = connection
-                        .send_request(CloseSessionRequest::new(created_id))
+                        .send_request(CloseSessionRequest::new(created_id.clone()))
                         .block_task()
                         .await
                         .unwrap_err();
                     assert_eq!(closed_again.code, ErrorCode::RESOURCE_NOT_FOUND);
+                    let _: DeleteSessionResponse = connection
+                        .send_request(DeleteSessionRequest::new(created_id.clone()))
+                        .block_task()
+                        .await?;
+                    assert!(store.load(&created_id.to_string()).is_err());
+                    let listed: ListSessionsResponse = connection
+                        .send_request(ListSessionsRequest::new().cwd(directory.path()))
+                        .block_task()
+                        .await?;
+                    assert!(listed
+                        .sessions
+                        .iter()
+                        .all(|session| session.session_id != created_id));
+                    let deleted_again = connection
+                        .send_request(DeleteSessionRequest::new(created_id))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert_eq!(deleted_again.code, ErrorCode::RESOURCE_NOT_FOUND);
 
                     let _: LoadSessionResponse = connection
                         .send_request(LoadSessionRequest::new(load_id, directory.path()))
