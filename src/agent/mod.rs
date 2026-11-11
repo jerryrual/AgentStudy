@@ -4,7 +4,7 @@
 pub mod events;
 pub mod injection;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,7 +70,7 @@ You help the user understand and change their codebase. Work directly, using the
 
 Operating rules:
 - Investigate before you edit: list directories, search, and read the relevant files.
-- Prefer read_file, list_dir, grep, glob and edit_file over shell equivalents when inspecting or editing source files.
+- Prefer read_file, list_dir, grep and glob over shell equivalents when inspecting source files.
 - Use bash for building, testing, running programs and git. Keep commands non-interactive.
 - Keep changes minimal and consistent with the surrounding code. Do not reformat unrelated code.
 - Verify your work by running the project's formatters, linters and tests when they exist.
@@ -118,6 +118,7 @@ pub struct Agent {
     project_memory: crate::memory::ProjectMemory,
     additional_directories: Vec<PathBuf>,
     tool_overrides: HashMap<String, Arc<dyn Tool>>,
+    hidden_tools: HashSet<String>,
     todos: Arc<Mutex<Vec<TodoItem>>>,
 }
 
@@ -139,6 +140,7 @@ impl Agent {
             project_memory,
             additional_directories: Vec::new(),
             tool_overrides: HashMap::new(),
+            hidden_tools: HashSet::new(),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -155,6 +157,15 @@ impl Agent {
             "tool override {name:?} has no registered specification"
         );
         self.tool_overrides.insert(name.to_string(), tool);
+        self
+    }
+
+    pub(crate) fn with_hidden_tool(mut self, name: &str) -> Self {
+        assert!(
+            self.tools.get(name).is_some(),
+            "hidden tool {name:?} is not registered"
+        );
+        self.hidden_tools.insert(name.to_string());
         self
     }
 
@@ -206,12 +217,15 @@ impl Agent {
     }
 
     fn visible_specs(&self) -> Vec<ToolDef> {
-        let specs = self.tools.specs();
+        let specs = self
+            .tools
+            .specs()
+            .into_iter()
+            .filter(|spec| !self.hidden_tools.contains(&spec.name));
         if self.options.kind == AgentKind::Code {
-            return specs;
+            return specs.collect();
         }
         specs
-            .into_iter()
             .filter(|spec| {
                 self.tools
                     .get(&spec.name)
@@ -406,6 +420,9 @@ impl Agent {
     }
 
     fn tool(&self, name: &str) -> Option<&dyn Tool> {
+        if self.hidden_tools.contains(name) {
+            return None;
+        }
         self.tool_overrides
             .get(name)
             .map(Arc::as_ref)
@@ -456,8 +473,7 @@ impl Agent {
             let message = format!(
                 "Error: unknown tool {:?}; available tools: {}",
                 call.name,
-                self.tools
-                    .specs()
+                self.visible_specs()
                     .iter()
                     .map(|spec| spec.name.clone())
                     .collect::<Vec<_>>()
@@ -918,6 +934,25 @@ mod tests {
         assert!(ok);
         assert_eq!(output, "client");
         assert_eq!(model_output, "client");
+    }
+
+    #[tokio::test]
+    async fn prompt_hidden_tool_is_neither_visible_nor_executable() {
+        let agent = test_agent(Box::new(OutputProbe("local"))).with_hidden_tool("read_file");
+        assert!(agent.tool_defs().is_empty());
+        let call = ToolCall {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        };
+
+        let (ok, _, output, model_output) = agent
+            .execute_tool_inner(&call, &test_context(), "read")
+            .await;
+        assert!(!ok);
+        assert!(output.contains("unknown tool"));
+        assert!(!output.contains("available tools: read_file"));
+        assert_eq!(model_output, output);
     }
 
     #[tokio::test]

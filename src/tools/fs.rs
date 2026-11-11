@@ -182,8 +182,7 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> &'static str {
-        "Create or overwrite a UTF-8 text file. Missing parent directories are created. \
-         For small edits prefer edit_file, which keeps the rest of the file untouched."
+        "Create or overwrite a UTF-8 text file with the complete new contents."
     }
 
     fn parameters(&self) -> Value {
@@ -236,8 +235,7 @@ impl Tool for WriteFile {
         tokio::fs::write(&full, content)
             .await
             .with_context(|| format!("cannot write {display}"))?;
-        let lines = content.lines().count();
-        let mut message = format!("Wrote {display}: {lines} lines, {} bytes.", content.len());
+        let mut message = format_write_result(&display, content);
         if let Some(previous) = previous {
             if previous != content {
                 let (added, removed) = diff_counts(&previous, content);
@@ -248,6 +246,11 @@ impl Tool for WriteFile {
         }
         Ok(message)
     }
+}
+
+pub(crate) fn format_write_result(display: &str, content: &str) -> String {
+    let lines = content.lines().count();
+    format!("Wrote {display}: {lines} lines, {} bytes.", content.len())
 }
 
 pub struct EditFile;
