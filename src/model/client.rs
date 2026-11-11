@@ -1,9 +1,9 @@
 //! OpenAI-compatible chat-completions client with SSE streaming and retries.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client as HttpClient;
 use reqwest::StatusCode;
@@ -18,6 +18,9 @@ use crate::config::{resolve_api_key, ApiStyle, ModelProfile};
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_ERROR_BODY: usize = 600;
+const MAX_ERROR_READ: usize = 64 * 1024;
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const BACKGROUND_DEADLINE: Duration = Duration::from_secs(600);
 const LAST_WORDS_MIN_CHARS: usize = 300;
 const LAST_WORDS_GENERATION_ATTEMPTS: usize = 2;
 const LAST_WORDS_SYSTEM_PROMPT: &str = r#"You write a durable progress note so a coding agent can continue after its current tool-call history is removed.
@@ -38,6 +41,7 @@ pub struct ModelClient {
     include_encrypted_reasoning: bool,
     responses_web_search: bool,
     responses_stored_continuation: bool,
+    responses_background: bool,
     endpoint: String,
     api_key: String,
     model: String,
@@ -95,6 +99,16 @@ impl PhaseFourPrepareError {
 impl ModelClient {
     /// Build a client for a profile, resolving the API key.
     pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
+        if profile.responses_background
+            && (profile.api_style != ApiStyle::Responses
+                || !profile.provider.eq_ignore_ascii_case("openai")
+                || !profile.responses_stored_continuation
+                || profile.stream)
+        {
+            bail!(
+                "background Responses require an OpenAI Responses profile with stored continuation enabled and streaming disabled"
+            );
+        }
         let api_key = resolve_api_key(&profile.api_key)
             .with_context(|| format!("cannot use model profile {:?}", profile.name))?;
         let http = HttpClient::builder()
@@ -118,6 +132,7 @@ impl ModelClient {
                 && profile.provider.eq_ignore_ascii_case("openai"),
             responses_web_search: profile.responses_web_search,
             responses_stored_continuation: profile.responses_stored_continuation,
+            responses_background: profile.responses_background,
             endpoint,
             api_key,
             model: profile.model.clone(),
@@ -593,6 +608,17 @@ impl ModelClient {
         continuation_scope: Option<&str>,
         continuation_input_sha256: Option<&str>,
     ) -> std::result::Result<Completion, ClientError> {
+        if body.get("background").and_then(Value::as_bool) == Some(true) {
+            let mut completion = self.send_background_once(body, sink).await?;
+            self.finalize_responses_continuation(
+                body,
+                &mut completion,
+                continuation_scope,
+                continuation_input_sha256,
+            )
+            .map_err(ClientError::Fatal)?;
+            return Ok(completion);
+        }
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if let Some((budget_sink, estimate)) = side_call_budget {
@@ -821,6 +847,7 @@ impl ModelClient {
                     include_encrypted_reasoning: self.include_encrypted_reasoning,
                     web_search: self.responses_web_search,
                     store: self.responses_stored_continuation,
+                    background: self.responses_background,
                     previous_response_id,
                 },
             )
@@ -858,7 +885,7 @@ impl ModelClient {
                 .then(|| self.continuation_scope(prepared_messages.as_ref())),
             continuation_input_sha256: self
                 .responses_stored_continuation
-                .then(|| Self::continuation_input_sha256(messages))
+                .then(|| Self::continuation_input_sha256(prepared_messages.as_ref()))
                 .flatten(),
         })
     }
@@ -1075,6 +1102,220 @@ impl ModelClient {
         };
         body[field] = json!(output);
         Ok(())
+    }
+
+    async fn send_background_once(
+        &self,
+        body: &Value,
+        sink: &dyn EventSink,
+    ) -> Result<Completion, ClientError> {
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            BACKGROUND_DEADLINE,
+            self.http
+                .post(&self.endpoint)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            ClientError::Fatal(anyhow!(
+                "background Responses create timed out with an ambiguous remote outcome; it was not retried"
+            ))
+        })?
+        .map_err(|error| {
+            ClientError::Fatal(anyhow!(
+                "background Responses create failed with an ambiguous remote outcome and was not retried: {error}"
+            ))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+            let (bytes, truncated) = tokio::time::timeout(
+                remaining,
+                read_limited_error_body(response),
+            )
+            .await
+            .map_err(|_| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses create failed with HTTP {}: error body timed out; it was not retried",
+                    status.as_u16()
+                ))
+            })?
+            .map_err(|error| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses create failed with HTTP {}: error body read failed: {error}; it was not retried",
+                    status.as_u16()
+                ))
+            })?;
+            let text = String::from_utf8_lossy(&bytes);
+            let detail = if truncated {
+                format!(
+                    "error body exceeded {MAX_ERROR_READ} bytes: {}",
+                    truncate(&text, MAX_ERROR_BODY).trim()
+                )
+            } else {
+                truncate(&text, MAX_ERROR_BODY).trim().to_string()
+            };
+            let message = format!(
+                "background Responses create failed with HTTP {} and was not retried: {detail}",
+                status.as_u16()
+            );
+            if !truncated {
+                if let Some(named_limit) = context_overflow_details(status, &text) {
+                    return Err(ClientError::ContextOverflow {
+                        error: anyhow!(message),
+                        named_limit,
+                    });
+                }
+            }
+            return Err(ClientError::Fatal(anyhow!(message)));
+        }
+        let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+        let payload: Value = tokio::time::timeout(remaining, response.json())
+            .await
+            .map_err(|_| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses create body timed out with an ambiguous remote outcome"
+                ))
+            })?
+            .map_err(|error| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses create returned invalid JSON with an ambiguous remote outcome: {error}"
+                ))
+            })?;
+        let id = background_response_id(&payload).map_err(ClientError::Fatal)?;
+        match background_response_state(&payload).map_err(ClientError::Fatal)? {
+            BackgroundState::Terminal => {
+                return super::responses::decode_json(payload).map_err(ClientError::Fatal);
+            }
+            BackgroundState::Pending => sink.info(&format!(
+                "background response {id} is pending; waiting for provider completion"
+            )),
+        }
+
+        let mut poll_url = reqwest::Url::parse(&self.endpoint)
+            .context("invalid Responses endpoint")
+            .map_err(ClientError::Fatal)?;
+        poll_url
+            .path_segments_mut()
+            .map_err(|_| {
+                ClientError::Fatal(anyhow!("Responses endpoint cannot accept a response id"))
+            })?
+            .push(&id);
+        if self.include_encrypted_reasoning {
+            poll_url
+                .query_pairs_mut()
+                .append_pair("include", "reasoning.encrypted_content");
+        }
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= BACKGROUND_DEADLINE {
+                return Err(ClientError::Fatal(anyhow!(
+                    "background response {id} did not finish within {} seconds; remote work may still be running",
+                    BACKGROUND_DEADLINE.as_secs()
+                )));
+            }
+            tokio::time::sleep(BACKGROUND_POLL_INTERVAL).await;
+            let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+            let result = tokio::time::timeout(
+                remaining,
+                self.http
+                    .get(poll_url.clone())
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .send(),
+            )
+            .await;
+            let response = match result {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    sink.info(&format!(
+                        "background response {id} retrieval failed ({error}); retrying"
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "background response {id} polling timed out; remote work may still be running"
+                    )));
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                if is_retryable_status(status) {
+                    sink.info(&format!(
+                        "background response {id} retrieval failed with HTTP {}; retrying",
+                        status.as_u16()
+                    ));
+                    continue;
+                }
+                let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+                let (bytes, truncated) = tokio::time::timeout(
+                    remaining,
+                    read_limited_error_body(response),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Fatal(anyhow!(
+                        "background response {id} retrieval failed with HTTP {}: error body timed out; remote work may still be running",
+                        status.as_u16()
+                    ))
+                })?
+                .map_err(|error| {
+                    ClientError::Fatal(anyhow!(
+                        "background response {id} retrieval failed with HTTP {}: error body read failed: {error}",
+                        status.as_u16()
+                    ))
+                })?;
+                let text = String::from_utf8_lossy(&bytes);
+                let detail = if truncated {
+                    format!(
+                        "error body exceeded {MAX_ERROR_READ} bytes: {}",
+                        truncate(&text, MAX_ERROR_BODY).trim()
+                    )
+                } else {
+                    truncate(&text, MAX_ERROR_BODY).trim().to_string()
+                };
+                return Err(ClientError::Fatal(anyhow!(
+                    "background response {id} retrieval failed with HTTP {}: {detail}",
+                    status.as_u16()
+                )));
+            }
+            let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+            let bytes = match tokio::time::timeout(remaining, response.bytes()).await {
+                Err(_) => {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "background response {id} body timed out; remote work may still be running"
+                    )));
+                }
+                Ok(Err(error)) => {
+                    sink.info(&format!(
+                        "background response {id} body read failed ({error}); retrying"
+                    ));
+                    continue;
+                }
+                Ok(Ok(bytes)) => bytes,
+            };
+            let payload: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                ClientError::Fatal(anyhow!(
+                    "background response {id} retrieval returned invalid JSON: {error}"
+                ))
+            })?;
+            let returned_id = background_response_id(&payload).map_err(ClientError::Fatal)?;
+            if returned_id != id {
+                return Err(ClientError::Fatal(anyhow!(
+                    "background response retrieval changed id from {id:?} to {returned_id:?}"
+                )));
+            }
+            match background_response_state(&payload).map_err(ClientError::Fatal)? {
+                BackgroundState::Pending => {}
+                BackgroundState::Terminal => {
+                    return super::responses::decode_json(payload).map_err(ClientError::Fatal);
+                }
+            }
+        }
     }
 
     async fn send_once(
@@ -1516,6 +1757,25 @@ fn named_context_limit(text: &str) -> Option<u32> {
     }
 }
 
+async fn read_limited_error_body(
+    mut response: reqwest::Response,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut bytes = Vec::with_capacity(MAX_ERROR_READ + 1);
+    while bytes.len() <= MAX_ERROR_READ {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        let remaining = MAX_ERROR_READ + 1 - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if bytes.len() > MAX_ERROR_READ {
+            break;
+        }
+    }
+    let truncated = bytes.len() > MAX_ERROR_READ;
+    bytes.truncate(MAX_ERROR_READ);
+    Ok((bytes, truncated))
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -1525,6 +1785,31 @@ fn truncate(text: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+#[derive(Clone, Copy)]
+enum BackgroundState {
+    Pending,
+    Terminal,
+}
+
+fn background_response_id(payload: &Value) -> Result<String> {
+    payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("background Responses result is missing a response id"))
+}
+
+fn background_response_state(payload: &Value) -> Result<BackgroundState> {
+    match payload.get("status").and_then(Value::as_str) {
+        Some("queued" | "in_progress") => Ok(BackgroundState::Pending),
+        Some("completed" | "incomplete" | "failed" | "cancelled") => Ok(BackgroundState::Terminal),
+        Some(status) => bail!("background Responses returned unknown status {status:?}"),
+        None => bail!("background Responses result is missing status"),
+    }
 }
 
 #[derive(Debug)]
@@ -1741,6 +2026,27 @@ struct ResponseFunction {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn background_status_requires_a_known_lifecycle_value() {
+        assert!(matches!(
+            background_response_state(&json!({"status":"queued"})).unwrap(),
+            BackgroundState::Pending
+        ));
+        assert!(matches!(
+            background_response_state(&json!({"status":"in_progress"})).unwrap(),
+            BackgroundState::Pending
+        ));
+        for status in ["completed", "incomplete", "failed", "cancelled"] {
+            assert!(matches!(
+                background_response_state(&json!({"status":status})).unwrap(),
+                BackgroundState::Terminal
+            ));
+        }
+        assert!(background_response_state(&json!({})).is_err());
+        assert!(background_response_state(&json!({"status":"mystery"})).is_err());
+        assert!(background_response_id(&json!({"id":"  "})).is_err());
+    }
 
     struct NullSink;
     impl EventSink for NullSink {}
@@ -2842,7 +3148,8 @@ mod tests {
 
     #[test]
     fn request_projection_trims_old_tools_for_responses_and_keeps_pairs() {
-        let client = phase1_client(ApiStyle::Responses);
+        let mut client = phase1_client(ApiStyle::Responses);
+        client.responses_stored_continuation = true;
         let messages = projection_messages();
         let original = messages.clone();
 
@@ -2882,6 +3189,12 @@ mod tests {
             .filter_map(|item| item["call_id"].as_str())
             .collect();
         assert_eq!(call_ids, result_ids);
+
+        let prepared = client.prepare_request(&messages, &[], false).unwrap();
+        assert_ne!(
+            prepared.continuation_input_sha256,
+            ModelClient::continuation_input_sha256(&messages)
+        );
     }
 
     #[test]

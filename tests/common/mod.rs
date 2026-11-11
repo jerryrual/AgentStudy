@@ -15,6 +15,7 @@ pub struct MockResponse {
     pub status: u16,
     pub body: String,
     pub content_type: String,
+    pub declared_length: Option<usize>,
 }
 
 impl MockResponse {
@@ -31,6 +32,7 @@ impl MockResponse {
             status: 200,
             body,
             content_type: "text/event-stream".to_string(),
+            declared_length: None,
         }
     }
 
@@ -39,6 +41,7 @@ impl MockResponse {
             status,
             body: body.to_string(),
             content_type: "application/json".to_string(),
+            declared_length: None,
         }
     }
 }
@@ -153,7 +156,7 @@ fn serve_connection(
         response.status,
         status_text(response.status),
         response.content_type,
-        response.body.len()
+        response.declared_length.unwrap_or(response.body.len())
     );
     stream.write_all(head.as_bytes()).ok()?;
     stream.write_all(response.body.as_bytes()).ok()?;
@@ -180,6 +183,7 @@ pub fn mock_profile(base_url: String) -> icode::config::ModelProfile {
         api_style: icode::config::ApiStyle::Chat,
         responses_web_search: false,
         responses_stored_continuation: false,
+        responses_background: false,
         model: "mock-model".to_string(),
         base_url,
         api_key: "test-key".to_string(),
