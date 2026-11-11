@@ -24,6 +24,7 @@ const MAX_ERROR_BODY: usize = 600;
 const MAX_ERROR_READ: usize = 64 * 1024;
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const BACKGROUND_DEADLINE: Duration = Duration::from_secs(600);
+const BACKGROUND_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 const LAST_WORDS_MIN_CHARS: usize = 300;
 const LAST_WORDS_GENERATION_ATTEMPTS: usize = 2;
 const LAST_WORDS_SYSTEM_PROMPT: &str = r#"You write a durable progress note so a coding agent can continue after its current tool-call history is removed.
@@ -36,6 +37,79 @@ Concrete completed work, files, commands, results, exact facts, and failed appro
 ## Next
 Outstanding work, success criteria, and the next safe action.
 Do not call tools. Do not claim work not present in the transcript. Write at least 500 tokens when the transcript contains enough detail."#;
+
+struct BackgroundCancellation {
+    http: HttpClient,
+    url: reqwest::Url,
+    api_key: String,
+    armed: bool,
+}
+
+impl BackgroundCancellation {
+    fn new(http: &HttpClient, endpoint: &str, api_key: &str, id: &str) -> Result<Self> {
+        let mut url = reqwest::Url::parse(endpoint).context("invalid Responses endpoint")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Responses endpoint cannot accept a response id"))?
+            .extend([id, "cancel"]);
+        Ok(Self {
+            http: http.clone(),
+            url,
+            api_key: api_key.to_string(),
+            armed: true,
+        })
+    }
+
+    async fn cancel(&mut self) -> Result<()> {
+        let result =
+            send_background_cancel(&self.http, self.url.clone(), self.api_key.clone()).await;
+        self.armed = false;
+        result
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BackgroundCancellation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let http = self.http.clone();
+        let url = self.url.clone();
+        let api_key = self.api_key.clone();
+        runtime.spawn(async move {
+            let _ = send_background_cancel(&http, url, api_key).await;
+        });
+    }
+}
+
+async fn send_background_cancel(
+    http: &HttpClient,
+    url: reqwest::Url,
+    api_key: String,
+) -> Result<()> {
+    let response = tokio::time::timeout(
+        BACKGROUND_CANCEL_TIMEOUT,
+        http.post(url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow!("remote cancellation timed out"))?
+    .context("remote cancellation request failed")?;
+    if !response.status().is_success() {
+        bail!(
+            "remote cancellation failed with HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    Ok(())
+}
 
 /// A configured model endpoint.
 pub struct ModelClient {
@@ -1322,6 +1396,9 @@ impl ModelClient {
                 "background response {id} is pending; waiting for provider completion"
             )),
         }
+        let mut cancellation =
+            BackgroundCancellation::new(&self.http, &self.endpoint, &self.api_key, &id)
+                .map_err(ClientError::Fatal)?;
 
         let mut poll_url = reqwest::Url::parse(&self.endpoint)
             .context("invalid Responses endpoint")
@@ -1342,14 +1419,15 @@ impl ModelClient {
                 .query_pairs_mut()
                 .append_pair("include", "file_search_call.results");
         }
-        loop {
-            let elapsed = started.elapsed();
-            if elapsed >= BACKGROUND_DEADLINE {
-                return Err(ClientError::Fatal(anyhow!(
-                    "background response {id} did not finish within {} seconds; remote work may still be running",
-                    BACKGROUND_DEADLINE.as_secs()
-                )));
-            }
+        let poll_result: Result<Completion, ClientError> = async {
+            loop {
+                let elapsed = started.elapsed();
+                if elapsed >= BACKGROUND_DEADLINE {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "background response {id} did not finish within {} seconds",
+                        BACKGROUND_DEADLINE.as_secs()
+                    )));
+                }
             tokio::time::sleep(BACKGROUND_POLL_INTERVAL).await;
             let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
             let result = tokio::time::timeout(
@@ -1446,6 +1524,26 @@ impl ModelClient {
                 BackgroundState::Terminal => {
                     return super::responses::decode_json(payload).map_err(ClientError::Fatal);
                 }
+            }
+        }
+        }
+        .await;
+        match poll_result {
+            Ok(completion) => {
+                cancellation.disarm();
+                Ok(completion)
+            }
+            Err(error) => {
+                let original = error.into_error();
+                let cancellation_detail = match cancellation.cancel().await {
+                    Ok(()) => "remote cancellation was accepted".to_string(),
+                    Err(cancel_error) => {
+                        format!("remote cancellation failed: {cancel_error}")
+                    }
+                };
+                Err(ClientError::Fatal(anyhow!(
+                    "{original:#}; {cancellation_detail}"
+                )))
             }
         }
     }
