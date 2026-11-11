@@ -24,6 +24,7 @@ pub(crate) enum InvalidSessionRequest {
     ActiveElsewhere,
     PromptLoading,
     PromptActive,
+    CloseLoading,
 }
 
 impl InvalidSessionRequest {
@@ -43,6 +44,7 @@ impl InvalidSessionRequest {
             Self::ActiveElsewhere => "session is active in another process",
             Self::PromptLoading => "session is still loading",
             Self::PromptActive => "session already has an active prompt",
+            Self::CloseLoading => "session cannot be closed while it is loading",
         }
     }
 }
@@ -166,6 +168,10 @@ mod tests {
             (
                 InvalidSessionRequest::PromptActive,
                 "session already has an active prompt",
+            ),
+            (
+                InvalidSessionRequest::CloseLoading,
+                "session cannot be closed while it is loading",
             ),
         ];
 

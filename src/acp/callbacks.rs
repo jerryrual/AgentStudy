@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
-    CancelNotification, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, StopReason,
+    CancelNotification, CloseSessionRequest, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, PromptRequest, PromptResponse, StopReason,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, Error as ProtocolError};
 
@@ -86,6 +86,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let initialize_notices = Arc::clone(&notices);
     let prompt_notices = notices;
     let load_control = Arc::clone(&control);
+    let close_control = Arc::clone(&control);
     let prompt_control = Arc::clone(&control);
     let prompt_runtime = runtime;
     let cancel_control = control;
@@ -125,6 +126,17 @@ pub(crate) fn callback_bundle_with_setup_hook(
                             |response| responder.respond(response),
                         )
                         .map_err(ProtocolError::from)
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: CloseSessionRequest, responder, connection| {
+                let control = Arc::clone(&close_control);
+                connection.spawn(async move {
+                    responder.respond_with_result(
+                        control.close(&request).await.map_err(ProtocolError::from),
+                    )
                 })
             },
             agent_client_protocol::on_receive_request!(),
@@ -266,10 +278,11 @@ mod tests {
 
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::v1::schema::{
-        AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-        InitializeResponse, LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse,
-        NoticeCapabilities, PromptRequest, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionId, SessionNotification,
+        AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest,
+        CloseSessionResponse, ContentBlock, InitializeResponse, LoadSessionResponse, McpServer,
+        McpServerStdio, NewSessionResponse, NoticeCapabilities, PromptRequest,
+        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+        SessionId, SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -335,7 +348,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn callbacks_preserve_load_order_errors_and_cancellation() -> Result<(), ProtocolError> {
+    async fn callbacks_preserve_load_order_errors_and_close_lifecycle() -> Result<(), ProtocolError>
+    {
         let directory = TempDir::new().unwrap();
         let store = SessionStore::with_root(directory.path().join("sessions"));
         let sessions = Arc::new(SessionRegistry::new(store.clone()));
@@ -400,9 +414,11 @@ mod tests {
                         AgentCapabilities::new()
                             .load_session(true)
                             .session_capabilities(
-                                SessionCapabilities::new().additional_directories(
-                                    SessionAdditionalDirectoriesCapabilities::new(),
-                                ),
+                                SessionCapabilities::new()
+                                    .additional_directories(
+                                        SessionAdditionalDirectoriesCapabilities::new(),
+                                    )
+                                    .close(SessionCloseCapabilities::new()),
                             )
                     );
 
@@ -469,7 +485,19 @@ mod tests {
                         .send_request(NewSessionRequest::new(directory.path()))
                         .block_task()
                         .await?;
-                    assert!(store.load(&created.session_id.to_string()).is_ok());
+                    let created_id = created.session_id.clone();
+                    assert!(store.load(&created_id.to_string()).is_ok());
+                    let _: CloseSessionResponse = connection
+                        .send_request(CloseSessionRequest::new(created_id.clone()))
+                        .block_task()
+                        .await?;
+                    assert!(store.load(&created_id.to_string()).is_ok());
+                    let closed_again = connection
+                        .send_request(CloseSessionRequest::new(created_id))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert_eq!(closed_again.code, ErrorCode::RESOURCE_NOT_FOUND);
 
                     let _: LoadSessionResponse = connection
                         .send_request(LoadSessionRequest::new(load_id, directory.path()))
@@ -490,10 +518,18 @@ mod tests {
                         );
                     }
 
-                    connection.send_notification(CancelNotification::new(cancel_id))?;
+                    let close = connection
+                        .send_request(CloseSessionRequest::new(cancel_id))
+                        .block_task();
+                    tokio::pin!(close);
+                    assert!(tokio::time::timeout(Duration::from_millis(25), &mut close)
+                        .await
+                        .is_err());
                     tokio::time::timeout(Duration::from_secs(1), prompt.cancelled())
                         .await
-                        .expect("cancel callback did not signal the active prompt");
+                        .expect("close callback did not signal the active prompt");
+                    drop(prompt);
+                    let _: CloseSessionResponse = close.await?;
                     Ok(())
                 },
             )
