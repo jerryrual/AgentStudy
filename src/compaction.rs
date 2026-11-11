@@ -219,7 +219,7 @@ pub async fn compact(client: &ModelClient, messages: &[Message]) -> Result<Compa
     let transcript: Vec<_> = messages
         .iter()
         .filter(|message| !matches!(message, Message::System { .. }))
-        .map(Message::to_api)
+        .map(Message::to_transcript_api)
         .collect();
     if transcript.is_empty() {
         bail!("there is no conversation to compact");

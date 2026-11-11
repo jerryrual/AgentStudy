@@ -1155,7 +1155,7 @@ impl ModelClient {
                 Usage::default(),
             ));
         }
-        let transcript: Vec<Value> = current.iter().map(Message::to_api).collect();
+        let transcript: Vec<Value> = current.iter().map(Message::to_transcript_api).collect();
         let transcript = serde_json::to_string_pretty(&transcript).map_err(|error| {
             PhaseFourPrepareError::skipped(
                 anyhow!(error).context("failed to encode current-turn transcript for Last Words"),

@@ -1071,11 +1071,12 @@ impl App {
             }
         };
         self.continue_available = false;
-        let user = Message::user(message_text.clone());
+        let user_content = crate::model::UserContent::from(message_text.clone());
+        let user = Message::user(user_content.clone());
         self.messages.push(user);
         let phase_four = match self
             .session
-            .append_user_and_load_phase_four_breaker(&message_text)
+            .append_user_and_load_phase_four_breaker(&user_content)
         {
             Ok(restored) => restored,
             Err(error) => {
@@ -1898,7 +1899,7 @@ fn view_from_records(records: &[crate::session::Record]) -> Vec<ViewItem> {
     let mut view = Vec::new();
     for record in records {
         match record {
-            crate::session::Record::User { text } => view.push(ViewItem::User(text.clone())),
+            crate::session::Record::User { text } => view.push(ViewItem::User(text.display_text())),
             crate::session::Record::Assistant { content, .. } => {
                 if let Some(content) = content {
                     view.push(ViewItem::Assistant {
@@ -2649,7 +2650,7 @@ mod tests {
     fn automatic_compaction_records_do_not_change_the_visible_transcript() {
         let records = vec![
             Record::User {
-                text: "old request".to_string(),
+                text: "old request".into(),
             },
             Record::Compaction {
                 summary: "automatic summary".to_string(),

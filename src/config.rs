@@ -310,6 +310,9 @@ pub struct ModelProfile {
     pub responses_background: bool,
     /// Provider model identifier, e.g. `deepseek-chat`.
     pub model: String,
+    /// Allow ACP clients to submit image content to this model.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
     /// Base URL; empty means the provider default.
     #[serde(default)]
     pub base_url: String,
@@ -366,6 +369,7 @@ impl ModelProfile {
             responses_stored_continuation: false,
             responses_background: false,
             model: "deepseek-chat".to_string(),
+            vision: false,
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "{{DEEPSEEK_API_KEY}}".to_string(),
             max_tokens: Some(8192),
@@ -974,9 +978,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(profile.context_window, None);
+        assert!(!profile.vision);
 
         let json = serde_json::to_value(profile).unwrap();
         assert_eq!(json.get("context_window"), None);
+        assert_eq!(json.get("vision"), None);
+    }
+
+    #[test]
+    fn vision_capability_is_explicit_and_backward_compatible() {
+        let legacy: ModelProfile =
+            serde_json::from_str(r#"{"name":"legacy","model":"text-model"}"#).unwrap();
+        assert!(!legacy.vision);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("vision")
+            .is_none());
+
+        let vision: ModelProfile =
+            serde_json::from_str(r#"{"name":"vision","model":"vision-model","vision":true}"#)
+                .unwrap();
+        assert!(vision.vision);
+        assert_eq!(serde_json::to_value(vision).unwrap()["vision"], true);
     }
 
     #[test]

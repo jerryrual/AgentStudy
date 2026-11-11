@@ -52,6 +52,7 @@ async fn serve_with_setup_hook(
     transport: impl ConnectTo<AcpAgent>,
     prompt_setup_hook: Option<callbacks::PromptSetupHook>,
 ) -> Result<()> {
+    let image_prompts = profile.vision;
     let client = tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
         .await
         .context("ACP model configuration task failed")??;
@@ -61,6 +62,7 @@ async fn serve_with_setup_hook(
         sessions,
         model,
         agent_kind.as_str(),
+        image_prompts,
     ));
     let runtime = Arc::new(runtime::PromptRuntime::new(
         Arc::new(client),

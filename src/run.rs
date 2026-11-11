@@ -15,7 +15,7 @@ use crate::compaction::{CompressionBatch, ContextProjection};
 use crate::compaction_archive::CurrentTurnArchiveManifest;
 use crate::config::{ApprovalMode, ModelProfile, Settings};
 use crate::interaction::{AllowAll, Approver, DenyAll, NoAsker};
-use crate::model::{Message, ModelClient, ToolCall, Usage};
+use crate::model::{Message, ModelClient, ToolCall, Usage, UserContent};
 use crate::phase4_breaker::PhaseFourBreaker;
 use crate::recovery_writer::{RecoveryCheckpointHandle, RecoveryCheckpointWriter};
 use crate::session::{Record, RecordBuffer, Session, SessionStore};
@@ -412,7 +412,7 @@ impl<O: TurnObserver> EventSink for PersistentTurnSink<O> {
 
 /// How a caller starts one turn on an already-owned persistent session.
 pub(crate) enum TurnStart {
-    User(String),
+    User(UserContent),
     Resume,
 }
 
@@ -430,13 +430,13 @@ pub(crate) fn prepare_session_turn(
 ) -> Result<PreparedSessionTurn> {
     let (messages, phase_four_turn, phase_four_state) = match start {
         TurnStart::Resume => session.load_resumable_turn()?,
-        TurnStart::User(text) => {
-            if text.trim().is_empty() {
+        TurnStart::User(content) => {
+            if !content.is_meaningful() {
                 anyhow::bail!("the task prompt must not be empty");
             }
             let mut messages = session.load_messages()?;
-            messages.push(Message::user(text.clone()));
-            let (turn, state) = session.append_user_and_load_phase_four_breaker(&text)?;
+            messages.push(Message::user(content.clone()));
+            let (turn, state) = session.append_user_and_load_phase_four_breaker(&content)?;
             (messages, turn, state)
         }
     };
@@ -618,7 +618,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         if options.resume_turn {
             TurnStart::Resume
         } else {
-            TurnStart::User(options.task.trim().to_string())
+            TurnStart::User(options.task.trim().to_string().into())
         },
     )?;
 
@@ -872,7 +872,7 @@ mod tests {
             .unwrap();
 
         let prepared =
-            prepare_session_turn(&session, TurnStart::User(" next ".to_string())).unwrap();
+            prepare_session_turn(&session, TurnStart::User(" next ".to_string().into())).unwrap();
 
         assert_eq!(
             prepared.messages,
@@ -899,7 +899,9 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
 
-        assert!(prepare_session_turn(&session, TurnStart::User(" \n ".to_string())).is_err());
+        assert!(
+            prepare_session_turn(&session, TurnStart::User(" \n ".to_string().into())).is_err()
+        );
         assert!(session.load_messages().unwrap().is_empty());
     }
 
@@ -909,7 +911,8 @@ mod tests {
         let store = SessionStore::with_root(directory.path());
         let session = store.create("/tmp", "model", "code").unwrap();
         let prepared =
-            prepare_session_turn(&session, TurnStart::User("cancel me".to_string())).unwrap();
+            prepare_session_turn(&session, TurnStart::User("cancel me".to_string().into()))
+                .unwrap();
         let mut profile = ModelProfile::builtin_deepseek();
         profile.api_key = "test-key".to_string();
         profile.base_url = "http://127.0.0.1:1".to_string();

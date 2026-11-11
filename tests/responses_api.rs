@@ -29,6 +29,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         responses_stored_continuation: false,
         responses_background: false,
         model: "gpt-test".to_string(),
+        vision: false,
         base_url: server.base_url(),
         api_key: "test-key".to_string(),
         max_tokens: Some(512),

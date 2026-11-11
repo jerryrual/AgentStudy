@@ -1,8 +1,15 @@
 //! Conversation and tool-call types shared by the client, the agent and the
 //! session store.
 
+use std::collections::HashSet;
+use std::io::Cursor;
+
+use anyhow::{ensure, Context, Result};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use image::{ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// A tool call requested by the model.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +84,273 @@ impl AssistantMessage {
     }
 }
 
+pub(crate) const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PROMPT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PROMPT_IMAGES: usize = 16;
+pub(crate) const MAX_SESSION_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_SESSION_IMAGES: usize = 256;
+const MAX_ENCODED_IMAGE_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+const MAX_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_IMAGE_DECODE_ALLOC: u64 = 128 * 1024 * 1024;
+
+/// One embedded image supplied by a user-facing protocol.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageInput {
+    pub media_type: String,
+    /// Canonical base64 payload without a data-URL prefix.
+    pub data: String,
+    #[serde(skip)]
+    pub(crate) validated_key: Option<[u8; 32]>,
+}
+
+impl PartialEq for ImageInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.media_type == other.media_type && self.data == other.data
+    }
+}
+
+impl Eq for ImageInput {}
+
+impl ImageInput {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+
+    pub(crate) fn validated(
+        media_type: String,
+        data: String,
+        remaining_bytes: usize,
+    ) -> Result<(Self, usize)> {
+        let mut image = Self {
+            media_type,
+            data,
+            validated_key: None,
+        };
+        let (format, decoded) = image.decode_payload()?;
+        ensure!(
+            decoded.len() <= remaining_bytes,
+            "ACP prompt images exceed their aggregate limit"
+        );
+        image.decode_image(format, &decoded)?;
+        image.validated_key = Some(validation_cache_key(&image.media_type, &decoded));
+        Ok((image, decoded.len()))
+    }
+
+    fn validate_persisted(
+        &self,
+        remaining_bytes: usize,
+        validated: &mut HashSet<[u8; 32]>,
+    ) -> Result<usize> {
+        let (format, decoded) = self.decode_payload()?;
+        ensure!(
+            decoded.len() <= remaining_bytes,
+            "ACP image bytes exceed their session limit"
+        );
+        let key = validation_cache_key(&self.media_type, &decoded);
+        if self.validated_key != Some(key) && !validated.contains(&key) {
+            self.decode_image(format, &decoded)?;
+        }
+        validated.insert(key);
+        Ok(decoded.len())
+    }
+
+    fn decode_payload(&self) -> Result<(ImageFormat, Vec<u8>)> {
+        let format = match self.media_type.as_str() {
+            "image/png" => ImageFormat::Png,
+            "image/jpeg" => ImageFormat::Jpeg,
+            "image/gif" => ImageFormat::Gif,
+            "image/webp" => ImageFormat::WebP,
+            _ => anyhow::bail!("unsupported ACP image MIME type: {}", self.media_type),
+        };
+        ensure!(!self.data.is_empty(), "ACP image data must not be empty");
+        ensure!(
+            self.data.len() <= MAX_ENCODED_IMAGE_BYTES,
+            "ACP image exceeds the {MAX_IMAGE_BYTES}-byte decoded limit"
+        );
+        let decoded = BASE64_STANDARD
+            .decode(&self.data)
+            .context("ACP image data is not valid padded base64")?;
+        ensure!(!decoded.is_empty(), "ACP image data must not be empty");
+        ensure!(
+            decoded.len() <= MAX_IMAGE_BYTES,
+            "ACP image exceeds the {MAX_IMAGE_BYTES}-byte decoded limit"
+        );
+        Ok((format, decoded))
+    }
+
+    fn decode_image(&self, format: ImageFormat, decoded: &[u8]) -> Result<()> {
+        let mut limits = Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+        limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+        let mut reader = ImageReader::with_format(Cursor::new(decoded), format);
+        reader.limits(limits);
+        reader
+            .decode()
+            .with_context(|| format!("ACP image data is not a valid {} image", self.media_type))?;
+        Ok(())
+    }
+
+    fn placeholder(&self) -> String {
+        format!("[image: {}]", self.media_type)
+    }
+}
+
+fn validation_cache_key(media_type: &str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(media_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// An ordered part of a multimodal user message.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserContentPart {
+    Text { text: String },
+    Image { image: ImageInput },
+}
+
+/// User content retains the legacy string representation for text-only turns.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum UserContent {
+    Text(String),
+    Parts(Vec<UserContentPart>),
+}
+
+impl UserContent {
+    pub fn parts(parts: Vec<UserContentPart>) -> Self {
+        Self::Parts(parts)
+    }
+
+    pub fn is_meaningful(&self) -> bool {
+        match self {
+            Self::Text(text) => !text.trim().is_empty(),
+            Self::Parts(parts) => parts.iter().any(|part| match part {
+                UserContentPart::Text { text } => !text.trim().is_empty(),
+                UserContentPart::Image { .. } => true,
+            }),
+        }
+    }
+
+    pub(crate) fn validate_images(
+        &self,
+        max_bytes: usize,
+        max_count: usize,
+        validated: &mut HashSet<[u8; 32]>,
+    ) -> Result<(usize, usize)> {
+        let Self::Parts(parts) = self else {
+            return Ok((0, 0));
+        };
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for part in parts {
+            let UserContentPart::Image { image } = part else {
+                continue;
+            };
+            count = count.checked_add(1).context("ACP image count overflowed")?;
+            ensure!(
+                count <= max_count,
+                "ACP image count exceeds its session limit"
+            );
+            let remaining_bytes = max_bytes.saturating_sub(bytes);
+            bytes = bytes
+                .checked_add(image.validate_persisted(remaining_bytes, validated)?)
+                .context("ACP image byte count overflowed")?;
+            ensure!(
+                bytes <= max_bytes,
+                "ACP image bytes exceed their session limit"
+            );
+        }
+        Ok((bytes, count))
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    UserContentPart::Text { text } => text.clone(),
+                    UserContentPart::Image { image } => image.placeholder(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        }
+    }
+
+    pub fn chat_content(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Parts(parts) => Value::Array(
+                parts
+                    .iter()
+                    .map(|part| match part {
+                        UserContentPart::Text { text } => json!({
+                            "type": "text",
+                            "text": text,
+                        }),
+                        UserContentPart::Image { image } => json!({
+                            "type": "image_url",
+                            "image_url": {"url": image.data_url()},
+                        }),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    pub fn responses_content(&self) -> Vec<Value> {
+        match self {
+            Self::Text(text) => vec![json!({"type": "input_text", "text": text})],
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|part| match part {
+                    UserContentPart::Text { text } => {
+                        json!({"type": "input_text", "text": text})
+                    }
+                    UserContentPart::Image { image } => json!({
+                        "type": "input_image",
+                        "image_url": image.data_url(),
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq<str> for UserContent {
+    fn eq(&self, other: &str) -> bool {
+        matches!(self, Self::Text(text) if text == other)
+    }
+}
+
+impl PartialEq<&str> for UserContent {
+    fn eq(&self, other: &&str) -> bool {
+        self == *other
+    }
+}
+
+impl std::fmt::Display for UserContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.display_text())
+    }
+}
+
+impl From<String> for UserContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for UserContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
 /// A message in the model conversation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "role", rename_all = "snake_case")]
@@ -85,7 +359,7 @@ pub enum Message {
         content: String,
     },
     User {
-        content: String,
+        content: UserContent,
     },
     /// Same-turn user-role context with a durable local identity.
     InjectedUser {
@@ -117,9 +391,15 @@ impl Message {
         }
     }
 
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<UserContent>) -> Self {
         Self::User {
             content: content.into(),
+        }
+    }
+
+    pub fn user_parts(parts: Vec<UserContentPart>) -> Self {
+        Self::User {
+            content: UserContent::parts(parts),
         }
     }
 
@@ -162,8 +442,10 @@ impl Message {
     pub fn to_api(&self) -> Value {
         match self {
             Message::System { content } => json!({"role": "system", "content": content}),
-            Message::User { content }
-            | Message::InjectedUser { content, .. }
+            Message::User { content } => {
+                json!({"role": "user", "content": content.chat_content()})
+            }
+            Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => {
                 json!({"role": "user", "content": content})
@@ -206,11 +488,21 @@ impl Message {
         }
     }
 
+    /// Serialise for textual side-call transcripts without embedding image bytes.
+    pub(crate) fn to_transcript_api(&self) -> Value {
+        match self {
+            Message::User { content } => {
+                json!({"role": "user", "content": content.display_text()})
+            }
+            _ => self.to_api(),
+        }
+    }
+
     /// Short single-line rendering used by transcripts and tests.
     pub fn preview(&self) -> String {
         let text = match self {
+            Message::User { content } => content.display_text(),
             Message::System { content }
-            | Message::User { content }
             | Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => content.clone(),
@@ -305,6 +597,76 @@ mod tests {
             message.to_api(),
             json!({"role": "user", "content": "updated requirements"})
         );
+    }
+
+    #[test]
+    fn text_user_keeps_legacy_storage_and_chat_shapes() {
+        let message = Message::user("hello");
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            json!({"role": "user", "content": "hello"})
+        );
+        assert_eq!(
+            message.to_api(),
+            json!({"role": "user", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn image_count_budget_rejects_before_payload_validation() {
+        let content = UserContent::parts(vec![UserContentPart::Image {
+            image: ImageInput {
+                media_type: "image/png".into(),
+                data: "not-base64".into(),
+                validated_key: None,
+            },
+        }]);
+        let error = content
+            .validate_images(MAX_IMAGE_BYTES, 0, &mut HashSet::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("count exceeds"), "{error:#}");
+    }
+
+    #[test]
+    fn multimodal_user_round_trips_and_maps_ordered_chat_parts() {
+        let message = Message::user_parts(vec![
+            UserContentPart::Text {
+                text: "before".into(),
+            },
+            UserContentPart::Image {
+                image: ImageInput {
+                    media_type: "image/png".into(),
+                    data: "cG5n".into(),
+                    validated_key: None,
+                },
+            },
+            UserContentPart::Text {
+                text: "after".into(),
+            },
+        ]);
+        let stored = serde_json::to_value(&message).unwrap();
+
+        assert_eq!(serde_json::from_value::<Message>(stored).unwrap(), message);
+        assert_eq!(
+            message.to_api(),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,cG5n"
+                    }},
+                    {"type": "text", "text": "after"},
+                ]
+            })
+        );
+        assert_eq!(message.preview(), "before");
+        let transcript = message.to_transcript_api();
+        assert_eq!(
+            transcript["content"],
+            "before\n\n[image: image/png]\n\nafter"
+        );
+        assert!(!transcript.to_string().contains("cG5n"));
     }
 
     #[test]

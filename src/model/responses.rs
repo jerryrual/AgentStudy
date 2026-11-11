@@ -37,8 +37,12 @@ pub(super) fn request_body(
     let mut input = Vec::new();
     for message in messages {
         match message {
+            Message::User { content } => input.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": content.responses_content(),
+            })),
             Message::System { content }
-            | Message::User { content }
             | Message::InjectedUser { content, .. }
             | Message::Summary { content }
             | Message::LastWords { content } => input.push(json!({
@@ -607,6 +611,42 @@ mod tests {
         assert_eq!(body["tools"], serde_json::json!([{"type": "web_search"}]));
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn maps_ordered_multimodal_user_content() {
+        let body = request_body(
+            &[Message::user_parts(vec![
+                crate::model::UserContentPart::Text {
+                    text: "before".into(),
+                },
+                crate::model::UserContentPart::Image {
+                    image: crate::model::ImageInput {
+                        media_type: "image/png".into(),
+                        data: "cG5n".into(),
+                        validated_key: None,
+                    },
+                },
+                crate::model::UserContentPart::Text {
+                    text: "after".into(),
+                },
+            ])],
+            &[],
+            "model",
+            false,
+            None,
+            None,
+            RequestFeatures::default(),
+        );
+
+        assert_eq!(
+            body["input"][0]["content"],
+            serde_json::json!([
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": "data:image/png;base64,cG5n"},
+                {"type": "input_text", "text": "after"},
+            ])
+        );
     }
 
     #[test]

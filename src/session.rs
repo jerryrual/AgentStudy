@@ -4,6 +4,7 @@
 //! resumed after a crash, mirroring iCode's session history. The format is a
 //! sequence of JSON lines; the first line is the session metadata.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,8 @@ use crate::compaction_archive::{
     open_read_nofollow, replace_private_file, sync_directory, ArchiveStore,
     ArchivedContextProjection,
 };
-use crate::model::{AssistantMessage, Message, ResponsesContinuation, ToolCall};
+use crate::model::types::{MAX_SESSION_IMAGES, MAX_SESSION_IMAGE_BYTES};
+use crate::model::{AssistantMessage, Message, ResponsesContinuation, ToolCall, UserContent};
 use crate::phase4_breaker::PhaseFourBreakerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +44,7 @@ pub enum Record {
         agent: String,
     },
     User {
-        text: String,
+        text: UserContent,
     },
     InjectedUser {
         injection_id: String,
@@ -205,6 +207,7 @@ pub struct Session {
     path: PathBuf,
     archive_root: PathBuf,
     append_lock: Arc<Mutex<()>>,
+    image_validation: Arc<Mutex<HashSet<[u8; 32]>>>,
 }
 
 struct ValidatedResumableTurn {
@@ -255,6 +258,17 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
+        if let Record::User { text } = record {
+            let loaded =
+                load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
+            let remaining_bytes = MAX_SESSION_IMAGE_BYTES.saturating_sub(loaded.image_bytes);
+            let remaining_count = MAX_SESSION_IMAGES.saturating_sub(loaded.image_count);
+            let mut validation = self
+                .image_validation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session image validation lock is poisoned"))?;
+            text.validate_images(remaining_bytes, remaining_count, &mut validation)?;
+        }
         self.append_unlocked(record)
     }
 
@@ -375,7 +389,7 @@ impl Session {
         if !should_append() {
             return Ok(None);
         }
-        let loaded = load_session_file(&self.path, self.id())?;
+        let loaded = load_session_file(&self.path, self.id(), Some(&self.image_validation))?;
         let current_user = loaded
             .records
             .iter()
@@ -415,7 +429,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
-        Ok(load_session_file(&self.path, self.id())?.messages())
+        Ok(load_session_file(&self.path, self.id(), Some(&self.image_validation))?.messages())
     }
 
     /// Append a conversation message, skipping system prompts.
@@ -428,17 +442,26 @@ impl Session {
 
     pub(crate) fn append_user_and_load_phase_four_breaker(
         &self,
-        text: &str,
+        content: &UserContent,
     ) -> Result<(u64, PhaseFourBreakerState)> {
         let _guard = self
             .append_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
+        let loaded = load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
+        let remaining_bytes = MAX_SESSION_IMAGE_BYTES.saturating_sub(loaded.image_bytes);
+        let remaining_count = MAX_SESSION_IMAGES.saturating_sub(loaded.image_count);
+        let mut validation = self
+            .image_validation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session image validation lock is poisoned"))?;
+        content.validate_images(remaining_bytes, remaining_count, &mut validation)?;
+        drop(validation);
         self.append_unlocked(&Record::User {
-            text: text.to_string(),
+            text: content.clone(),
         })?;
-        let turn = load_session_file(&self.path, &self.meta.id)?.user_turn_count();
+        let turn = loaded.user_turn_count() + 1;
         Ok((turn, PhaseFourBreakerState::default()))
     }
 
@@ -446,6 +469,24 @@ impl Session {
         if records.is_empty() {
             return Ok(());
         }
+        let loaded = load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
+        let mut image_bytes = loaded.image_bytes;
+        let mut image_count = loaded.image_count;
+        let mut validation = self
+            .image_validation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session image validation lock is poisoned"))?;
+        for record in records {
+            if let Record::User { text } = record {
+                let remaining_bytes = MAX_SESSION_IMAGE_BYTES.saturating_sub(image_bytes);
+                let remaining_count = MAX_SESSION_IMAGES.saturating_sub(image_count);
+                let (bytes, count) =
+                    text.validate_images(remaining_bytes, remaining_count, &mut validation)?;
+                image_bytes += bytes;
+                image_count += count;
+            }
+        }
+        drop(validation);
         let mut file = open_append_existing_nofollow(&self.path)
             .with_context(|| format!("failed to open session {}", self.path.display()))?;
         let previous_len = file
@@ -513,7 +554,7 @@ impl Session {
         if !should_persist() {
             return Ok(false);
         }
-        let loaded = load_session_file(&self.path, self.id())?;
+        let loaded = load_session_file(&self.path, self.id(), Some(&self.image_validation))?;
         let current_turn = loaded.user_turn_count();
         if turn == 0 || turn != current_turn {
             bail!("recovery checkpoint turn {turn} does not match current turn {current_turn}");
@@ -575,7 +616,9 @@ impl Session {
     fn load_recovery_checkpoint_unlocked(&self) -> Result<Option<RecoveryCheckpoint>> {
         let checkpoint = self.read_recovery_checkpoint_unlocked()?;
         if let Some(checkpoint) = &checkpoint {
-            let current_turn = load_session_file(&self.path, self.id())?.user_turn_count();
+            let current_turn =
+                load_session_file(&self.path, self.id(), Some(&self.image_validation))?
+                    .user_turn_count();
             if checkpoint.turn != current_turn {
                 bail!(
                     "recovery checkpoint {} is stale",
@@ -653,7 +696,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
-        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let loaded = load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
         let candidate = match self.inspect_resumable_turn_unlocked(loaded)? {
             ResumableTurnInspection::Available(candidate) => candidate,
             ResumableTurnInspection::Unavailable(_) => return Ok(false),
@@ -669,7 +712,7 @@ impl Session {
             .lock()
             .map_err(|_| anyhow::anyhow!("session append lock is poisoned"))?;
         let _file_guard = self.lock_exclusive()?;
-        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let loaded = load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
         let plan = self.prepare_resumable_turn_unlocked(loaded)?;
         self.append_records_unlocked(&plan.records)?;
         Ok((plan.messages, plan.turn, plan.breaker))
@@ -764,7 +807,7 @@ impl Session {
     }
 
     fn load_phase_four_breaker_unlocked(&self) -> Result<(u64, PhaseFourBreakerState)> {
-        let loaded = load_session_file(&self.path, &self.meta.id)?;
+        let loaded = load_session_file(&self.path, &self.meta.id, Some(&self.image_validation))?;
         self.load_phase_four_breaker_from(&loaded)
     }
 
@@ -1160,6 +1203,9 @@ fn validate_recovery_provider_boundary(messages: &[Message]) -> Result<()> {
 pub struct LoadedSession {
     pub meta: SessionMeta,
     pub records: Vec<Record>,
+    image_bytes: usize,
+    image_count: usize,
+    image_validation: Arc<HashSet<[u8; 32]>>,
 }
 
 impl LoadedSession {
@@ -1173,6 +1219,10 @@ impl LoadedSession {
                 _ => None,
             })
             .unwrap_or(&self.meta.agent)
+    }
+
+    pub(crate) fn has_images(&self) -> bool {
+        self.image_count != 0
     }
 
     fn user_turn_count(&self) -> u64 {
@@ -1248,7 +1298,7 @@ impl LoadedSession {
             match record {
                 Record::User { text } => {
                     flush(&mut messages, &mut pending);
-                    messages.push(Message::user(text));
+                    messages.push(Message::user(text.clone()));
                 }
                 Record::InjectedUser { injection_id, text } => {
                     flush(&mut messages, &mut pending);
@@ -1520,6 +1570,7 @@ impl SessionStore {
             path: self.path(&id),
             archive_root: self.archive_root(&id)?,
             append_lock: Arc::new(Mutex::new(())),
+            image_validation: Arc::new(Mutex::new(HashSet::new())),
         };
         session.append(&Record::Meta { meta })?;
         Ok(session)
@@ -1549,6 +1600,7 @@ impl SessionStore {
             path: self.path(id),
             archive_root,
             append_lock: Arc::new(Mutex::new(())),
+            image_validation: Arc::new(Mutex::new((*loaded.image_validation).clone())),
         };
         let _file_guard = session.lock_exclusive()?;
         ArchiveStore::with_root(&session.archive_root)
@@ -1561,7 +1613,7 @@ impl SessionStore {
     /// Load a session by id.
     pub fn load(&self, id: &str) -> Result<LoadedSession> {
         validate_session_id(id)?;
-        load_session_file(&self.path(id), id)
+        load_session_file(&self.path(id), id, None)
     }
 
     /// Delete one inactive session and its owned archive data.
@@ -1640,7 +1692,7 @@ impl SessionStore {
                     .records
                     .iter()
                     .find_map(|record| match record {
-                        Record::User { text } => Some(preview_text(text)),
+                        Record::User { text } => Some(preview_text(&text.display_text())),
                         _ => None,
                     })
                     .unwrap_or_else(|| "(no messages)".to_string());
@@ -1676,12 +1728,27 @@ fn owned_path_metadata(
     }
 }
 
-fn load_session_file(path: &Path, id: &str) -> Result<LoadedSession> {
+fn load_session_file(
+    path: &Path,
+    id: &str,
+    validation: Option<&Arc<Mutex<HashSet<[u8; 32]>>>>,
+) -> Result<LoadedSession> {
     let file =
         std::fs::File::open(path).with_context(|| format!("session {id:?} was not found"))?;
     let reader = BufReader::new(file);
     let mut meta: Option<SessionMeta> = None;
     let mut records = Vec::new();
+    let mut image_bytes = 0usize;
+    let mut image_count = 0usize;
+    let mut image_validation = validation
+        .map(|cache| {
+            cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session image validation lock is poisoned"))
+                .map(|keys| keys.clone())
+        })
+        .transpose()?
+        .unwrap_or_default();
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed to read session {id:?}"))?;
         if line.trim().is_empty() {
@@ -1695,10 +1762,33 @@ fn load_session_file(path: &Path, id: &str) -> Result<LoadedSession> {
                 _ => bail!("session {id:?} does not start with metadata"),
             }
         }
+        if let Record::User { text } = &record {
+            let remaining_bytes = MAX_SESSION_IMAGE_BYTES.saturating_sub(image_bytes);
+            let remaining_count = MAX_SESSION_IMAGES.saturating_sub(image_count);
+            let (bytes, count) = text
+                .validate_images(remaining_bytes, remaining_count, &mut image_validation)
+                .with_context(|| {
+                    format!("invalid user image on line {} of session {id:?}", index + 1)
+                })?;
+            image_bytes += bytes;
+            image_count += count;
+        }
         records.push(record);
     }
     let meta = meta.with_context(|| format!("session {id:?} is empty"))?;
-    Ok(LoadedSession { meta, records })
+    if let Some(cache) = validation {
+        *cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session image validation lock is poisoned"))? =
+            image_validation.clone();
+    }
+    Ok(LoadedSession {
+        meta,
+        records,
+        image_bytes,
+        image_count,
+        image_validation: Arc::new(image_validation),
+    })
 }
 
 fn preview_text(text: &str) -> String {
@@ -1740,6 +1830,34 @@ fn next_id(created_ms: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_reload_revalidates_persisted_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let record = Record::User {
+            text: UserContent::parts(vec![crate::model::UserContentPart::Image {
+                image: crate::model::ImageInput {
+                    media_type: "image/png".into(),
+                    data: "iVBORw0KGgo=".into(),
+                    validated_key: None,
+                },
+            }]),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&session.path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &record).unwrap();
+        writeln!(file).unwrap();
+
+        let error = store.load(session.id()).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid user image"),
+            "{error:#}"
+        );
+    }
+
     fn loaded(records: Vec<Record>) -> LoadedSession {
         LoadedSession {
             meta: SessionMeta {
@@ -1750,6 +1868,9 @@ mod tests {
                 agent: "code".into(),
             },
             records,
+            image_bytes: 0,
+            image_count: 0,
+            image_validation: Arc::new(HashSet::new()),
         }
     }
 
@@ -3009,7 +3130,7 @@ mod tests {
         let prefixed_user = format!("{}literal user task", crate::compaction::SUMMARY_PREFIX);
         let messages = loaded(vec![
             Record::User {
-                text: prefixed_user,
+                text: prefixed_user.into(),
             },
             assistant_record("first answer"),
             Record::User {

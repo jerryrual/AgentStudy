@@ -19,6 +19,7 @@ pub(crate) enum InvalidSessionRequest {
     CwdMissing,
     CwdNotDirectory,
     CwdMismatch,
+    ImagesDisabled,
     InvalidSessionId,
     AlreadyRegistered,
     ActiveElsewhere,
@@ -45,6 +46,9 @@ impl InvalidSessionRequest {
             Self::CwdMissing => "cwd does not exist",
             Self::CwdNotDirectory => "cwd is not a directory",
             Self::CwdMismatch => "cwd does not match the persisted session",
+            Self::ImagesDisabled => {
+                "session contains images but the active model profile has vision disabled"
+            }
             Self::InvalidSessionId => "session ID is invalid",
             Self::AlreadyRegistered => "session is already active",
             Self::ActiveElsewhere => "session is active in another process",
