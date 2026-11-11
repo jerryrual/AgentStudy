@@ -586,6 +586,15 @@ where
 /// Like iCode's `icode run`, no approval prompt is shown: mutating tools are
 /// allowed unless `--approval deny` was requested.
 pub async fn execute(options: RunOptions) -> Result<()> {
+    let content = UserContent::Text(options.task.trim().to_string());
+    execute_with_content(options, content).await
+}
+
+pub(crate) async fn execute_with_content(options: RunOptions, content: UserContent) -> Result<()> {
+    if !options.profile.vision && content.has_images() {
+        anyhow::bail!("the selected model profile does not enable vision image input");
+    }
+    content.validate_prompt_images()?;
     let profile = options.profile.clone();
     let client = std::sync::Arc::new(
         tokio::task::spawn_blocking(move || ModelClient::from_profile(&profile))
@@ -598,7 +607,13 @@ pub async fn execute(options: RunOptions) -> Result<()> {
     let (session, _run_lease) = match &options.session {
         Some(id) => {
             let lease = store.try_acquire_run_lease(id)?;
-            (store.reopen(id)?, lease)
+            let loaded = store.load(id)?;
+            if !options.profile.vision && loaded.has_images() {
+                anyhow::bail!(
+                    "the selected model profile cannot resume an image-bearing session without vision enabled"
+                );
+            }
+            (store.reopen_loaded(id, loaded)?, lease)
         }
         None if options.resume_turn => {
             anyhow::bail!("same-turn resume requires an existing session")
@@ -618,7 +633,7 @@ pub async fn execute(options: RunOptions) -> Result<()> {
         if options.resume_turn {
             TurnStart::Resume
         } else {
-            TurnStart::User(options.task.trim().to_string().into())
+            TurnStart::User(content.clone())
         },
     )?;
 

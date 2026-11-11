@@ -121,15 +121,50 @@ impl ImageInput {
         data: String,
         remaining_bytes: usize,
     ) -> Result<(Self, usize)> {
-        let mut image = Self {
+        let image = Self {
             media_type,
             data,
             validated_key: None,
         };
         let (format, decoded) = image.decode_payload()?;
+        Self::validated_decoded(image, format, decoded, remaining_bytes)
+    }
+
+    pub(crate) fn validated_bytes(
+        decoded: Vec<u8>,
+        remaining_bytes: usize,
+    ) -> Result<(Self, usize)> {
+        ensure!(!decoded.is_empty(), "image file must not be empty");
+        ensure!(
+            decoded.len() <= MAX_IMAGE_BYTES,
+            "image exceeds the {MAX_IMAGE_BYTES}-byte decoded limit"
+        );
+        let format =
+            image::guess_format(&decoded).context("unsupported or unrecognized image format")?;
+        let media_type = match format {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Gif => "image/gif",
+            ImageFormat::WebP => "image/webp",
+            _ => anyhow::bail!("unsupported image format: {format:?}"),
+        };
+        let image = Self {
+            media_type: media_type.to_string(),
+            data: BASE64_STANDARD.encode(&decoded),
+            validated_key: None,
+        };
+        Self::validated_decoded(image, format, decoded, remaining_bytes)
+    }
+
+    fn validated_decoded(
+        mut image: Self,
+        format: ImageFormat,
+        decoded: Vec<u8>,
+        remaining_bytes: usize,
+    ) -> Result<(Self, usize)> {
         ensure!(
             decoded.len() <= remaining_bytes,
-            "ACP prompt images exceed their aggregate limit"
+            "prompt images exceed their aggregate limit"
         );
         image.decode_image(format, &decoded)?;
         image.validated_key = Some(validation_cache_key(&image.media_type, &decoded));
@@ -144,7 +179,7 @@ impl ImageInput {
         let (format, decoded) = self.decode_payload()?;
         ensure!(
             decoded.len() <= remaining_bytes,
-            "ACP image bytes exceed their session limit"
+            "image bytes exceed their remaining limit"
         );
         let key = validation_cache_key(&self.media_type, &decoded);
         if self.validated_key != Some(key) && !validated.contains(&key) {
@@ -187,7 +222,7 @@ impl ImageInput {
         reader.limits(limits);
         reader
             .decode()
-            .with_context(|| format!("ACP image data is not a valid {} image", self.media_type))?;
+            .with_context(|| format!("image data is not a valid {} image", self.media_type))?;
         Ok(())
     }
 
@@ -235,6 +270,24 @@ impl UserContent {
         }
     }
 
+    pub(crate) fn has_images(&self) -> bool {
+        matches!(
+            self,
+            Self::Parts(parts)
+                if parts
+                    .iter()
+                    .any(|part| matches!(part, UserContentPart::Image { .. }))
+        )
+    }
+
+    pub(crate) fn validate_prompt_images(&self) -> Result<(usize, usize)> {
+        self.validate_images(
+            MAX_PROMPT_IMAGE_BYTES,
+            MAX_PROMPT_IMAGES,
+            &mut HashSet::new(),
+        )
+    }
+
     pub(crate) fn validate_images(
         &self,
         max_bytes: usize,
@@ -250,19 +303,13 @@ impl UserContent {
             let UserContentPart::Image { image } = part else {
                 continue;
             };
-            count = count.checked_add(1).context("ACP image count overflowed")?;
-            ensure!(
-                count <= max_count,
-                "ACP image count exceeds its session limit"
-            );
+            count = count.checked_add(1).context("image count overflowed")?;
+            ensure!(count <= max_count, "image count exceeds its limit");
             let remaining_bytes = max_bytes.saturating_sub(bytes);
             bytes = bytes
                 .checked_add(image.validate_persisted(remaining_bytes, validated)?)
-                .context("ACP image byte count overflowed")?;
-            ensure!(
-                bytes <= max_bytes,
-                "ACP image bytes exceed their session limit"
-            );
+                .context("image byte count overflowed")?;
+            ensure!(bytes <= max_bytes, "image bytes exceed their limit");
         }
         Ok((bytes, count))
     }
