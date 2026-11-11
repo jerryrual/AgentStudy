@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
     CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
@@ -24,7 +24,7 @@ use crate::run::{
 };
 
 use super::approval::AcpApprover;
-use super::client_fs::AcpReadFile;
+use super::client_fs::{AcpReadFile, AcpWriteDispatcher, AcpWriteFile};
 use super::dispatcher;
 use super::error::ControlError;
 use super::prompt;
@@ -72,6 +72,10 @@ fn supports_client_text_reads(request: &InitializeRequest) -> bool {
     request.client_capabilities.fs.read_text_file
 }
 
+fn supports_client_text_writes(request: &InitializeRequest) -> bool {
+    request.client_capabilities.fs.write_text_file
+}
+
 pub(crate) type PromptSetupHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Build the unexposed stable-v1 callbacks over the shared session control boundary.
@@ -95,6 +99,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let client_text_reads = Arc::new(AtomicBool::new(false));
     let initialize_text_reads = Arc::clone(&client_text_reads);
     let prompt_text_reads = client_text_reads;
+    let client_text_writes = Arc::new(AtomicBool::new(false));
+    let initialize_text_writes = Arc::clone(&client_text_writes);
+    let prompt_text_writes = client_text_writes;
+    let write_dispatcher = Arc::new(Mutex::new(None::<AcpWriteDispatcher>));
+    let initialize_write_dispatcher = Arc::clone(&write_dispatcher);
+    let prompt_write_dispatcher = write_dispatcher;
     let load_control = Arc::clone(&control);
     let resume_control = Arc::clone(&control);
     let config_control = Arc::clone(&control);
@@ -108,10 +118,21 @@ pub(crate) fn callback_bundle_with_setup_hook(
         .v1()
         .name("icode")
         .on_receive_request(
-            async move |request: InitializeRequest, responder, _connection| {
+            async move |request: InitializeRequest, responder, connection| {
                 initialize_notices.store(supports_notices(&request), Ordering::Release);
                 initialize_text_reads
                     .store(supports_client_text_reads(&request), Ordering::Release);
+                let supports_writes = supports_client_text_writes(&request);
+                initialize_text_writes.store(supports_writes, Ordering::Release);
+                if supports_writes {
+                    let dispatcher = match AcpWriteDispatcher::new(connection) {
+                        Ok(dispatcher) => dispatcher,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
+                    *initialize_write_dispatcher
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dispatcher);
+                }
                 responder.respond(SessionControl::initialize(&request))
             },
             agent_client_protocol::on_receive_request!(),
@@ -239,11 +260,21 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
                 let context_window = runtime.context_window();
                 let supports_notices = prompt_notices.load(Ordering::Acquire);
-                let text_file_reader = prompt_text_reads.load(Ordering::Acquire).then(|| {
+                let client_text_reads = prompt_text_reads.load(Ordering::Acquire);
+                let client_text_writes = prompt_text_writes.load(Ordering::Acquire);
+                let text_file_reader = client_text_reads.then(|| {
                     Arc::new(AcpReadFile::new(
                         request.session_id.clone(),
                         connection.clone(),
                     ))
+                });
+                let text_file_writer = client_text_writes.then(|| {
+                    let dispatcher = prompt_write_dispatcher
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone()
+                        .expect("write capability initialized its dispatcher");
+                    Arc::new(AcpWriteFile::new(request.session_id.clone(), dispatcher))
                 });
                 let request_cancellation = responder.cancellation();
                 let approver = Arc::new(AcpApprover::new(
@@ -269,6 +300,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         );
                         if let Some(reader) = text_file_reader {
                             agent = agent.with_tool_override(reader);
+                        }
+                        if let Some(writer) = text_file_writer {
+                            agent = agent.with_tool_override(writer);
+                        }
+                        if client_text_reads || client_text_writes {
+                            agent = agent.with_hidden_tool("edit_file");
                         }
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
@@ -403,14 +440,28 @@ mod tests {
     }
 
     #[test]
-    fn client_text_reads_require_explicit_fs_capability() {
+    fn client_text_capabilities_are_explicit_and_independent() {
         let without = InitializeRequest::new(ProtocolVersion::V1);
-        let with = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+        let reads = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
             ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+        );
+        let writes = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().write_text_file(true)),
+        );
+        let both = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().fs(FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true)),
         );
 
         assert!(!supports_client_text_reads(&without));
-        assert!(supports_client_text_reads(&with));
+        assert!(!supports_client_text_writes(&without));
+        assert!(supports_client_text_reads(&reads));
+        assert!(!supports_client_text_writes(&reads));
+        assert!(!supports_client_text_reads(&writes));
+        assert!(supports_client_text_writes(&writes));
+        assert!(supports_client_text_reads(&both));
+        assert!(supports_client_text_writes(&both));
     }
 
     #[tokio::test(flavor = "current_thread")]
