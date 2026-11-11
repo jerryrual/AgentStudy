@@ -19,6 +19,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         api_style: ApiStyle::Responses,
         responses_web_search: false,
         responses_stored_continuation: false,
+        responses_background: false,
         model: "gpt-test".to_string(),
         base_url: server.base_url(),
         api_key: "test-key".to_string(),
@@ -377,6 +378,7 @@ async fn responses_stream_ignores_empty_data_events() {
         MockResponse {
         status: 200,
         content_type: "text/event-stream".to_string(),
+        declared_length: None,
         body: concat!(
             "data: \n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]}}\n\n"
@@ -838,6 +840,125 @@ async fn responses_stored_stream_requires_and_captures_one_response_id() {
             .map(|handle| handle.id.as_str()),
         Some("resp_stream")
     );
+}
+
+#[tokio::test]
+async fn responses_background_creates_once_then_polls_to_completion() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = Arc::clone(&calls);
+    let server = MockServer::new(move |path, body| {
+        let call = calls_for_server.fetch_add(1, Ordering::SeqCst);
+        match call {
+            0 => {
+                assert_eq!(path, "/v1/responses");
+                assert_eq!(body["background"], true);
+                assert_eq!(body["store"], true);
+                assert_eq!(body["stream"], false);
+                MockResponse::json(
+                    200,
+                    &json!({"id":"resp_bg","status":"queued","output":[]}).to_string(),
+                )
+            }
+            1 => {
+                assert_eq!(
+                    path,
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                );
+                assert!(body.is_null());
+                MockResponse::json(500, r#"{"error":{"message":"poll later"}}"#)
+            }
+            2 => {
+                assert_eq!(
+                    path,
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                );
+                assert!(body.is_null());
+                let mut response =
+                    MockResponse::json(200, r#"{"id":"resp_bg","status":"in_progress"}"#);
+                response.declared_length = Some(response.body.len() + 10);
+                response
+            }
+            3 => {
+                assert_eq!(
+                    path,
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                );
+                assert!(body.is_null());
+                MockResponse::json(
+                    200,
+                    &json!({
+                        "id": "resp_bg",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_bg",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{"type":"output_text","text":"background done","annotations":[]}]
+                        }],
+                        "usage": {"input_tokens":2,"output_tokens":2,"total_tokens":4}
+                    })
+                    .to_string(),
+                )
+            }
+            _ => panic!("unexpected background request {call}"),
+        }
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+
+    let completion = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::system("prompt"), Message::user("long task")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.message.content.as_deref(),
+        Some("background done")
+    );
+    assert_eq!(
+        completion
+            .message
+            .responses_continuation
+            .as_ref()
+            .map(|handle| handle.id.as_str()),
+        Some("resp_bg")
+    );
+    assert_eq!(server.request_count(), 4);
+}
+
+#[tokio::test]
+async fn responses_background_create_failure_is_not_retried() {
+    let server = MockServer::new(|path, body| {
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["background"], true);
+        MockResponse::json(500, &"x".repeat(70_000))
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+
+    let error = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::system("prompt"), Message::user("long task")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("was not retried"));
+    assert!(error
+        .to_string()
+        .contains("error body exceeded 65536 bytes"));
+    assert_eq!(server.request_count(), 1);
 }
 
 #[tokio::test]

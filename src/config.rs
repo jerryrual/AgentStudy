@@ -96,6 +96,9 @@ pub struct ModelProfile {
     /// Store ordinary Responses and continue them by provider response id.
     #[serde(default, skip_serializing_if = "is_false")]
     pub responses_stored_continuation: bool,
+    /// Create ordinary Responses as provider-side background jobs and poll them.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub responses_background: bool,
     /// Provider model identifier, e.g. `deepseek-chat`.
     pub model: String,
     /// Base URL; empty means the provider default.
@@ -150,6 +153,7 @@ impl ModelProfile {
             api_style: ApiStyle::Chat,
             responses_web_search: false,
             responses_stored_continuation: false,
+            responses_background: false,
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             api_key: "{{DEEPSEEK_API_KEY}}".to_string(),
@@ -351,6 +355,33 @@ impl Settings {
                     "model profile {:?} enables Responses stored continuation with a non-Responses API style",
                     profile.name
                 );
+            }
+            if profile.responses_background {
+                if profile.api_style != ApiStyle::Responses {
+                    bail!(
+                        "model profile {:?} enables background Responses with a non-Responses API style",
+                        profile.name
+                    );
+                }
+                if !profile.provider.eq_ignore_ascii_case("openai") {
+                    bail!(
+                        "model profile {:?} enables background Responses for unsupported provider {:?}",
+                        profile.name,
+                        profile.provider
+                    );
+                }
+                if !profile.responses_stored_continuation {
+                    bail!(
+                        "model profile {:?} enables background Responses without stored continuation",
+                        profile.name
+                    );
+                }
+                if profile.stream {
+                    bail!(
+                        "model profile {:?} enables background Responses with streaming",
+                        profile.name
+                    );
+                }
             }
             if !(MIN_LAST_WORDS_MAX_OUTPUT_TOKENS..=MAX_LAST_WORDS_MAX_OUTPUT_TOKENS)
                 .contains(&profile.last_words_max_output_tokens)
@@ -671,6 +702,52 @@ mod tests {
 
         let json = serde_json::to_value(profile).unwrap();
         assert_eq!(json.get("context_window"), None);
+    }
+
+    #[test]
+    fn responses_background_requires_openai_stored_nonstreaming_responses() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert!(!profile.responses_background);
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("responses_background"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].responses_background = true;
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("background Responses with a non-Responses API style"));
+        settings.models[0].api_style = ApiStyle::Responses;
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("background Responses for unsupported provider"));
+        settings.models[0].provider = "openai".into();
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("background Responses without stored continuation"));
+        settings.models[0].responses_stored_continuation = true;
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("background Responses with streaming"));
+        settings.models[0].stream = false;
+        settings.normalise().unwrap();
     }
 
     #[test]

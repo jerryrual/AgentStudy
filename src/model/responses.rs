@@ -15,6 +15,7 @@ pub(super) struct RequestFeatures {
     pub include_encrypted_reasoning: bool,
     pub web_search: bool,
     pub store: bool,
+    pub background: bool,
     pub previous_response_id: Option<String>,
 }
 
@@ -77,6 +78,9 @@ pub(super) fn request_body(
         "stream": stream,
         "store": features.store,
     });
+    if features.background {
+        body["background"] = json!(true);
+    }
     if let Some(previous_response_id) = &features.previous_response_id {
         body["previous_response_id"] = json!(previous_response_id);
     }
