@@ -9,6 +9,7 @@ use super::{
     AssistantMessage, Completion, Message, ResponsesContinuation, ToolCall, ToolDef, Usage,
 };
 use crate::agent::EventSink;
+use crate::config::ResponsesFileSearchRankingOptions;
 
 #[derive(Clone, Default)]
 pub(super) struct RequestFeatures {
@@ -16,6 +17,7 @@ pub(super) struct RequestFeatures {
     pub web_search: bool,
     pub file_search_vector_store_ids: Vec<String>,
     pub file_search_max_num_results: Option<u8>,
+    pub file_search_ranking_options: Option<ResponsesFileSearchRankingOptions>,
     pub store: bool,
     pub background: bool,
     pub previous_response_id: Option<String>,
@@ -113,6 +115,9 @@ pub(super) fn request_body(
         });
         if let Some(maximum) = features.file_search_max_num_results {
             declaration["max_num_results"] = json!(maximum);
+        }
+        if let Some(ranking) = features.file_search_ranking_options {
+            declaration["ranking_options"] = json!(ranking);
         }
         declarations.push(declaration);
     }

@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use common::{MockResponse, MockServer, RecordingSink};
 use icode::agent::{Agent, AgentKind, AgentOptions};
-use icode::config::{ApiStyle, ModelProfile, ResponsesFileSearchConfig};
+use icode::config::{
+    ApiStyle, ModelProfile, ResponsesFileSearchConfig, ResponsesFileSearchHybridSearch,
+    ResponsesFileSearchRanker, ResponsesFileSearchRankingOptions,
+};
 use icode::interaction::{AllowAll, NoAsker};
 use icode::model::{AssistantMessage, Message, ModelClient, ToolCall, ToolDef};
 use icode::tools::ToolRegistry;
@@ -464,7 +467,15 @@ async fn responses_preserves_hosted_file_search_results_and_citations() {
             json!([{
                 "type": "file_search",
                 "vector_store_ids": ["vs_docs"],
-                "max_num_results": 10
+                "max_num_results": 10,
+                "ranking_options": {
+                    "hybrid_search": {
+                        "embedding_weight": 0.7,
+                        "text_weight": 0.3
+                    },
+                    "ranker": "default-2024-11-15",
+                    "score_threshold": 0.25
+                }
             }])
         );
         assert_eq!(
@@ -516,6 +527,14 @@ async fn responses_preserves_hosted_file_search_results_and_citations() {
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_docs".into()],
         max_num_results: Some(10),
+        ranking_options: Some(ResponsesFileSearchRankingOptions {
+            hybrid_search: Some(ResponsesFileSearchHybridSearch {
+                embedding_weight: 0.7,
+                text_weight: 0.3,
+            }),
+            ranker: Some(ResponsesFileSearchRanker::Default20241115),
+            score_threshold: Some(0.25),
+        }),
     });
 
     let completion = ModelClient::from_profile(&profile)
@@ -901,7 +920,7 @@ async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
 }
 
 #[tokio::test]
-async fn responses_file_search_change_forces_full_stored_replay() {
+async fn responses_file_search_ranking_change_forces_full_stored_replay() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_server = Arc::clone(&calls);
     let server = MockServer::new(move |_, _| {
@@ -928,6 +947,7 @@ async fn responses_file_search_change_forces_full_stored_replay() {
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_a".into()],
         max_num_results: None,
+        ranking_options: None,
     });
     let sink = RecordingSink::default();
     let mut messages = vec![Message::system("prompt"), Message::user("first")];
@@ -940,8 +960,13 @@ async fn responses_file_search_change_forces_full_stored_replay() {
     messages.push(Message::user("second"));
 
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
-        vector_store_ids: vec!["vs_b".into()],
+        vector_store_ids: vec!["vs_a".into()],
         max_num_results: None,
+        ranking_options: Some(ResponsesFileSearchRankingOptions {
+            hybrid_search: None,
+            ranker: Some(ResponsesFileSearchRanker::Auto),
+            score_threshold: Some(0.4),
+        }),
     });
     ModelClient::from_profile(&profile)
         .unwrap()
@@ -956,7 +981,11 @@ async fn responses_file_search_change_forces_full_stored_replay() {
         requests[1]["input"].as_array().unwrap().len(),
         messages.len()
     );
-    assert_eq!(requests[1]["tools"][0]["vector_store_ids"], json!(["vs_b"]));
+    assert_eq!(requests[1]["tools"][0]["vector_store_ids"], json!(["vs_a"]));
+    assert_eq!(
+        requests[1]["tools"][0]["ranking_options"],
+        json!({"ranker":"auto","score_threshold":0.4})
+    );
 }
 
 #[tokio::test]
@@ -1062,6 +1091,7 @@ async fn responses_background_creates_once_then_polls_to_completion() {
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_docs".into()],
         max_num_results: None,
+        ranking_options: None,
     });
 
     let completion = ModelClient::from_profile(&profile)

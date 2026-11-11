@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Name of the built-in profile created on first run.
@@ -80,6 +80,59 @@ impl ApiStyle {
     }
 }
 
+/// Provider ranker choices currently accepted by the Responses API.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum ResponsesFileSearchRanker {
+    /// Let the provider select the ranker.
+    #[serde(rename = "auto")]
+    Auto,
+    /// Use the provider's dated default ranker.
+    #[serde(rename = "default-2024-11-15")]
+    Default20241115,
+}
+
+/// Reciprocal-rank-fusion weights for hybrid file search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesFileSearchHybridSearch {
+    /// Reciprocal-rank-fusion weight for semantic embedding matches.
+    pub embedding_weight: f64,
+    /// Reciprocal-rank-fusion weight for sparse keyword matches.
+    pub text_weight: f64,
+}
+
+/// Optional ranking controls attached to a hosted file-search declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesFileSearchRankingOptions {
+    /// Optional reciprocal-rank-fusion weights for hybrid retrieval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hybrid_search: Option<ResponsesFileSearchHybridSearch>,
+    /// Provider ranker selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranker: Option<ResponsesFileSearchRanker>,
+    /// Minimum relevance score accepted from the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_threshold: Option<f64>,
+}
+
+impl ResponsesFileSearchRankingOptions {
+    /// Reject values that cannot be serialized safely or violate documented bounds.
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self
+            .score_threshold
+            .is_some_and(|threshold| !threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+        {
+            bail!("Responses file search score_threshold must be finite and between 0 and 1");
+        }
+        if self.hybrid_search.as_ref().is_some_and(|hybrid| {
+            !hybrid.embedding_weight.is_finite() || !hybrid.text_weight.is_finite()
+        }) {
+            bail!("Responses file search hybrid weights must be finite");
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for the provider-hosted Responses file-search tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesFileSearchConfig {
     /// Provider vector stores searched by the hosted tool.
@@ -87,6 +140,9 @@ pub struct ResponsesFileSearchConfig {
     /// Maximum result chunks returned to the model (provider range: 1..=50).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_num_results: Option<u8>,
+    /// Optional provider ranking controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_options: Option<ResponsesFileSearchRankingOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -400,6 +456,14 @@ impl Settings {
                         "model profile {:?} Responses file search max_num_results must be between 1 and 50",
                         profile.name
                     );
+                }
+                if let Some(ranking) = &file_search.ranking_options {
+                    ranking.validate().map_err(|error| {
+                        anyhow!(
+                            "model profile {:?} has invalid ranking options: {error}",
+                            profile.name
+                        )
+                    })?;
                 }
             }
             if profile.responses_stored_continuation && profile.api_style != ApiStyle::Responses {
@@ -853,6 +917,7 @@ mod tests {
         settings.models[0].responses_file_search = Some(ResponsesFileSearchConfig {
             vector_store_ids: vec!["vs_docs".into()],
             max_num_results: Some(20),
+            ranking_options: None,
         });
         assert!(settings
             .normalise()
@@ -880,6 +945,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate Responses file search vector store id"));
+
+        let file_search = settings.models[0].responses_file_search.as_mut().unwrap();
+        file_search.vector_store_ids.pop();
+        file_search.ranking_options = Some(ResponsesFileSearchRankingOptions {
+            hybrid_search: None,
+            ranker: Some(ResponsesFileSearchRanker::Default20241115),
+            score_threshold: Some(1.1),
+        });
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("score_threshold must be finite and between 0 and 1"));
+
+        let ranking = settings.models[0]
+            .responses_file_search
+            .as_mut()
+            .unwrap()
+            .ranking_options
+            .as_mut()
+            .unwrap();
+        ranking.score_threshold = Some(0.5);
+        ranking.hybrid_search = Some(ResponsesFileSearchHybridSearch {
+            embedding_weight: f64::NAN,
+            text_weight: 1.0,
+        });
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("hybrid weights must be finite"));
+
+        settings.models[0]
+            .responses_file_search
+            .as_mut()
+            .unwrap()
+            .ranking_options
+            .as_mut()
+            .unwrap()
+            .hybrid_search = Some(ResponsesFileSearchHybridSearch {
+            embedding_weight: 0.6,
+            text_weight: 0.4,
+        });
+        settings.normalise().unwrap();
+        assert_eq!(
+            serde_json::to_value(&settings).unwrap()["models"][0]["responses_file_search"]
+                ["ranking_options"]["ranker"],
+            "default-2024-11-15"
+        );
     }
 
     #[test]

@@ -89,7 +89,9 @@ export ICODE_HOME="$HOME/.icode"
 Responses profile 可设置 `"responses_web_search": true`，让 provider 在普通请求中运行托管
 `web_search`；该搜索不经过本地工具审批或网络策略，其 native call 会随会话持久化并在无状态请求中回放。
 也可配置 `"responses_file_search": {"vector_store_ids": ["vs_..."], "max_num_results": 20}`，让
-provider 搜索既有 vector store；`max_num_results` 可省略，若设置须为 1–50。文件搜索结果、原生
+provider 搜索既有 vector store；`max_num_results` 可省略，若设置须为 1–50。可选 `ranking_options`
+支持 `ranker`（`auto` / `default-2024-11-15`）、0–1 的 `score_threshold`，以及同时指定有限
+`embedding_weight` / `text_weight` 的 `hybrid_search`。文件搜索结果、原生
 `file_search_call` 与文件引用注解会进入本地会话并原样回放，但当前 TUI 仅显示回答文本，不单独渲染引用。
 这些托管调用都不经过本地工具审批/执行；切换配置会使存储续传建立新 scope。Phase 4 Last Words
 side-call 始终不暴露托管工具。还可显式设置
