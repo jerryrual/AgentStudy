@@ -25,6 +25,7 @@ pub(crate) enum InvalidSessionRequest {
     PromptLoading,
     PromptActive,
     CloseLoading,
+    DeleteLoading,
     ListCursor,
 }
 
@@ -46,6 +47,7 @@ impl InvalidSessionRequest {
             Self::PromptLoading => "session is still loading",
             Self::PromptActive => "session already has an active prompt",
             Self::CloseLoading => "session cannot be closed while it is loading",
+            Self::DeleteLoading => "session cannot be deleted while it is loading",
             Self::ListCursor => "session list cursor is not supported",
         }
     }
@@ -174,6 +176,10 @@ mod tests {
             (
                 InvalidSessionRequest::CloseLoading,
                 "session cannot be closed while it is loading",
+            ),
+            (
+                InvalidSessionRequest::DeleteLoading,
+                "session cannot be deleted while it is loading",
             ),
             (
                 InvalidSessionRequest::ListCursor,

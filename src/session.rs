@@ -1454,6 +1454,13 @@ impl SessionStore {
                 RunLeaseError::Internal(error)
             });
         }
+        self.acquire_validated_run_lease(id)
+    }
+
+    fn acquire_validated_run_lease(
+        &self,
+        id: &str,
+    ) -> std::result::Result<SessionRunLease, RunLeaseError> {
         let path = self.root.join(format!("{id}.run.lock"));
         let file = open_append_private_nofollow(&path)
             .with_context(|| format!("failed to open session run lease {}", path.display()))
@@ -1529,6 +1536,57 @@ impl SessionStore {
         load_session_file(&self.path(id), id)
     }
 
+    /// Delete one inactive session and its owned archive data.
+    pub(crate) fn delete(&self, id: &str) -> std::result::Result<(), RunLeaseError> {
+        validate_session_id(id).map_err(RunLeaseError::InvalidSessionId)?;
+        let transcript = self.path(id);
+        let archive_root = self
+            .archive_root(id)
+            .map_err(RunLeaseError::InvalidSessionId)?;
+        if owned_path_metadata(&transcript, "session transcript")?.is_none()
+            && owned_path_metadata(&archive_root, "session archive")?.is_none()
+        {
+            return Err(RunLeaseError::SessionNotFound(anyhow::anyhow!(
+                "session {id:?} was not found"
+            )));
+        }
+
+        let lease = self.acquire_validated_run_lease(id)?;
+        let transcript_metadata = owned_path_metadata(&transcript, "session transcript")?;
+        let archive_metadata = owned_path_metadata(&archive_root, "session archive")?;
+        if transcript_metadata.is_none() && archive_metadata.is_none() {
+            return Err(RunLeaseError::SessionNotFound(anyhow::anyhow!(
+                "session {id:?} was not found"
+            )));
+        }
+        if transcript_metadata.is_some() {
+            std::fs::remove_file(&transcript).map_err(|error| {
+                RunLeaseError::Internal(
+                    anyhow::Error::from(error).context(format!("failed to delete session {id}")),
+                )
+            })?;
+        }
+        if let Some(metadata) = archive_metadata {
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&archive_root).map_err(|error| {
+                    RunLeaseError::Internal(anyhow::Error::from(error).context(format!(
+                        "failed to delete session archive {}",
+                        archive_root.display()
+                    )))
+                })?;
+            } else {
+                std::fs::remove_file(&archive_root).map_err(|error| {
+                    RunLeaseError::Internal(anyhow::Error::from(error).context(format!(
+                        "failed to delete session archive {}",
+                        archive_root.display()
+                    )))
+                })?;
+            }
+        }
+        drop(lease);
+        Ok(())
+    }
+
     /// List sessions, newest first.
     pub fn list(&self) -> Result<Vec<SessionSummary>> {
         let mut summaries = Vec::new();
@@ -1574,6 +1632,19 @@ impl SessionStore {
     /// Id of the most recent session, if any.
     pub fn latest(&self) -> Result<Option<String>> {
         Ok(self.list()?.into_iter().next().map(|summary| summary.id))
+    }
+}
+
+fn owned_path_metadata(
+    path: &Path,
+    description: &str,
+) -> std::result::Result<Option<std::fs::Metadata>, RunLeaseError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RunLeaseError::Internal(anyhow::Error::from(error).context(
+            format!("failed to inspect {description} {}", path.display()),
+        ))),
     }
 }
 
@@ -2464,6 +2535,94 @@ mod tests {
             .path()
             .join(format!("{}.run.lock", session.id()))
             .exists());
+    }
+
+    #[test]
+    fn delete_requires_the_run_lease_and_removes_owned_session_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let archive_root = store.archive_root(session.id()).unwrap();
+        std::fs::create_dir_all(&archive_root).unwrap();
+        std::fs::write(archive_root.join("record.json"), "owned").unwrap();
+
+        let lease = store.try_acquire_run_lease(session.id()).unwrap();
+        assert!(matches!(
+            store.delete(session.id()),
+            Err(RunLeaseError::ActiveElsewhere { .. })
+        ));
+        assert!(store.path(session.id()).exists());
+        drop(lease);
+
+        store.delete(session.id()).unwrap();
+        assert!(!store.path(session.id()).exists());
+        assert!(!archive_root.exists());
+        assert!(directory
+            .path()
+            .join(format!("{}.run.lock", session.id()))
+            .exists());
+        assert!(matches!(
+            store.delete(session.id()),
+            Err(RunLeaseError::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_retries_archive_cleanup_after_the_transcript_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let archive_root = store.archive_root(session.id()).unwrap();
+        std::fs::create_dir_all(&archive_root).unwrap();
+        std::fs::write(archive_root.join("record.json"), "owned").unwrap();
+        std::fs::remove_file(store.path(session.id())).unwrap();
+
+        store.delete(session.id()).unwrap();
+
+        assert!(!archive_root.exists());
+        assert!(matches!(
+            store.delete(session.id()),
+            Err(RunLeaseError::SessionNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_preserves_the_archive_when_transcript_removal_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let transcript = store.path(session.id());
+        let archive_root = store.archive_root(session.id()).unwrap();
+        std::fs::create_dir_all(&archive_root).unwrap();
+        std::fs::write(archive_root.join("record.json"), "owned").unwrap();
+        std::fs::remove_file(&transcript).unwrap();
+        std::fs::create_dir(&transcript).unwrap();
+
+        assert!(matches!(
+            store.delete(session.id()),
+            Err(RunLeaseError::Internal(_))
+        ));
+        assert!(archive_root.join("record.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_unlinks_a_symlinked_archive_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), "external").unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        symlink(outside.path(), store.archive_root(session.id()).unwrap()).unwrap();
+
+        store.delete(session.id()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "external"
+        );
     }
 
     #[test]

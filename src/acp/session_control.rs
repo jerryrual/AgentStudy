@@ -15,12 +15,15 @@ use super::sessions::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
+    DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification,
 };
 use agent_client_protocol::Error as ProtocolError;
+
+use crate::session::RunLeaseError;
 
 /// Validated session creation and cancellation shared by future wire handlers.
 pub(crate) struct SessionControl {
@@ -62,6 +65,7 @@ impl SessionControl {
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                         .close(SessionCloseCapabilities::new())
+                        .delete(SessionDeleteCapabilities::new())
                         .list(SessionListCapabilities::new()),
                 ),
         )
@@ -210,6 +214,27 @@ impl SessionControl {
         Ok(ListSessionsResponse::new(sessions))
     }
 
+    /// Cancel active work, drain it, then delete the durable session and archive.
+    pub(crate) async fn delete(
+        &self,
+        request: &DeleteSessionRequest,
+    ) -> ControlResult<DeleteSessionResponse> {
+        match self.sessions.close(&request.session_id).await {
+            Ok(()) | Err(CloseError::SessionNotFound) => {}
+            Err(CloseError::Loading) => {
+                return Err(ControlError::invalid(InvalidSessionRequest::DeleteLoading));
+            }
+        }
+        let store = self.sessions.store();
+        let session_id = request.session_id.clone();
+        let id = session_id.to_string();
+        tokio::task::spawn_blocking(move || store.delete(&id))
+            .await
+            .map_err(ControlError::internal)?
+            .map_err(|error| map_delete_error(error, session_id))?;
+        Ok(DeleteSessionResponse::new())
+    }
+
     /// Cancel active work, drain it, and release one registered session.
     pub(crate) async fn close(
         &self,
@@ -253,6 +278,19 @@ impl LoadTransaction {
         respond(LoadSessionResponse::new()).map_err(ControlError::Protocol)?;
         pending.commit();
         Ok(())
+    }
+}
+
+fn map_delete_error(error: RunLeaseError, session_id: SessionId) -> ControlError {
+    match error {
+        RunLeaseError::InvalidSessionId(_) => {
+            ControlError::invalid(InvalidSessionRequest::InvalidSessionId)
+        }
+        RunLeaseError::SessionNotFound(_) => ControlError::SessionNotFound(session_id),
+        RunLeaseError::ActiveElsewhere { .. } => {
+            ControlError::invalid(InvalidSessionRequest::ActiveElsewhere)
+        }
+        RunLeaseError::Internal(error) => ControlError::Internal(error),
     }
 }
 
@@ -342,6 +380,7 @@ mod tests {
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new(),)
                         .close(SessionCloseCapabilities::new())
+                        .delete(SessionDeleteCapabilities::new())
                         .list(SessionListCapabilities::new()),
                 )
             );
@@ -454,6 +493,51 @@ mod tests {
 
         let error = close_control
             .close(&CloseSessionRequest::new(session_id.clone()))
+            .await
+            .unwrap_err();
+        let protocol: ProtocolError = error.into();
+        assert_eq!(
+            protocol,
+            agent_client_protocol::v1::schema::Error::session_not_found(session_id).into()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cancels_drains_and_removes_the_durable_session() {
+        let (directory, store, control) = control();
+        let response = control
+            .new_session(&NewSessionRequest::new(directory.path()))
+            .await
+            .unwrap();
+        let session_id = response.session_id;
+        let id = session_id.to_string();
+        let archive_root = store.archive_root(&id).unwrap();
+        std::fs::create_dir_all(&archive_root).unwrap();
+        std::fs::write(archive_root.join("record.json"), "owned").unwrap();
+        let mut guard = control.begin_prompt(&session_id).unwrap();
+        let delete_control = Arc::new(control);
+        let delete_request = DeleteSessionRequest::new(session_id.clone());
+        let delete_task = {
+            let delete_control = Arc::clone(&delete_control);
+            tokio::spawn(async move { delete_control.delete(&delete_request).await })
+        };
+
+        guard.cancelled().await;
+        assert!(matches!(
+            delete_control.begin_prompt(&session_id),
+            Err(ControlError::SessionNotFound(_))
+        ));
+        assert!(!delete_task.is_finished());
+        drop(guard);
+        assert_eq!(
+            delete_task.await.unwrap().unwrap(),
+            DeleteSessionResponse::new()
+        );
+        assert!(!store.path(&id).exists());
+        assert!(!archive_root.exists());
+
+        let error = delete_control
+            .delete(&DeleteSessionRequest::new(session_id.clone()))
             .await
             .unwrap_err();
         let protocol: ProtocolError = error.into();
