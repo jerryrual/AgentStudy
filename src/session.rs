@@ -152,7 +152,13 @@ struct PhaseFourBreakerCheckpoint {
 
 #[derive(Debug)]
 pub(crate) struct SessionRunLease {
-    _file: std::fs::File,
+    file: std::fs::File,
+}
+
+impl Drop for SessionRunLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
 }
 
 #[derive(Debug)]
@@ -1488,7 +1494,7 @@ impl SessionStore {
             .with_context(|| format!("failed to open session run lease {}", path.display()))
             .map_err(RunLeaseError::Internal)?;
         match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => Ok(SessionRunLease { _file: file }),
+            Ok(()) => Ok(SessionRunLease { file }),
             Err(error) if is_lock_contended(&error) => {
                 Err(RunLeaseError::ActiveElsewhere { id: id.to_string() })
             }
@@ -2557,6 +2563,20 @@ mod tests {
             .path()
             .join(format!("{}.run.lock", session.id()))
             .exists());
+    }
+
+    #[test]
+    fn dropping_run_lease_unlocks_an_inherited_file_description() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_root(directory.path());
+        let session = store.create("/tmp", "model", "code").unwrap();
+        let lease = store.try_acquire_run_lease(session.id()).unwrap();
+        let inherited = lease.file.try_clone().unwrap();
+
+        drop(lease);
+        let reacquired = store.try_acquire_run_lease(session.id()).unwrap();
+        drop(reacquired);
+        drop(inherited);
     }
 
     #[test]
