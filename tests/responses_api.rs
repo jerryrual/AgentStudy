@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{MockResponse, MockServer, RecordingSink};
 use icode::agent::{Agent, AgentKind, AgentOptions};
-use icode::config::{ApiStyle, ModelProfile};
+use icode::config::{ApiStyle, ModelProfile, ResponsesFileSearchConfig};
 use icode::interaction::{AllowAll, NoAsker};
 use icode::model::{AssistantMessage, Message, ModelClient, ToolCall, ToolDef};
 use icode::tools::ToolRegistry;
@@ -18,6 +18,7 @@ fn responses_profile(server: &MockServer, stream: bool) -> ModelProfile {
         provider: "openai".to_string(),
         api_style: ApiStyle::Responses,
         responses_web_search: false,
+        responses_file_search: None,
         responses_stored_continuation: false,
         responses_background: false,
         model: "gpt-test".to_string(),
@@ -456,6 +457,94 @@ async fn responses_preserves_hosted_web_search_without_local_execution() {
 }
 
 #[tokio::test]
+async fn responses_preserves_hosted_file_search_results_and_citations() {
+    let server = MockServer::new(|_, body| {
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "file_search",
+                "vector_store_ids": ["vs_docs"],
+                "max_num_results": 10
+            }])
+        );
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content", "file_search_call.results"])
+        );
+        assert!(body.get("tool_choice").is_none());
+        MockResponse::json(
+            200,
+            &json!({
+                "id": "resp_file_search",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "file_search_call",
+                        "id": "fs_1",
+                        "queries": ["Rust ownership"],
+                        "status": "completed",
+                        "results": [{
+                            "file_id": "file_1",
+                            "filename": "guide.md",
+                            "score": 0.91,
+                            "text": "Ownership has one owner."
+                        }]
+                    },
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Ownership has one owner.",
+                            "annotations": [{
+                                "type": "file_citation",
+                                "file_id": "file_1",
+                                "filename": "guide.md",
+                                "index": 0
+                            }]
+                        }]
+                    }
+                ],
+                "usage": {"input_tokens": 6, "output_tokens": 4, "total_tokens": 10}
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_file_search = Some(ResponsesFileSearchConfig {
+        vector_store_ids: vec!["vs_docs".into()],
+        max_num_results: Some(10),
+    });
+
+    let completion = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::user("What does the guide say about ownership?")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        completion.message.content.as_deref(),
+        Some("Ownership has one owner.")
+    );
+    assert!(completion.message.tool_calls.is_empty());
+    assert_eq!(completion.message.responses_items.len(), 2);
+    assert_eq!(
+        completion.message.responses_items[0]["type"],
+        "file_search_call"
+    );
+    assert_eq!(
+        completion.message.responses_items[1]["content"][0]["annotations"][0]["type"],
+        "file_citation"
+    );
+}
+
+#[tokio::test]
 async fn responses_rejects_unsupported_executable_output_items() {
     let server = MockServer::new(|_, _| {
         MockResponse::json(
@@ -812,6 +901,65 @@ async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
 }
 
 #[tokio::test]
+async fn responses_file_search_change_forces_full_stored_replay() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = Arc::clone(&calls);
+    let server = MockServer::new(move |_, _| {
+        let call = calls_for_server.fetch_add(1, Ordering::SeqCst) + 1;
+        MockResponse::json(
+            200,
+            &json!({
+                "id": format!("resp_{call}"),
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_{call}"),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type":"output_text","text":"answer","annotations":[]}]
+                }],
+                "usage": {"input_tokens":2,"output_tokens":1,"total_tokens":3}
+            })
+            .to_string(),
+        )
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    profile.responses_file_search = Some(ResponsesFileSearchConfig {
+        vector_store_ids: vec!["vs_a".into()],
+        max_num_results: None,
+    });
+    let sink = RecordingSink::default();
+    let mut messages = vec![Message::system("prompt"), Message::user("first")];
+    let first = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(&messages, &[], &sink)
+        .await
+        .unwrap();
+    messages.push(Message::assistant(first.message));
+    messages.push(Message::user("second"));
+
+    profile.responses_file_search = Some(ResponsesFileSearchConfig {
+        vector_store_ids: vec!["vs_b".into()],
+        max_num_results: None,
+    });
+    ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(&messages, &[], &sink)
+        .await
+        .unwrap();
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].get("previous_response_id").is_none());
+    assert_eq!(
+        requests[1]["input"].as_array().unwrap().len(),
+        messages.len()
+    );
+    assert_eq!(requests[1]["tools"][0]["vector_store_ids"], json!(["vs_b"]));
+}
+
+#[tokio::test]
 async fn responses_stored_stream_requires_and_captures_one_response_id() {
     let server = MockServer::new(|_, _| {
         MockResponse::sse(&[
@@ -854,6 +1002,10 @@ async fn responses_background_creates_once_then_polls_to_completion() {
                 assert_eq!(body["background"], true);
                 assert_eq!(body["store"], true);
                 assert_eq!(body["stream"], false);
+                assert_eq!(
+                    body["include"],
+                    json!(["reasoning.encrypted_content", "file_search_call.results"])
+                );
                 MockResponse::json(
                     200,
                     &json!({"id":"resp_bg","status":"queued","output":[]}).to_string(),
@@ -862,7 +1014,7 @@ async fn responses_background_creates_once_then_polls_to_completion() {
             1 => {
                 assert_eq!(
                     path,
-                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content&include=file_search_call.results"
                 );
                 assert!(body.is_null());
                 MockResponse::json(500, r#"{"error":{"message":"poll later"}}"#)
@@ -870,7 +1022,7 @@ async fn responses_background_creates_once_then_polls_to_completion() {
             2 => {
                 assert_eq!(
                     path,
-                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content&include=file_search_call.results"
                 );
                 assert!(body.is_null());
                 let mut response =
@@ -881,7 +1033,7 @@ async fn responses_background_creates_once_then_polls_to_completion() {
             3 => {
                 assert_eq!(
                     path,
-                    "/v1/responses/resp_bg?include=reasoning.encrypted_content"
+                    "/v1/responses/resp_bg?include=reasoning.encrypted_content&include=file_search_call.results"
                 );
                 assert!(body.is_null());
                 MockResponse::json(
@@ -907,6 +1059,10 @@ async fn responses_background_creates_once_then_polls_to_completion() {
     let mut profile = responses_profile(&server, false);
     profile.responses_stored_continuation = true;
     profile.responses_background = true;
+    profile.responses_file_search = Some(ResponsesFileSearchConfig {
+        vector_store_ids: vec!["vs_docs".into()],
+        max_num_results: None,
+    });
 
     let completion = ModelClient::from_profile(&profile)
         .unwrap()

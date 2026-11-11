@@ -13,8 +13,8 @@
   工作目录 / token / 会话），支持流式 Markdown 渲染、工具调用卡片与审批弹窗。
 - **模型接入**：兼容 OpenAI Chat Completions 或核心 Responses API 的服务，
   支持流式 SSE、推理摘要、token 用量统计、429/5xx 自动重试和本地函数工具；Responses
-  模式支持流式/非流式文本、显式 opt-in 的 provider-hosted `web_search`、默认关闭的 provider
-  存储续传，以及 OpenAI 非流式后台执行，但不支持后台流式恢复、远端取消、其他托管工具或图片。
+  模式支持流式/非流式文本、显式 opt-in 的 provider-hosted `web_search` / `file_search`、默认关闭的
+  provider 存储续传，以及 OpenAI 非流式后台执行，但不支持后台流式恢复、远端取消、其他托管工具或图片。
 - **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
   写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
@@ -88,7 +88,11 @@ export ICODE_HOME="$HOME/.icode"
 该限制不会调高配置的 `max_tokens`，Chat 与 Responses 对同一语义上下文使用相同估算。
 Responses profile 可设置 `"responses_web_search": true`，让 provider 在普通请求中运行托管
 `web_search`；该搜索不经过本地工具审批或网络策略，其 native call 会随会话持久化并在无状态请求中回放。
-Phase 4 Last Words side-call 始终不暴露该工具。还可显式设置
+也可配置 `"responses_file_search": {"vector_store_ids": ["vs_..."], "max_num_results": 20}`，让
+provider 搜索既有 vector store；`max_num_results` 可省略，若设置须为 1–50。文件搜索结果、原生
+`file_search_call` 与文件引用注解会进入本地会话并原样回放，但当前 TUI 仅显示回答文本，不单独渲染引用。
+这些托管调用都不经过本地工具审批/执行；切换配置会使存储续传建立新 scope。Phase 4 Last Words
+side-call 始终不暴露托管工具。还可显式设置
 `"responses_stored_continuation": true`：普通 Responses 结果会由 provider 远端存储，Rust 会把不透明
 response id 与 endpoint、model、认证身份、当前 system prompt 的 SHA-256 scope 及本地输入前缀摘要一起绑定到
 assistant 会话记录；scope 与前缀均未变化且没有本地裁剪/投影时，下一次请求只发送新增后缀并携带

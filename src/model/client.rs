@@ -40,6 +40,8 @@ pub struct ModelClient {
     api_style: ApiStyle,
     include_encrypted_reasoning: bool,
     responses_web_search: bool,
+    responses_file_search_vector_store_ids: Vec<String>,
+    responses_file_search_max_num_results: Option<u8>,
     responses_stored_continuation: bool,
     responses_background: bool,
     endpoint: String,
@@ -131,6 +133,15 @@ impl ModelClient {
             include_encrypted_reasoning: profile.api_style == ApiStyle::Responses
                 && profile.provider.eq_ignore_ascii_case("openai"),
             responses_web_search: profile.responses_web_search,
+            responses_file_search_vector_store_ids: profile
+                .responses_file_search
+                .as_ref()
+                .map(|config| config.vector_store_ids.clone())
+                .unwrap_or_default(),
+            responses_file_search_max_num_results: profile
+                .responses_file_search
+                .as_ref()
+                .and_then(|config| config.max_num_results),
             responses_stored_continuation: profile.responses_stored_continuation,
             responses_background: profile.responses_background,
             endpoint,
@@ -708,6 +719,15 @@ impl ModelClient {
             hasher.update(value.as_bytes());
             hasher.update([0]);
         }
+        hasher.update([u8::from(self.responses_web_search)]);
+        hasher.update((self.responses_file_search_vector_store_ids.len() as u64).to_be_bytes());
+        hasher.update([self
+            .responses_file_search_max_num_results
+            .unwrap_or_default()]);
+        for id in &self.responses_file_search_vector_store_ids {
+            hasher.update((id.len() as u64).to_be_bytes());
+            hasher.update(id.as_bytes());
+        }
         hasher
             .finalize()
             .iter()
@@ -846,6 +866,10 @@ impl ModelClient {
                 super::responses::RequestFeatures {
                     include_encrypted_reasoning: self.include_encrypted_reasoning,
                     web_search: self.responses_web_search,
+                    file_search_vector_store_ids: self
+                        .responses_file_search_vector_store_ids
+                        .clone(),
+                    file_search_max_num_results: self.responses_file_search_max_num_results,
                     store: self.responses_stored_continuation,
                     background: self.responses_background,
                     previous_response_id,
@@ -920,6 +944,19 @@ impl ModelClient {
         if allow_hosted_tools && self.api_style == ApiStyle::Responses && self.responses_web_search
         {
             semantic_tools.push(json!({"type": "web_search"}));
+        }
+        if allow_hosted_tools
+            && self.api_style == ApiStyle::Responses
+            && !self.responses_file_search_vector_store_ids.is_empty()
+        {
+            let mut declaration = json!({
+                "type": "file_search",
+                "vector_store_ids": self.responses_file_search_vector_store_ids,
+            });
+            if let Some(maximum) = self.responses_file_search_max_num_results {
+                declaration["max_num_results"] = json!(maximum);
+            }
+            semantic_tools.push(declaration);
         }
         crate::context_budget::estimate_json_tokens(&json!({
             "messages": semantic_messages,
@@ -1209,6 +1246,11 @@ impl ModelClient {
             poll_url
                 .query_pairs_mut()
                 .append_pair("include", "reasoning.encrypted_content");
+        }
+        if !self.responses_file_search_vector_store_ids.is_empty() {
+            poll_url
+                .query_pairs_mut()
+                .append_pair("include", "file_search_call.results");
         }
         loop {
             let elapsed = started.elapsed();

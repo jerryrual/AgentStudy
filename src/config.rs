@@ -81,6 +81,15 @@ impl ApiStyle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesFileSearchConfig {
+    /// Provider vector stores searched by the hosted tool.
+    pub vector_store_ids: Vec<String>,
+    /// Maximum result chunks returned to the model (provider range: 1..=50).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_num_results: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     /// Display name used by `--model`, `/model` and the status bar.
     pub name: String,
@@ -93,6 +102,9 @@ pub struct ModelProfile {
     /// Enable provider-hosted web search for ordinary Responses requests.
     #[serde(default, skip_serializing_if = "is_false")]
     pub responses_web_search: bool,
+    /// Provider-hosted file search for ordinary Responses requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_file_search: Option<ResponsesFileSearchConfig>,
     /// Store ordinary Responses and continue them by provider response id.
     #[serde(default, skip_serializing_if = "is_false")]
     pub responses_stored_continuation: bool,
@@ -152,6 +164,7 @@ impl ModelProfile {
             provider: "deepseek".to_string(),
             api_style: ApiStyle::Chat,
             responses_web_search: false,
+            responses_file_search: None,
             responses_stored_continuation: false,
             responses_background: false,
             model: "deepseek-chat".to_string(),
@@ -349,6 +362,45 @@ impl Settings {
                     "model profile {:?} enables Responses web search with a non-Responses API style",
                     profile.name
                 );
+            }
+            if let Some(file_search) = &profile.responses_file_search {
+                if profile.api_style != ApiStyle::Responses {
+                    bail!(
+                        "model profile {:?} enables Responses file search with a non-Responses API style",
+                        profile.name
+                    );
+                }
+                if file_search.vector_store_ids.is_empty() {
+                    bail!(
+                        "model profile {:?} enables Responses file search without vector stores",
+                        profile.name
+                    );
+                }
+                let mut vector_stores = std::collections::HashSet::new();
+                for id in &file_search.vector_store_ids {
+                    if id.trim().is_empty() || id.trim() != id {
+                        bail!(
+                            "model profile {:?} has an empty or whitespace-padded Responses file search vector store id",
+                            profile.name
+                        );
+                    }
+                    if !vector_stores.insert(id) {
+                        bail!(
+                            "model profile {:?} has duplicate Responses file search vector store id {:?}",
+                            profile.name,
+                            id
+                        );
+                    }
+                }
+                if file_search
+                    .max_num_results
+                    .is_some_and(|maximum| !(1..=50).contains(&maximum))
+                {
+                    bail!(
+                        "model profile {:?} Responses file search max_num_results must be between 1 and 50",
+                        profile.name
+                    );
+                }
             }
             if profile.responses_stored_continuation && profile.api_style != ApiStyle::Responses {
                 bail!(
@@ -778,6 +830,56 @@ mod tests {
             serde_json::to_value(&settings).unwrap()["models"][0]["responses_stored_continuation"],
             true
         );
+    }
+
+    #[test]
+    fn responses_file_search_is_atomic_bounded_and_responses_only() {
+        let profile: ModelProfile = serde_json::from_str(
+            r#"{
+                "name": "legacy",
+                "model": "legacy-model"
+            }"#,
+        )
+        .unwrap();
+        assert!(profile.responses_file_search.is_none());
+        assert_eq!(
+            serde_json::to_value(profile)
+                .unwrap()
+                .get("responses_file_search"),
+            None
+        );
+
+        let mut settings = Settings::default();
+        settings.models[0].responses_file_search = Some(ResponsesFileSearchConfig {
+            vector_store_ids: vec!["vs_docs".into()],
+            max_num_results: Some(20),
+        });
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("Responses file search with a non-Responses API style"));
+        settings.models[0].api_style = ApiStyle::Responses;
+        settings.normalise().unwrap();
+
+        settings.models[0]
+            .responses_file_search
+            .as_mut()
+            .unwrap()
+            .max_num_results = Some(0);
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("max_num_results must be between 1 and 50"));
+        let file_search = settings.models[0].responses_file_search.as_mut().unwrap();
+        file_search.max_num_results = Some(50);
+        file_search.vector_store_ids.push("vs_docs".into());
+        assert!(settings
+            .normalise()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate Responses file search vector store id"));
     }
 
     #[test]
