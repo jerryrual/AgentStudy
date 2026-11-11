@@ -23,7 +23,7 @@
 | Phase 4 归档与检索 | 已实现上游目录/文件名约束、2 MiB 单记录与 64 MiB 单轮上限、256 MiB 会话配额与最旧记录淘汰、owner-only exclusive 写入、append-only `catalog.jsonl`/tombstone、可重建 `manifest.md`、严格 UTF-8 中段截断，以及 path/symlink/junction containment。当前轮次投影会把每个 assistant/tool 组完整未脱敏地序列化（并行调用共用一条记录，保留 assistant 文本、reasoning、provider-native items、完整参数和结果），Run/TUI 在同一 session append/FIFO 屏障内先归档再提交 `ContextProjection`；归档 I/O、限额或安全校验失败时拒绝投影并保留原始工具历史。成功归档的同轮记录会累积为 Last Words manifest（状态保留最新 500 行、请求渲染不超过 50 行/6000 字符，配额淘汰后标记 missing），进入紧随其后的 Chat/Responses 主请求及后续同轮 Last Words side-call；新用户轮次会清空该 manifest。每个逻辑轮次开始时还会冻结此前 live 记录数量，并在 `read_file` 可用时把经过安全校验的绝对 `catalog.jsonl` 路径注入该轮所有 Chat/Responses 请求；模型可用通用 `read_file` 读取该绝对 catalog，再按其中的 session-relative path 读取完整归档记录；同轮新增归档不会改变该指针 | `src/compaction_archive.rs`、`src/session.rs`、`src/model/client.rs`、`src/run.rs`、`src/tui/app.rs`、`tests/tools.rs` |
 | 项目记忆 | 主 agent 从当前工作目录加载 `AGENTS.md` 并注入系统上下文 | `src/memory.rs` |
 | 无界面运行 | `icode run`，JSON 输出 | `src/run.rs` |
-| 直接 Shell | 输入 `!命令` 直接执行 | `src/tui/app.rs` |
+| 直接 Shell | 输入 `!命令` 时暂停 TUI，以当前 cwd 启动继承 stdin/stdout/stderr 的 `bash -c`；Unix 上使用独立前台进程组，支持全屏程序与交互输入，Ctrl-C 只发送给子进程，停止作业会被收回并终止，随后恢复 icode 的前台终端和 TUI。工具卡只保留命令、耗时与退出码/信号/错误；该路径不进入模型、审批、会话 transcript 或 recovery，模型 `bash` 工具仍保持有界捕获和超时语义 | `src/tui/` |
 | 深度推理 | 展示 `reasoning_content` 摘要 | `src/tui/ui.rs` |
 | 模型协议 | Chat Completions；核心 Responses API（文本、推理摘要、本地函数工具、流式/非流式、profile 显式启用的 provider-hosted `web_search` / `file_search` / OpenAI `code_interpreter`、默认关闭的 provider 存储续传，以及 OpenAI 后台执行）；file search vector store IDs、可选 1–50 结果上限、ranking controls 与递归 metadata filters 由 profile 原子配置；code interpreter 固定使用无文件、禁用出站网络的自动容器；原生调用、结果和注解持久化回放，但 UI 暂不单独渲染引用或 interpreter 图片 URL；续传句柄按 endpoint/model/认证身份/system prompt/托管工具配置 scope 与本地输入前缀摘要持久化，裁剪、投影、前缀或 scope 变化时回退为完整请求并建立新锚点；后台 create 只发送一次，非流式按同一 id 轮询，流式按最后已应用事件 sequence 续接，并在已知 id 的本地提前退出时 best-effort 远端取消；尚不支持图片输入与其他可执行输出类型 | `src/model/` |
 | 重试 | 429/5xx/transport 指数退避重试；严格上下文溢出会强制运行 Phase 1–3，并在当前工具尾部可严格缩小时生成无工具、非流式 Last Words，原子持久化 Phase 4 后零延迟重试一次；主动 Phase 4 未提交投影而原始请求随后溢出时，可在同一 turn breaker 下再次尝试 Last Words，成功投影后的 provider 请求仍不递归恢复；全部恢复仍属于同一 agent round。`phase4_side_call_token_budget` 按逻辑用户轮累计每次实际 Phase 4 HTTP 尝试的估算输入 token：`-1` 不限、`0` 禁用、正数按上游的 charge-first 且严格小于上限准入；格式纠正和 429/5xx/transport 重试共享配额，新用户轮重置 | `src/config.rs`、`src/agent/events.rs`、`src/model/client.rs` |
@@ -43,7 +43,6 @@
 1. MCP 服务器与 Skills。
 2. Hooks 与子智能体；依赖统一的工具协议和上下文隔离。
 3. `web_fetch` 等联网工具；依赖独立搜索/抓取提供方。
-4. 真正的交互式 Shell 终端；当前 `!` 命令只回显输出，不接管全屏程序。
 
 ### 3. 可观测性 / 恢复
 
