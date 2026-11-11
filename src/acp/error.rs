@@ -27,6 +27,10 @@ pub(crate) enum InvalidSessionRequest {
     CloseLoading,
     DeleteLoading,
     ListCursor,
+    ConfigId,
+    ConfigValue,
+    ConfigLoading,
+    ConfigActive,
 }
 
 impl InvalidSessionRequest {
@@ -49,6 +53,10 @@ impl InvalidSessionRequest {
             Self::CloseLoading => "session cannot be closed while it is loading",
             Self::DeleteLoading => "session cannot be deleted while it is loading",
             Self::ListCursor => "session list cursor is not supported",
+            Self::ConfigId => "unknown session configuration option",
+            Self::ConfigValue => "invalid session configuration value",
+            Self::ConfigLoading => "session configuration cannot change while loading",
+            Self::ConfigActive => "session configuration cannot change during an active prompt",
         }
     }
 }
@@ -184,6 +192,22 @@ mod tests {
             (
                 InvalidSessionRequest::ListCursor,
                 "session list cursor is not supported",
+            ),
+            (
+                InvalidSessionRequest::ConfigId,
+                "unknown session configuration option",
+            ),
+            (
+                InvalidSessionRequest::ConfigValue,
+                "invalid session configuration value",
+            ),
+            (
+                InvalidSessionRequest::ConfigLoading,
+                "session configuration cannot change while loading",
+            ),
+            (
+                InvalidSessionRequest::ConfigActive,
+                "session configuration cannot change during an active prompt",
             ),
         ];
 

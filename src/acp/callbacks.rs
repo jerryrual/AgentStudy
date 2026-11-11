@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agent_client_protocol::v1::schema::{
     CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
-    ResumeSessionRequest, StopReason,
+    ResumeSessionRequest, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, Error as ProtocolError};
 
@@ -89,6 +89,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let prompt_notices = notices;
     let load_control = Arc::clone(&control);
     let resume_control = Arc::clone(&control);
+    let config_control = Arc::clone(&control);
     let close_control = Arc::clone(&control);
     let delete_control = Arc::clone(&control);
     let prompt_control = Arc::clone(&control);
@@ -164,6 +165,20 @@ pub(crate) fn callback_bundle_with_setup_hook(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
+            async move |request: SetSessionConfigOptionRequest, responder, connection| {
+                let control = Arc::clone(&config_control);
+                connection.spawn(async move {
+                    responder.respond_with_result(
+                        control
+                            .set_config_option(&request)
+                            .await
+                            .map_err(ProtocolError::from),
+                    )
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async move |request: CloseSessionRequest, responder, connection| {
                 let control = Arc::clone(&close_control);
                 connection.spawn(async move {
@@ -205,6 +220,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let session = guard.session().clone();
                 let tools = guard.tools();
                 let additional_directories = guard.additional_directories();
+                let agent_kind = guard.agent_kind();
                 let ownership = guard.ownership();
                 let setup_ownership = Arc::clone(&ownership);
                 let cwd = PathBuf::from(session.cwd());
@@ -228,7 +244,8 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         if let Some(hook) = setup_hook {
                             hook();
                         }
-                        let agent = runtime.agent_for_with_directories(
+                        let agent = runtime.agent_for_kind_with_directories(
+                            agent_kind,
                             &cwd,
                             additional_directories,
                             tools,
@@ -329,6 +346,7 @@ mod tests {
         ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
         SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
         SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
+        SetSessionConfigOptionResponse,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -511,11 +529,24 @@ mod tests {
                         ))
                         .block_task()
                         .await?;
-                    assert_eq!(resumed, ResumeSessionResponse::new());
+                    assert_eq!(resumed.config_options.as_ref().map(Vec::len), Some(1));
                     assert!(notifications
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .is_empty());
+                    let configured: SetSessionConfigOptionResponse = connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            resume_id.clone(),
+                            "mode",
+                            "qa",
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(
+                        serde_json::to_value(&configured).unwrap()["configOptions"][0]
+                            ["currentValue"],
+                        "qa"
+                    );
                     let _: CloseSessionResponse = connection
                         .send_request(CloseSessionRequest::new(resume_id))
                         .block_task()
