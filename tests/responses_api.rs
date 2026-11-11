@@ -7,8 +7,11 @@ use std::time::Duration;
 use common::{MockResponse, MockServer, RecordingSink};
 use icode::agent::{Agent, AgentKind, AgentOptions};
 use icode::config::{
-    ApiStyle, ModelProfile, ResponsesFileSearchConfig, ResponsesFileSearchHybridSearch,
-    ResponsesFileSearchRanker, ResponsesFileSearchRankingOptions,
+    ApiStyle, ModelProfile, ResponsesFileSearchComparisonFilter,
+    ResponsesFileSearchComparisonOperator, ResponsesFileSearchCompoundFilter,
+    ResponsesFileSearchCompoundOperator, ResponsesFileSearchConfig, ResponsesFileSearchFilter,
+    ResponsesFileSearchFilterScalar, ResponsesFileSearchFilterValue,
+    ResponsesFileSearchHybridSearch, ResponsesFileSearchRanker, ResponsesFileSearchRankingOptions,
 };
 use icode::interaction::{AllowAll, NoAsker};
 use icode::model::{AssistantMessage, Message, ModelClient, ToolCall, ToolDef};
@@ -467,6 +470,19 @@ async fn responses_preserves_hosted_file_search_results_and_citations() {
             json!([{
                 "type": "file_search",
                 "vector_store_ids": ["vs_docs"],
+                "filters": {
+                    "type": "and",
+                    "filters": [
+                        {"type": "eq", "key": "department", "value": "engineering"},
+                        {
+                            "type": "or",
+                            "filters": [
+                                {"type": "gte", "key": "year", "value": 2025.0},
+                                {"type": "in", "key": "category", "value": ["guide", 7.0]}
+                            ]
+                        }
+                    ]
+                },
                 "max_num_results": 10,
                 "ranking_options": {
                     "hybrid_search": {
@@ -526,6 +542,40 @@ async fn responses_preserves_hosted_file_search_results_and_citations() {
     let mut profile = responses_profile(&server, false);
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_docs".into()],
+        filters: Some(ResponsesFileSearchFilter::Compound(
+            ResponsesFileSearchCompoundFilter {
+                operator: ResponsesFileSearchCompoundOperator::And,
+                filters: vec![
+                    ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                        key: "department".into(),
+                        operator: ResponsesFileSearchComparisonOperator::Eq,
+                        value: ResponsesFileSearchFilterValue::String("engineering".into()),
+                    }),
+                    ResponsesFileSearchFilter::Compound(ResponsesFileSearchCompoundFilter {
+                        operator: ResponsesFileSearchCompoundOperator::Or,
+                        filters: vec![
+                            ResponsesFileSearchFilter::Comparison(
+                                ResponsesFileSearchComparisonFilter {
+                                    key: "year".into(),
+                                    operator: ResponsesFileSearchComparisonOperator::Gte,
+                                    value: ResponsesFileSearchFilterValue::Number(2025.0),
+                                },
+                            ),
+                            ResponsesFileSearchFilter::Comparison(
+                                ResponsesFileSearchComparisonFilter {
+                                    key: "category".into(),
+                                    operator: ResponsesFileSearchComparisonOperator::In,
+                                    value: ResponsesFileSearchFilterValue::List(vec![
+                                        ResponsesFileSearchFilterScalar::String("guide".into()),
+                                        ResponsesFileSearchFilterScalar::Number(7.0),
+                                    ]),
+                                },
+                            ),
+                        ],
+                    }),
+                ],
+            },
+        )),
         max_num_results: Some(10),
         ranking_options: Some(ResponsesFileSearchRankingOptions {
             hybrid_search: Some(ResponsesFileSearchHybridSearch {
@@ -920,7 +970,7 @@ async fn responses_stored_continuation_reuses_only_a_scope_matching_tail() {
 }
 
 #[tokio::test]
-async fn responses_file_search_ranking_change_forces_full_stored_replay() {
+async fn responses_file_search_configuration_changes_force_full_stored_replay() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_server = Arc::clone(&calls);
     let server = MockServer::new(move |_, _| {
@@ -946,6 +996,7 @@ async fn responses_file_search_ranking_change_forces_full_stored_replay() {
     profile.responses_stored_continuation = true;
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_a".into()],
+        filters: None,
         max_num_results: None,
         ranking_options: None,
     });
@@ -961,6 +1012,7 @@ async fn responses_file_search_ranking_change_forces_full_stored_replay() {
 
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_a".into()],
+        filters: None,
         max_num_results: None,
         ranking_options: Some(ResponsesFileSearchRankingOptions {
             hybrid_search: None,
@@ -968,6 +1020,21 @@ async fn responses_file_search_ranking_change_forces_full_stored_replay() {
             score_threshold: Some(0.4),
         }),
     });
+    let second_input_len = messages.len();
+    let second = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(&messages, &[], &sink)
+        .await
+        .unwrap();
+    messages.push(Message::assistant(second.message));
+    messages.push(Message::user("third"));
+    profile.responses_file_search.as_mut().unwrap().filters = Some(
+        ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+            key: "department".into(),
+            operator: ResponsesFileSearchComparisonOperator::Eq,
+            value: ResponsesFileSearchFilterValue::String("engineering".into()),
+        }),
+    );
     ModelClient::from_profile(&profile)
         .unwrap()
         .complete(&messages, &[], &sink)
@@ -975,16 +1042,25 @@ async fn responses_file_search_ranking_change_forces_full_stored_replay() {
         .unwrap();
 
     let requests = server.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert!(requests[1].get("previous_response_id").is_none());
     assert_eq!(
         requests[1]["input"].as_array().unwrap().len(),
-        messages.len()
+        second_input_len
     );
     assert_eq!(requests[1]["tools"][0]["vector_store_ids"], json!(["vs_a"]));
     assert_eq!(
         requests[1]["tools"][0]["ranking_options"],
         json!({"ranker":"auto","score_threshold":0.4})
+    );
+    assert!(requests[2].get("previous_response_id").is_none());
+    assert_eq!(
+        requests[2]["input"].as_array().unwrap().len(),
+        messages.len()
+    );
+    assert_eq!(
+        requests[2]["tools"][0]["filters"],
+        json!({"type":"eq","key":"department","value":"engineering"})
     );
 }
 
@@ -1090,6 +1166,7 @@ async fn responses_background_creates_once_then_polls_to_completion() {
     profile.responses_background = true;
     profile.responses_file_search = Some(ResponsesFileSearchConfig {
         vector_store_ids: vec!["vs_docs".into()],
+        filters: None,
         max_num_results: None,
         ranking_options: None,
     });

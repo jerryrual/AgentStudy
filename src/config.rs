@@ -132,11 +132,137 @@ impl ResponsesFileSearchRankingOptions {
     }
 }
 
+/// Comparison operators accepted by provider file-search metadata filters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesFileSearchComparisonOperator {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    In,
+    Nin,
+}
+
+/// Boolean operators used to combine file-search metadata filters.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponsesFileSearchCompoundOperator {
+    And,
+    Or,
+}
+
+/// Scalar values allowed inside a metadata-filter list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesFileSearchFilterScalar {
+    String(String),
+    Number(f64),
+}
+
+/// Values accepted by a file-search metadata comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesFileSearchFilterValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    List(Vec<ResponsesFileSearchFilterScalar>),
+}
+
+/// One leaf comparison in a file-search metadata filter tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesFileSearchComparisonFilter {
+    /// Metadata attribute name.
+    pub key: String,
+    /// Comparison operation serialized as the provider's `type` field.
+    #[serde(rename = "type")]
+    pub operator: ResponsesFileSearchComparisonOperator,
+    /// Value compared against the metadata attribute.
+    pub value: ResponsesFileSearchFilterValue,
+}
+
+/// A recursive `and` or `or` group in a metadata filter tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponsesFileSearchCompoundFilter {
+    /// Child filters evaluated by this group.
+    pub filters: Vec<ResponsesFileSearchFilter>,
+    /// Boolean operation serialized as the provider's `type` field.
+    #[serde(rename = "type")]
+    pub operator: ResponsesFileSearchCompoundOperator,
+}
+
+/// A provider file-search metadata filter node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponsesFileSearchFilter {
+    Comparison(ResponsesFileSearchComparisonFilter),
+    Compound(ResponsesFileSearchCompoundFilter),
+}
+
+impl ResponsesFileSearchFilter {
+    const MAX_DEPTH: usize = 16;
+    const MAX_NODES: usize = 256;
+
+    /// Reject invalid numeric values and pathologically large recursive trees.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut nodes = 0;
+        self.validate_inner(0, &mut nodes)
+    }
+
+    fn validate_inner(&self, depth: usize, nodes: &mut usize) -> Result<()> {
+        if depth > Self::MAX_DEPTH {
+            bail!("Responses file search metadata filter exceeds maximum depth");
+        }
+        *nodes += 1;
+        if *nodes > Self::MAX_NODES {
+            bail!("Responses file search metadata filter has too many nodes");
+        }
+        match self {
+            Self::Comparison(filter) => {
+                if filter.key.trim().is_empty() {
+                    bail!("Responses file search metadata filter has an empty key");
+                }
+                match &filter.value {
+                    ResponsesFileSearchFilterValue::Number(number) if !number.is_finite() => {
+                        bail!("Responses file search metadata filter number must be finite");
+                    }
+                    ResponsesFileSearchFilterValue::List(values)
+                        if values.iter().any(|value| {
+                            matches!(
+                                value,
+                                ResponsesFileSearchFilterScalar::Number(number)
+                                    if !number.is_finite()
+                            )
+                        }) =>
+                    {
+                        bail!("Responses file search metadata filter number must be finite");
+                    }
+                    _ => {}
+                }
+            }
+            Self::Compound(filter) => {
+                for child in &filter.filters {
+                    child.validate_inner(depth + 1, nodes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Configuration for the provider-hosted Responses file-search tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesFileSearchConfig {
     /// Provider vector stores searched by the hosted tool.
     pub vector_store_ids: Vec<String>,
+    /// Optional metadata filter applied by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<ResponsesFileSearchFilter>,
     /// Maximum result chunks returned to the model (provider range: 1..=50).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_num_results: Option<u8>,
@@ -447,6 +573,14 @@ impl Settings {
                             id
                         );
                     }
+                }
+                if let Some(filter) = &file_search.filters {
+                    filter.validate().map_err(|error| {
+                        anyhow!(
+                            "model profile {:?} has invalid file search metadata filters: {error}",
+                            profile.name
+                        )
+                    })?;
                 }
                 if file_search
                     .max_num_results
@@ -916,6 +1050,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.models[0].responses_file_search = Some(ResponsesFileSearchConfig {
             vector_store_ids: vec!["vs_docs".into()],
+            filters: None,
             max_num_results: Some(20),
             ranking_options: None,
         });
@@ -994,6 +1129,69 @@ mod tests {
                 ["ranking_options"]["ranker"],
             "default-2024-11-15"
         );
+    }
+
+    #[test]
+    fn responses_file_search_metadata_filters_validate_and_serialize() {
+        let valid = ResponsesFileSearchFilter::Compound(ResponsesFileSearchCompoundFilter {
+            operator: ResponsesFileSearchCompoundOperator::And,
+            filters: vec![
+                ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                    key: "active".into(),
+                    operator: ResponsesFileSearchComparisonOperator::Eq,
+                    value: ResponsesFileSearchFilterValue::Boolean(true),
+                }),
+                ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                    key: "version".into(),
+                    operator: ResponsesFileSearchComparisonOperator::In,
+                    value: ResponsesFileSearchFilterValue::List(vec![
+                        ResponsesFileSearchFilterScalar::String("stable".into()),
+                        ResponsesFileSearchFilterScalar::Number(2.0),
+                    ]),
+                }),
+            ],
+        });
+        valid.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&valid).unwrap(),
+            serde_json::json!({
+                "type": "and",
+                "filters": [
+                    {"type":"eq","key":"active","value":true},
+                    {"type":"in","key":"version","value":["stable",2.0]}
+                ]
+            })
+        );
+
+        let invalid_number =
+            ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                key: "score".into(),
+                operator: ResponsesFileSearchComparisonOperator::Gt,
+                value: ResponsesFileSearchFilterValue::Number(f64::INFINITY),
+            });
+        assert!(invalid_number
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("number must be finite"));
+
+        let mut too_deep =
+            ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                key: "kind".into(),
+                operator: ResponsesFileSearchComparisonOperator::Ne,
+                value: ResponsesFileSearchFilterValue::String("draft".into()),
+            });
+        for _ in 0..=ResponsesFileSearchFilter::MAX_DEPTH {
+            too_deep = ResponsesFileSearchFilter::Compound(ResponsesFileSearchCompoundFilter {
+                operator: ResponsesFileSearchCompoundOperator::Or,
+                filters: vec![too_deep],
+            });
+        }
+        assert!(too_deep
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("maximum depth"));
     }
 
     #[test]

@@ -9,13 +9,14 @@ use super::{
     AssistantMessage, Completion, Message, ResponsesContinuation, ToolCall, ToolDef, Usage,
 };
 use crate::agent::EventSink;
-use crate::config::ResponsesFileSearchRankingOptions;
+use crate::config::{ResponsesFileSearchFilter, ResponsesFileSearchRankingOptions};
 
 #[derive(Clone, Default)]
 pub(super) struct RequestFeatures {
     pub include_encrypted_reasoning: bool,
     pub web_search: bool,
     pub file_search_vector_store_ids: Vec<String>,
+    pub file_search_filters: Option<ResponsesFileSearchFilter>,
     pub file_search_max_num_results: Option<u8>,
     pub file_search_ranking_options: Option<ResponsesFileSearchRankingOptions>,
     pub store: bool,
@@ -113,6 +114,9 @@ pub(super) fn request_body(
             "type": "file_search",
             "vector_store_ids": features.file_search_vector_store_ids,
         });
+        if let Some(filters) = features.file_search_filters {
+            declaration["filters"] = json!(filters);
+        }
         if let Some(maximum) = features.file_search_max_num_results {
             declaration["max_num_results"] = json!(maximum);
         }
