@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 use super::sse::SseParser;
 use super::types::{AssistantMessage, Completion, Message, ToolCall, ToolDef, Usage};
 use crate::agent::EventSink;
-use crate::config::{resolve_api_key, ApiStyle, ModelProfile};
+use crate::config::{
+    resolve_api_key, ApiStyle, ModelProfile, ResponsesFileSearchRanker,
+    ResponsesFileSearchRankingOptions,
+};
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_ERROR_BODY: usize = 600;
@@ -42,6 +45,7 @@ pub struct ModelClient {
     responses_web_search: bool,
     responses_file_search_vector_store_ids: Vec<String>,
     responses_file_search_max_num_results: Option<u8>,
+    responses_file_search_ranking_options: Option<ResponsesFileSearchRankingOptions>,
     responses_stored_continuation: bool,
     responses_background: bool,
     endpoint: String,
@@ -111,6 +115,13 @@ impl ModelClient {
                 "background Responses require an OpenAI Responses profile with stored continuation enabled and streaming disabled"
             );
         }
+        if let Some(ranking) = profile
+            .responses_file_search
+            .as_ref()
+            .and_then(|config| config.ranking_options.as_ref())
+        {
+            ranking.validate()?;
+        }
         let api_key = resolve_api_key(&profile.api_key)
             .with_context(|| format!("cannot use model profile {:?}", profile.name))?;
         let http = HttpClient::builder()
@@ -142,6 +153,10 @@ impl ModelClient {
                 .responses_file_search
                 .as_ref()
                 .and_then(|config| config.max_num_results),
+            responses_file_search_ranking_options: profile
+                .responses_file_search
+                .as_ref()
+                .and_then(|config| config.ranking_options.clone()),
             responses_stored_continuation: profile.responses_stored_continuation,
             responses_background: profile.responses_background,
             endpoint,
@@ -728,6 +743,31 @@ impl ModelClient {
             hasher.update((id.len() as u64).to_be_bytes());
             hasher.update(id.as_bytes());
         }
+        if let Some(ranking) = &self.responses_file_search_ranking_options {
+            hasher.update([1]);
+            hasher.update([match ranking.ranker {
+                None => 0,
+                Some(ResponsesFileSearchRanker::Auto) => 1,
+                Some(ResponsesFileSearchRanker::Default20241115) => 2,
+            }]);
+            match ranking.score_threshold {
+                Some(threshold) => {
+                    hasher.update([1]);
+                    hasher.update(threshold.to_bits().to_be_bytes());
+                }
+                None => hasher.update([0]),
+            }
+            match &ranking.hybrid_search {
+                Some(hybrid) => {
+                    hasher.update([1]);
+                    hasher.update(hybrid.embedding_weight.to_bits().to_be_bytes());
+                    hasher.update(hybrid.text_weight.to_bits().to_be_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        } else {
+            hasher.update([0]);
+        }
         hasher
             .finalize()
             .iter()
@@ -870,6 +910,7 @@ impl ModelClient {
                         .responses_file_search_vector_store_ids
                         .clone(),
                     file_search_max_num_results: self.responses_file_search_max_num_results,
+                    file_search_ranking_options: self.responses_file_search_ranking_options.clone(),
                     store: self.responses_stored_continuation,
                     background: self.responses_background,
                     previous_response_id,
@@ -955,6 +996,9 @@ impl ModelClient {
             });
             if let Some(maximum) = self.responses_file_search_max_num_results {
                 declaration["max_num_results"] = json!(maximum);
+            }
+            if let Some(ranking) = &self.responses_file_search_ranking_options {
+                declaration["ranking_options"] = json!(ranking);
             }
             semantic_tools.push(declaration);
         }
