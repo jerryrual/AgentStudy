@@ -102,7 +102,10 @@ pub(crate) fn replay_updates(records: &[Record]) -> Result<Vec<SessionUpdate>> {
             | Record::ContextProjection { .. } => {
                 flush_interrupted(&mut updates, &mut pending);
             }
-            Record::Meta { .. } | Record::Usage { .. } | Record::PhaseFourBreaker { .. } => {}
+            Record::Meta { .. }
+            | Record::AgentMode { .. }
+            | Record::Usage { .. }
+            | Record::PhaseFourBreaker { .. } => {}
         }
     }
     flush_interrupted(&mut updates, &mut pending);

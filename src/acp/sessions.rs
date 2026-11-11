@@ -13,7 +13,8 @@ use agent_client_protocol::v1::schema::{SessionId, SessionUpdate};
 use anyhow::{ensure, Result};
 use tokio::sync::watch;
 
-use crate::session::{RunLeaseError, Session, SessionRunLease, SessionStore};
+use crate::agent::AgentKind;
+use crate::session::{Record, RunLeaseError, Session, SessionRunLease, SessionStore};
 use crate::tools::ToolRegistry;
 
 use super::approval::{new_policy, ApprovalPolicy};
@@ -44,6 +45,15 @@ impl std::error::Error for BeginPromptError {}
 pub(crate) enum CloseError {
     SessionNotFound,
     Loading,
+}
+
+/// A classified failure while changing one registered ACP session mode.
+#[derive(Debug)]
+pub(crate) enum SetModeError {
+    SessionNotFound,
+    Loading,
+    ActivePrompt,
+    Persist(anyhow::Error),
 }
 
 /// A classified failure while preparing or activating an ACP session load.
@@ -89,9 +99,11 @@ struct RegisteredSession {
     session: Session,
     _run_lease: SessionRunLease,
     ready: AtomicBool,
+    closed: AtomicBool,
     approval_policy: ApprovalPolicy,
     tools: Arc<ToolRegistry>,
     additional_directories: Vec<PathBuf>,
+    agent_kind: Mutex<AgentKind>,
     active_prompt: Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -111,6 +123,7 @@ pub(crate) struct PreparedRestore {
     run_lease: SessionRunLease,
     tools: Arc<ToolRegistry>,
     additional_directories: Vec<PathBuf>,
+    agent_kind: AgentKind,
 }
 
 /// A validated load whose replay is complete but whose session is not exposed.
@@ -131,6 +144,7 @@ pub(crate) struct PendingLoad {
 pub(crate) struct PromptGuard {
     registered: Arc<RegisteredSession>,
     cancellation: watch::Receiver<bool>,
+    agent_kind: AgentKind,
 }
 
 /// Keeps a registered session and its run lease alive without owning its prompt slot.
@@ -193,8 +207,15 @@ impl SessionRegistry {
             .run_lease
             .take()
             .expect("prepared session run lease missing");
-        let (session_id, _) =
-            self.register(session, run_lease, true, tools, additional_directories)?;
+        let agent_kind = AgentKind::parse(session.agent()).unwrap_or_default();
+        let (session_id, _) = self.register(
+            session,
+            run_lease,
+            true,
+            tools,
+            additional_directories,
+            agent_kind,
+        )?;
         prepared.committed = true;
         Ok(session_id)
     }
@@ -298,6 +319,7 @@ impl SessionRegistry {
         if loaded.meta.cwd != expected_cwd {
             return Err(LoadError::CwdMismatch);
         }
+        let agent_kind = AgentKind::parse(loaded.effective_agent()).unwrap_or_default();
         let updates = project_replay
             .then(|| replay_updates(&loaded.records).map_err(LoadError::Internal))
             .transpose()?;
@@ -311,6 +333,7 @@ impl SessionRegistry {
                 run_lease,
                 tools: Arc::new(ToolRegistry::builtin()),
                 additional_directories: Vec::new(),
+                agent_kind,
             },
             updates,
         ))
@@ -323,6 +346,7 @@ impl SessionRegistry {
         ready: bool,
         tools: Arc<ToolRegistry>,
         additional_directories: Vec<PathBuf>,
+        agent_kind: AgentKind,
     ) -> Result<(SessionId, Arc<RegisteredSession>)> {
         let session_id = SessionId::new(session.id());
         let mut sessions = lock(&self.sessions);
@@ -334,9 +358,11 @@ impl SessionRegistry {
             session,
             _run_lease: run_lease,
             ready: AtomicBool::new(ready),
+            closed: AtomicBool::new(false),
             approval_policy: new_policy(),
             tools,
             additional_directories,
+            agent_kind: Mutex::new(agent_kind),
             active_prompt: Mutex::new(None),
         });
         sessions.insert(session_id.clone(), Arc::clone(&registered));
@@ -348,8 +374,7 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<PromptGuard, BeginPromptError> {
-        let sessions = lock(&self.sessions);
-        let registered = sessions
+        let registered = lock(&self.sessions)
             .get(session_id)
             .cloned()
             .ok_or(BeginPromptError::SessionNotFound)?;
@@ -357,18 +382,56 @@ impl SessionRegistry {
             return Err(BeginPromptError::Loading);
         }
         let (cancel, cancellation) = watch::channel(false);
-        {
+        let agent_kind = {
             let mut active_prompt = lock(&registered.active_prompt);
+            if registered.closed.load(Ordering::Acquire) {
+                return Err(BeginPromptError::SessionNotFound);
+            }
             if active_prompt.is_some() {
                 return Err(BeginPromptError::ActivePrompt);
             }
             *active_prompt = Some(cancel);
-        }
-        drop(sessions);
+            *lock(&registered.agent_kind)
+        };
         Ok(PromptGuard {
             registered,
             cancellation,
+            agent_kind,
         })
+    }
+
+    /// Persist and apply the agent kind used by the next admitted prompt.
+    pub(crate) fn set_agent_kind(
+        &self,
+        session_id: &SessionId,
+        agent_kind: AgentKind,
+    ) -> std::result::Result<(), SetModeError> {
+        let registered = lock(&self.sessions)
+            .get(session_id)
+            .cloned()
+            .ok_or(SetModeError::SessionNotFound)?;
+        if !registered.ready.load(Ordering::Acquire) {
+            return Err(SetModeError::Loading);
+        }
+        let active_prompt = lock(&registered.active_prompt);
+        if registered.closed.load(Ordering::Acquire) {
+            return Err(SetModeError::SessionNotFound);
+        }
+        if active_prompt.is_some() {
+            return Err(SetModeError::ActivePrompt);
+        }
+        let mut current = lock(&registered.agent_kind);
+        if *current == agent_kind {
+            return Ok(());
+        }
+        registered
+            .session
+            .append(&Record::AgentMode {
+                agent: agent_kind.as_str().to_string(),
+            })
+            .map_err(SetModeError::Persist)?;
+        *current = agent_kind;
+        Ok(())
     }
 
     /// Stop admitting prompts, cancel active work, and release the registered session.
@@ -376,7 +439,7 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
     ) -> std::result::Result<(), CloseError> {
-        let (registered, cancellation) = {
+        let registered = {
             let mut sessions = lock(&self.sessions);
             let registered = sessions
                 .get(session_id)
@@ -384,14 +447,18 @@ impl SessionRegistry {
             if !registered.ready.load(Ordering::Acquire) {
                 return Err(CloseError::Loading);
             }
-            let registered = sessions
+            registered.closed.store(true, Ordering::Release);
+            sessions
                 .remove(session_id)
-                .expect("registered session disappeared while locked");
-            let cancellation = lock(&registered.active_prompt).clone();
+                .expect("registered session disappeared while locked")
+        };
+        let cancellation = {
+            let active_prompt = lock(&registered.active_prompt);
+            let cancellation = active_prompt.clone();
             if let Some(cancel) = cancellation.as_ref() {
                 cancel.send_replace(true);
             }
-            (registered, cancellation)
+            cancellation
         };
         if let Some(cancel) = cancellation {
             cancel.closed().await;
@@ -453,6 +520,11 @@ impl PreparedRestore {
         self.additional_directories = directories;
     }
 
+    /// Return the effective agent kind restored from durable session state.
+    pub(crate) fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+
     /// Register this restore as pending while its protocol response is admitted.
     pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
         let PreparedRestore {
@@ -461,12 +533,20 @@ impl PreparedRestore {
             run_lease,
             tools,
             additional_directories,
+            agent_kind,
         } = self;
         let registry = registry.upgrade().ok_or_else(|| {
             LoadError::Internal(anyhow::anyhow!("ACP session registry was released"))
         })?;
         let (session_id, registered) = registry
-            .register(session, run_lease, false, tools, additional_directories)
+            .register(
+                session,
+                run_lease,
+                false,
+                tools,
+                additional_directories,
+                agent_kind,
+            )
             .map_err(|_| LoadError::AlreadyRegistered)?;
         Ok(PendingLoad {
             registry,
@@ -481,6 +561,11 @@ impl PreparedLoad {
     /// Return the stable ACP session ID that will be registered on activation.
     pub(crate) fn session_id(&self) -> SessionId {
         self.restored.session_id()
+    }
+
+    /// Return the effective agent kind restored from durable session state.
+    pub(crate) fn agent_kind(&self) -> AgentKind {
+        self.restored.agent_kind()
     }
 
     /// Return the fully validated replay projection without exposing the session.
@@ -560,6 +645,11 @@ impl PromptGuard {
         self.registered.additional_directories.clone()
     }
 
+    /// Return the agent kind captured when this prompt was admitted.
+    pub(crate) fn agent_kind(&self) -> AgentKind {
+        self.agent_kind
+    }
+
     /// Wait until the matching session receives a cancellation request.
     pub(crate) async fn cancelled(&mut self) {
         let _ = self.cancellation.wait_for(|cancelled| *cancelled).await;
@@ -581,7 +671,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
     use tokio::sync::oneshot;
@@ -744,6 +834,44 @@ mod tests {
             registry.close(&session_id).await,
             Err(CloseError::SessionNotFound)
         );
+    }
+
+    #[test]
+    fn waiting_mode_change_does_not_hold_the_registry_lock() {
+        let (_directory, _store, registry) = registry();
+        let registry = Arc::new(registry);
+        let session_id = registry
+            .create(
+                "/workspace",
+                "model-a",
+                "code",
+                Arc::new(ToolRegistry::builtin()),
+            )
+            .unwrap();
+        let registered = lock(&registry.sessions).get(&session_id).cloned().unwrap();
+        let active_prompt = lock(&registered.active_prompt);
+        let baseline = Arc::strong_count(&registered);
+        let task_registry = Arc::clone(&registry);
+        let task_id = session_id.clone();
+        let update =
+            std::thread::spawn(move || task_registry.set_agent_kind(&task_id, AgentKind::Qa));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Arc::strong_count(&registered) == baseline && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(Arc::strong_count(&registered) > baseline);
+        let mut registry_available = false;
+        while Instant::now() < deadline {
+            if registry.sessions.try_lock().is_ok() {
+                registry_available = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(registry_available);
+
+        drop(active_prompt);
+        update.join().unwrap().unwrap();
     }
 
     #[test]

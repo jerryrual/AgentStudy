@@ -38,6 +38,9 @@ pub enum Record {
     Meta {
         meta: SessionMeta,
     },
+    AgentMode {
+        agent: String,
+    },
     User {
         text: String,
     },
@@ -963,6 +966,10 @@ impl Session {
     pub(crate) fn cwd(&self) -> &str {
         &self.meta.cwd
     }
+    /// Return the initial agent kind persisted for this session.
+    pub(crate) fn agent(&self) -> &str {
+        &self.meta.agent
+    }
 }
 
 fn shape_recovery_messages(messages: &[Message]) -> Result<Vec<Message>> {
@@ -1150,6 +1157,18 @@ pub struct LoadedSession {
 }
 
 impl LoadedSession {
+    /// Return the latest append-only agent selection, falling back to session metadata.
+    pub(crate) fn effective_agent(&self) -> &str {
+        self.records
+            .iter()
+            .rev()
+            .find_map(|record| match record {
+                Record::AgentMode { agent } => Some(agent.as_str()),
+                _ => None,
+            })
+            .unwrap_or(&self.meta.agent)
+    }
+
     fn user_turn_count(&self) -> u64 {
         self.records
             .iter()
@@ -1291,7 +1310,10 @@ impl LoadedSession {
                         pending = candidate_pending;
                     }
                 }
-                Record::Meta { .. } | Record::Usage { .. } | Record::PhaseFourBreaker { .. } => {}
+                Record::Meta { .. }
+                | Record::AgentMode { .. }
+                | Record::Usage { .. }
+                | Record::PhaseFourBreaker { .. } => {}
             }
         }
         flush(&mut messages, &mut pending);

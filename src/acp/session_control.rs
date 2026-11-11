@@ -11,7 +11,7 @@ use super::error::{ControlError, ControlResult, InvalidSessionRequest};
 use super::mcp;
 use super::sessions::{
     BeginPromptError, CloseError, LoadError, PreparedLoad, PreparedRestore, PromptGuard,
-    SessionRegistry,
+    SessionRegistry, SetModeError,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
@@ -20,12 +20,37 @@ use agent_client_protocol::v1::schema::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
     NewSessionRequest, NewSessionResponse, ResumeSessionRequest, ResumeSessionResponse,
     SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
-    SessionNotification, SessionResumeCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectOption, SessionDeleteCapabilities, SessionId, SessionInfo,
+    SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
 };
 use agent_client_protocol::Error as ProtocolError;
 
+use crate::agent::AgentKind;
 use crate::session::RunLeaseError;
+
+const MODE_CONFIG_ID: &str = "mode";
+
+fn configured_agent_kind(agent: &str) -> AgentKind {
+    AgentKind::parse(agent).unwrap_or_default()
+}
+
+fn mode_config_options(agent_kind: AgentKind) -> Vec<SessionConfigOption> {
+    vec![SessionConfigOption::select(
+        MODE_CONFIG_ID,
+        "Agent mode",
+        agent_kind.as_str(),
+        vec![
+            SessionConfigSelectOption::new(
+                AgentKind::Code.as_str(),
+                AgentKind::Code.display_name(),
+            ),
+            SessionConfigSelectOption::new(AgentKind::Qa.as_str(), AgentKind::Qa.display_name()),
+        ],
+    )
+    .category(SessionConfigOptionCategory::Mode)]
+}
 
 /// Validated session creation and cancellation shared by future wire handlers.
 pub(crate) struct SessionControl {
@@ -121,7 +146,8 @@ impl SessionControl {
             .sessions
             .commit_create_with_directories(prepared, tools, additional_directories)
             .map_err(ControlError::internal)?;
-        Ok(NewSessionResponse::new(session_id))
+        Ok(NewSessionResponse::new(session_id)
+            .config_options(mode_config_options(configured_agent_kind(&self.agent))))
     }
 
     /// Validate and project a load while its session remains hidden from prompts.
@@ -244,6 +270,44 @@ impl SessionControl {
         Ok(prepared)
     }
 
+    /// Persist one supported session config option for subsequent prompts.
+    pub(crate) async fn set_config_option(
+        &self,
+        request: &SetSessionConfigOptionRequest,
+    ) -> ControlResult<SetSessionConfigOptionResponse> {
+        if request.config_id.0.as_ref() != MODE_CONFIG_ID {
+            return Err(ControlError::invalid(InvalidSessionRequest::ConfigId));
+        }
+        let SessionConfigOptionValue::ValueId { value } = &request.value else {
+            return Err(ControlError::invalid(InvalidSessionRequest::ConfigValue));
+        };
+        let agent_kind = match value.0.as_ref() {
+            "code" => AgentKind::Code,
+            "qa" => AgentKind::Qa,
+            _ => return Err(ControlError::invalid(InvalidSessionRequest::ConfigValue)),
+        };
+        let sessions = Arc::clone(&self.sessions);
+        let session_id = request.session_id.clone();
+        tokio::task::spawn_blocking(move || sessions.set_agent_kind(&session_id, agent_kind))
+            .await
+            .map_err(ControlError::internal)?
+            .map_err(|error| match error {
+                SetModeError::SessionNotFound => {
+                    ControlError::SessionNotFound(request.session_id.clone())
+                }
+                SetModeError::Loading => {
+                    ControlError::invalid(InvalidSessionRequest::ConfigLoading)
+                }
+                SetModeError::ActivePrompt => {
+                    ControlError::invalid(InvalidSessionRequest::ConfigActive)
+                }
+                SetModeError::Persist(error) => ControlError::internal(error),
+            })?;
+        Ok(SetSessionConfigOptionResponse::new(mode_config_options(
+            agent_kind,
+        )))
+    }
+
     /// Acquire the prompt slot or classify its client-visible admission failure.
     pub(crate) fn begin_prompt(
         &self,
@@ -348,6 +412,7 @@ impl LoadTransaction {
         respond: impl FnOnce(LoadSessionResponse) -> Result<(), ProtocolError>,
     ) -> ControlResult<()> {
         let session_id = self.prepared.session_id();
+        let agent_kind = self.prepared.agent_kind();
         let updates = self.prepared.updates().to_vec();
         let pending = self
             .prepared
@@ -357,7 +422,8 @@ impl LoadTransaction {
             notify(SessionNotification::new(session_id.clone(), update))
                 .map_err(ControlError::Protocol)?;
         }
-        respond(LoadSessionResponse::new()).map_err(ControlError::Protocol)?;
+        respond(LoadSessionResponse::new().config_options(mode_config_options(agent_kind)))
+            .map_err(ControlError::Protocol)?;
         pending.commit();
         Ok(())
     }
@@ -370,11 +436,13 @@ impl ResumeTransaction {
         respond: impl FnOnce(ResumeSessionResponse) -> Result<(), ProtocolError>,
     ) -> ControlResult<()> {
         let session_id = self.prepared.session_id();
+        let agent_kind = self.prepared.agent_kind();
         let pending = self
             .prepared
             .activate()
             .map_err(|error| map_load_error(error, &session_id))?;
-        respond(ResumeSessionResponse::new()).map_err(ControlError::Protocol)?;
+        respond(ResumeSessionResponse::new().config_options(mode_config_options(agent_kind)))
+            .map_err(ControlError::Protocol)?;
         pending.commit();
         Ok(())
     }
@@ -929,6 +997,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_mode_config_is_durable_and_applies_to_the_next_prompt() {
+        let (directory, _store, control) = control();
+        let created = control
+            .new_session(&NewSessionRequest::new(directory.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            created.config_options,
+            Some(mode_config_options(AgentKind::Code))
+        );
+
+        let select_qa =
+            SetSessionConfigOptionRequest::new(created.session_id.clone(), MODE_CONFIG_ID, "qa");
+        let response = control.set_config_option(&select_qa).await.unwrap();
+        assert_eq!(response.config_options, mode_config_options(AgentKind::Qa));
+
+        let guard = control.begin_prompt(&created.session_id).unwrap();
+        assert_eq!(guard.agent_kind(), AgentKind::Qa);
+        let active =
+            SetSessionConfigOptionRequest::new(created.session_id.clone(), MODE_CONFIG_ID, "code");
+        assert!(matches!(
+            control.set_config_option(&active).await,
+            Err(ControlError::Invalid(InvalidSessionRequest::ConfigActive))
+        ));
+        drop(guard);
+        control.sessions.close(&created.session_id).await.unwrap();
+
+        let transaction = control
+            .prepare_resume_with_mcp(&ResumeSessionRequest::new(
+                created.session_id.clone(),
+                directory.path(),
+            ))
+            .await
+            .unwrap();
+        transaction
+            .complete_with(|response| {
+                assert_eq!(
+                    response.config_options,
+                    Some(mode_config_options(AgentKind::Qa))
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            control
+                .begin_prompt(&created.session_id)
+                .unwrap()
+                .agent_kind(),
+            AgentKind::Qa
+        );
+
+        let unknown =
+            SetSessionConfigOptionRequest::new(created.session_id.clone(), "unknown", "qa");
+        assert!(matches!(
+            control.set_config_option(&unknown).await,
+            Err(ControlError::Invalid(InvalidSessionRequest::ConfigId))
+        ));
+        let invalid =
+            SetSessionConfigOptionRequest::new(created.session_id.clone(), MODE_CONFIG_ID, true);
+        assert!(matches!(
+            control.set_config_option(&invalid).await,
+            Err(ControlError::Invalid(InvalidSessionRequest::ConfigValue))
+        ));
+        let missing =
+            SetSessionConfigOptionRequest::new(SessionId::new("missing"), MODE_CONFIG_ID, "qa");
+        assert!(matches!(
+            control.set_config_option(&missing).await,
+            Err(ControlError::SessionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn resume_skips_replay_admits_response_before_ready_and_rolls_back_failure() {
         let (directory, store, control) = control();
         let duplicate = Record::Assistant {
@@ -955,7 +1095,11 @@ mod tests {
         let transaction = control.prepare_resume_with_mcp(&request).await.unwrap();
         transaction
             .complete_with(|response| {
-                assert_eq!(response, ResumeSessionResponse::new());
+                assert_eq!(
+                    response,
+                    ResumeSessionResponse::new()
+                        .config_options(mode_config_options(AgentKind::Code))
+                );
                 assert!(matches!(
                     control.begin_prompt(&session_id),
                     Err(ControlError::Invalid(InvalidSessionRequest::PromptLoading))
@@ -1084,7 +1228,14 @@ mod tests {
         assert_eq!(events[3]["update"]["rawInput"]["path"], "a");
         assert_eq!(events[4]["update"]["status"], "completed");
         assert_eq!(events[4]["update"]["rawOutput"], "contents");
-        assert_eq!(events[6], serde_json::json!({"response": {}}));
+        assert_eq!(
+            events[6],
+            serde_json::json!({
+                "response": {
+                    "configOptions": mode_config_options(AgentKind::Code)
+                }
+            })
+        );
         let guard = control.sessions.begin_prompt(&session_id).unwrap();
         assert_eq!(guard.additional_directories(), roots);
         assert!(store

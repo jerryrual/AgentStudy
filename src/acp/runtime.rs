@@ -57,13 +57,31 @@ impl PromptRuntime {
         tools: Arc<ToolRegistry>,
         approver: Arc<dyn Approver>,
     ) -> Agent {
+        self.agent_for_kind_with_directories(
+            self.agent_kind,
+            cwd,
+            additional_directories,
+            tools,
+            approver,
+        )
+    }
+
+    /// Construct a fresh agent using the active session's selected mode.
+    pub(crate) fn agent_for_kind_with_directories(
+        &self,
+        agent_kind: AgentKind,
+        cwd: &Path,
+        additional_directories: Vec<std::path::PathBuf>,
+        tools: Arc<ToolRegistry>,
+        approver: Arc<dyn Approver>,
+    ) -> Agent {
         Agent::new(
             Arc::clone(&self.client),
             tools,
             approver,
             Arc::new(NoAsker),
             AgentOptions {
-                kind: self.agent_kind,
+                kind: agent_kind,
                 cwd: cwd.to_path_buf(),
                 max_rounds: self.max_tool_rounds,
                 tool_timeout: self.tool_timeout,
@@ -120,8 +138,16 @@ mod tests {
             Arc::new(ToolRegistry::builtin()),
             Arc::new(DenyAll),
         );
+        let qa_agent = runtime.agent_for_kind_with_directories(
+            AgentKind::Qa,
+            second.path(),
+            Vec::new(),
+            Arc::new(ToolRegistry::builtin()),
+            Arc::new(DenyAll),
+        );
 
         assert_eq!(first_agent.kind(), AgentKind::Code);
+        assert_eq!(qa_agent.kind(), AgentKind::Qa);
         assert_eq!(first_agent.model(), "mock-model");
         assert!(first_agent.system_prompt().contains("first workspace rule"));
         assert!(!first_agent
