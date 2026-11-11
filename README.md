@@ -14,7 +14,7 @@
 - **模型接入**：兼容 OpenAI Chat Completions 或核心 Responses API 的服务，
   支持流式 SSE、推理摘要、token 用量统计、429/5xx 自动重试和本地函数工具；Responses
   模式支持流式/非流式文本、显式 opt-in 的 provider-hosted `web_search` / `file_search`、默认关闭的
-  provider 存储续传，以及 OpenAI 非流式后台执行和已知 ID 的远端取消，但不支持后台流式恢复、其他托管工具或图片。
+  provider 存储续传，以及 OpenAI 后台执行、流式断线续接和已知 ID 的远端取消，但不支持其他托管工具或图片。
 - **智能体循环**：系统提示词 + 多轮工具调用；只读检索批次并行执行并按调用顺序回填，
   写操作与交互工具保持顺序执行；内置 Code 与只读 Q&A 两种智能体。
 - **工具集**：`read_file`、`write_file`、`edit_file`、`list_dir`、`grep`、`glob`、
@@ -105,8 +105,9 @@ response id 与 endpoint、model、认证身份、当前 system prompt 的 SHA-2
 assistant 会话记录；scope 与前缀均未变化且没有本地裁剪/投影时，下一次请求只发送新增后缀并携带
 `previous_response_id`，否则完整回放并建立新锚点。该选项默认关闭；启用后数据受 provider 的远端保留策略约束，删除本地会话不会删除远端 response，
 过期或被 provider 拒绝的 response id 会显式报错。OpenAI profile 还可在上述存储续传已启用且
-`"stream": false` 时设置 `"responses_background": true`：每个普通请求只创建一次后台 response，随后每
-2 秒轮询同一 id，最多等待 10 分钟；轮询 GET 的临时错误可重试，但 create 的 transport/429/5xx 不会
+`"responses_background": true`：每个普通请求只创建一次后台 response；非流式请求随后每 2 秒轮询同一 id，
+流式请求断线后则按最后已应用事件的 `sequence_number` 通过 `starting_after` 恢复，二者最多等待 10 分钟。
+轮询/续接 GET 的临时错误可重试，但 create 的 transport/429/5xx 不会
 自动重发，以免重复执行或计费。取得 response id 后，10 分钟超时、轮询失败或本地取消会在 10 秒上限内
 best-effort POST 远端 cancel；create 请求超时或传输失败时远端结果仍不明确且没有可靠 id 可取消，任务可能继续运行并
 按其保留策略存储；Zero Data Retention 配置通常不兼容该模式。Last Words 始终 `store: false` 且不进入

@@ -1329,6 +1329,106 @@ async fn responses_background_creates_once_then_polls_to_completion() {
 }
 
 #[tokio::test]
+async fn responses_background_stream_resumes_after_known_sequence() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_server = Arc::clone(&calls);
+    let server = MockServer::new(move |path, body| {
+        let call = calls_for_server.fetch_add(1, Ordering::SeqCst);
+        match call {
+            0 => {
+                assert_eq!(path, "/v1/responses");
+                assert_eq!(body["background"], true);
+                assert_eq!(body["store"], true);
+                assert_eq!(body["stream"], true);
+                MockResponse {
+                    status: 200,
+                    content_type: "text/event-stream".into(),
+                    declared_length: None,
+                    body: concat!(
+                        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_stream_bg\",\"status\":\"queued\",\"output\":[]}}\n\n",
+                        "data: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_bg\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":2,\"output_index\":0,\"delta\":\"part \"}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\""
+                    )
+                    .into(),
+                }
+            }
+            1 => {
+                assert_eq!(
+                    path,
+                    "/v1/responses/resp_stream_bg?include=reasoning.encrypted_content&stream=true&starting_after=2"
+                );
+                assert!(body.is_null());
+                MockResponse::sse(&[
+                    r#"{"type":"response.output_text.delta","sequence_number":3,"output_index":0,"delta":"done"}"#,
+                    r#"{"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"type":"message","id":"msg_bg","role":"assistant","status":"completed","content":[{"type":"output_text","text":"part done","annotations":[]}]}}"#,
+                    r#"{"type":"response.completed","sequence_number":5,"response":{"id":"resp_stream_bg","status":"completed","output":[{"type":"message","id":"msg_bg","role":"assistant","status":"completed","content":[{"type":"output_text","text":"part done","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}"#,
+                ])
+            }
+            _ => panic!("unexpected background stream request {call}"),
+        }
+    });
+    let mut profile = responses_profile(&server, true);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+    let completion = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::system("prompt"), Message::user("long task")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(completion.message.content.as_deref(), Some("part done"));
+    assert_eq!(
+        completion
+            .message
+            .responses_continuation
+            .as_ref()
+            .map(|handle| handle.id.as_str()),
+        Some("resp_stream_bg")
+    );
+    assert_eq!(server.request_count(), 2);
+}
+
+#[tokio::test]
+async fn responses_background_stream_does_not_retry_before_response_id() {
+    let server = MockServer::new(|path, body| {
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["background"], true);
+        assert_eq!(body["stream"], true);
+        let mut response = MockResponse {
+            status: 200,
+            content_type: "text/event-stream".into(),
+            declared_length: None,
+            body: "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"output_index\":0,\"delta\":\"unknown\"}\n\n".into(),
+        };
+        response.declared_length = Some(response.body.len() + 10);
+        response
+    });
+    let mut profile = responses_profile(&server, true);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+
+    let error = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::user("long task")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("ambiguous remote outcome"),
+        "{error:#}"
+    );
+    assert_eq!(server.request_count(), 1);
+}
+
+#[tokio::test]
 async fn responses_background_local_cancellation_cancels_remote_work() {
     let paths = Arc::new(Mutex::new(Vec::new()));
     let paths_for_server = Arc::clone(&paths);
@@ -1337,10 +1437,19 @@ async fn responses_background_local_cancellation_cancels_remote_work() {
         match path {
             "/v1/responses" => {
                 assert_eq!(body["background"], true);
-                MockResponse::json(
-                    200,
-                    &json!({"id":"resp_cancel","status":"queued","output":[]}).to_string(),
-                )
+                assert_eq!(body["stream"], true);
+                let mut response = MockResponse {
+                    status: 200,
+                    content_type: "text/event-stream".into(),
+                    declared_length: None,
+                    body: concat!(
+                        "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_cancel\",\"status\":\"queued\",\"output\":[]}}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"output_index\":0,\"delta\":\"started\"}\n\n"
+                    )
+                    .into(),
+                };
+                response.declared_length = Some(response.body.len() + 10);
+                response
             }
             "/v1/responses/resp_cancel/cancel" => {
                 assert!(body.is_null());
@@ -1352,7 +1461,7 @@ async fn responses_background_local_cancellation_cancels_remote_work() {
             _ => panic!("unexpected background cancellation request {path}"),
         }
     });
-    let mut profile = responses_profile(&server, false);
+    let mut profile = responses_profile(&server, true);
     profile.responses_stored_continuation = true;
     profile.responses_background = true;
     let client = ModelClient::from_profile(&profile).unwrap();
@@ -1366,11 +1475,7 @@ async fn responses_background_local_cancellation_cancels_remote_work() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if sink
-                .events()
-                .iter()
-                .any(|event| event.contains("background response resp_cancel is pending"))
-            {
+            if sink.events().iter().any(|event| event == "text:started") {
                 break;
             }
             tokio::task::yield_now().await;
