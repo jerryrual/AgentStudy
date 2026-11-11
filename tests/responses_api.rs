@@ -1,7 +1,7 @@
 mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{MockResponse, MockServer, RecordingSink};
@@ -1326,6 +1326,140 @@ async fn responses_background_creates_once_then_polls_to_completion() {
         Some("resp_bg")
     );
     assert_eq!(server.request_count(), 4);
+}
+
+#[tokio::test]
+async fn responses_background_local_cancellation_cancels_remote_work() {
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let paths_for_server = Arc::clone(&paths);
+    let server = MockServer::new(move |path, body| {
+        paths_for_server.lock().unwrap().push(path.to_string());
+        match path {
+            "/v1/responses" => {
+                assert_eq!(body["background"], true);
+                MockResponse::json(
+                    200,
+                    &json!({"id":"resp_cancel","status":"queued","output":[]}).to_string(),
+                )
+            }
+            "/v1/responses/resp_cancel/cancel" => {
+                assert!(body.is_null());
+                MockResponse::json(
+                    200,
+                    &json!({"id":"resp_cancel","status":"cancelled","output":[]}).to_string(),
+                )
+            }
+            _ => panic!("unexpected background cancellation request {path}"),
+        }
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+    let client = ModelClient::from_profile(&profile).unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let sink_for_task = Arc::clone(&sink);
+    let task = tokio::spawn(async move {
+        client
+            .complete(&[Message::user("long task")], &[], sink_for_task.as_ref())
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if sink
+                .events()
+                .iter()
+                .any(|event| event.contains("background response resp_cancel is pending"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if paths
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path == "/v1/responses/resp_cancel/cancel")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        paths.lock().unwrap().as_slice(),
+        ["/v1/responses", "/v1/responses/resp_cancel/cancel"]
+    );
+}
+
+#[tokio::test]
+async fn responses_background_poll_failure_cancels_remote_work() {
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let paths_for_server = Arc::clone(&paths);
+    let server = MockServer::new(move |path, body| {
+        paths_for_server.lock().unwrap().push(path.to_string());
+        match path {
+            "/v1/responses" => {
+                assert_eq!(body["background"], true);
+                MockResponse::json(
+                    200,
+                    &json!({"id":"resp_poll_error","status":"queued","output":[]}).to_string(),
+                )
+            }
+            "/v1/responses/resp_poll_error?include=reasoning.encrypted_content" => {
+                assert!(body.is_null());
+                MockResponse::json(400, r#"{"error":{"message":"invalid response"}}"#)
+            }
+            "/v1/responses/resp_poll_error/cancel" => {
+                assert!(body.is_null());
+                MockResponse::json(
+                    200,
+                    &json!({"id":"resp_poll_error","status":"cancelled","output":[]}).to_string(),
+                )
+            }
+            _ => panic!("unexpected background poll failure request {path}"),
+        }
+    });
+    let mut profile = responses_profile(&server, false);
+    profile.responses_stored_continuation = true;
+    profile.responses_background = true;
+
+    let error = ModelClient::from_profile(&profile)
+        .unwrap()
+        .complete(
+            &[Message::user("long task")],
+            &[],
+            &RecordingSink::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("retrieval failed with HTTP 400"),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("remote cancellation was accepted"),
+        "{error:#}"
+    );
+    assert_eq!(
+        paths.lock().unwrap().as_slice(),
+        [
+            "/v1/responses",
+            "/v1/responses/resp_poll_error?include=reasoning.encrypted_content",
+            "/v1/responses/resp_poll_error/cancel"
+        ]
+    );
 }
 
 #[tokio::test]
