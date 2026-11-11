@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use agent_client_protocol::v1::schema::{
-    CancelNotification, CloseSessionRequest, InitializeRequest, LoadSessionRequest,
-    NewSessionRequest, PromptRequest, PromptResponse, StopReason,
+    CancelNotification, CloseSessionRequest, InitializeRequest, ListSessionsRequest,
+    LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, StopReason,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, Error as ProtocolError};
 
@@ -82,6 +82,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     prompt_setup_hook: Option<PromptSetupHook>,
 ) -> impl ConnectTo<Client> {
     let new_control = Arc::clone(&control);
+    let list_control = Arc::clone(&control);
     let notices = Arc::new(AtomicBool::new(false));
     let initialize_notices = Arc::clone(&notices);
     let prompt_notices = notices;
@@ -98,6 +99,20 @@ pub(crate) fn callback_bundle_with_setup_hook(
             async move |request: InitializeRequest, responder, _connection| {
                 initialize_notices.store(supports_notices(&request), Ordering::Release);
                 responder.respond(SessionControl::initialize(&request))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: ListSessionsRequest, responder, connection| {
+                let control = Arc::clone(&list_control);
+                connection.spawn(async move {
+                    responder.respond_with_result(
+                        control
+                            .list_sessions(&request)
+                            .await
+                            .map_err(ProtocolError::from),
+                    )
+                })
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -279,10 +294,11 @@ mod tests {
     use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::v1::schema::{
         AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest,
-        CloseSessionResponse, ContentBlock, InitializeResponse, LoadSessionResponse, McpServer,
-        McpServerStdio, NewSessionResponse, NoticeCapabilities, PromptRequest,
-        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-        SessionId, SessionNotification,
+        CloseSessionResponse, ContentBlock, InitializeResponse, ListSessionsRequest,
+        ListSessionsResponse, LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse,
+        NoticeCapabilities, PromptRequest, SessionAdditionalDirectoriesCapabilities,
+        SessionCapabilities, SessionCloseCapabilities, SessionId, SessionListCapabilities,
+        SessionNotification,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -418,7 +434,8 @@ mod tests {
                                     .additional_directories(
                                         SessionAdditionalDirectoriesCapabilities::new(),
                                     )
-                                    .close(SessionCloseCapabilities::new()),
+                                    .close(SessionCloseCapabilities::new())
+                                    .list(SessionListCapabilities::new()),
                             )
                     );
 
@@ -492,6 +509,20 @@ mod tests {
                         .block_task()
                         .await?;
                     assert!(store.load(&created_id.to_string()).is_ok());
+                    let listed: ListSessionsResponse = connection
+                        .send_request(ListSessionsRequest::new().cwd(directory.path()))
+                        .block_task()
+                        .await?;
+                    assert_eq!(listed.next_cursor, None);
+                    assert!(listed.sessions.iter().any(|session| {
+                        session.session_id == created_id && session.cwd == directory.path()
+                    }));
+                    let invalid_cursor = connection
+                        .send_request(ListSessionsRequest::new().cursor("unsolicited"))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert_eq!(invalid_cursor.code, ErrorCode::INVALID_PARAMS);
                     let closed_again = connection
                         .send_request(CloseSessionRequest::new(created_id))
                         .block_task()
