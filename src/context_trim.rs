@@ -262,7 +262,7 @@ pub(crate) fn automatic_turn_summary(turn: &[Message]) -> String {
     let user_messages: Vec<_> = turn
         .iter()
         .filter_map(|message| match message {
-            Message::User { content } if !content.is_empty() => Some(content.as_str()),
+            Message::User { content } if content.is_meaningful() => Some(content.display_text()),
             _ => None,
         })
         .collect();

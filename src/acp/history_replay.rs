@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 
-use agent_client_protocol::v1::schema::SessionUpdate;
+use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, ImageContent, SessionUpdate};
 use anyhow::{ensure, Result};
 
 use super::event_mapping::{text_chunk, tool_finished, tool_started};
-use crate::model::ToolCall;
+use crate::model::{ToolCall, UserContent, UserContentPart};
 use crate::session::Record;
 
 const INTERRUPTED_TOOL_OUTPUT: &str =
@@ -27,7 +27,11 @@ pub(crate) fn replay_updates(records: &[Record]) -> Result<Vec<SessionUpdate>> {
 
     for record in records {
         match record {
-            Record::User { text } | Record::InjectedUser { text, .. } => {
+            Record::User { text } => {
+                flush_interrupted(&mut updates, &mut pending);
+                push_user_content(&mut updates, text);
+            }
+            Record::InjectedUser { text, .. } => {
                 flush_interrupted(&mut updates, &mut pending);
                 updates.push(SessionUpdate::UserMessageChunk(text_chunk(text.clone())));
             }
@@ -112,6 +116,26 @@ pub(crate) fn replay_updates(records: &[Record]) -> Result<Vec<SessionUpdate>> {
     Ok(updates)
 }
 
+fn push_user_content(updates: &mut Vec<SessionUpdate>, content: &UserContent) {
+    match content {
+        UserContent::Text(text) => {
+            updates.push(SessionUpdate::UserMessageChunk(text_chunk(text.clone())));
+        }
+        UserContent::Parts(parts) => {
+            updates.extend(parts.iter().map(|part| {
+                let block = match part {
+                    UserContentPart::Text { text } => ContentBlock::from(text.clone()),
+                    UserContentPart::Image { image } => ContentBlock::Image(ImageContent::new(
+                        image.data.clone(),
+                        image.media_type.clone(),
+                    )),
+                };
+                SessionUpdate::UserMessageChunk(ContentChunk::new(block))
+            }));
+        }
+    }
+}
+
 fn flush_interrupted(updates: &mut Vec<SessionUpdate>, pending: &mut Vec<ToolCall>) {
     updates.extend(
         pending
@@ -144,7 +168,7 @@ mod tests {
     fn replays_messages_thoughts_and_tool_lifecycle_in_record_order() {
         let records = vec![
             Record::User {
-                text: "first".to_string(),
+                text: "first".into(),
             },
             Record::InjectedUser {
                 injection_id: "private-id".to_string(),
@@ -199,6 +223,34 @@ mod tests {
     }
 
     #[test]
+    fn replays_multimodal_user_parts_in_order() {
+        let updates = wire(&[Record::User {
+            text: UserContent::parts(vec![
+                UserContentPart::Text {
+                    text: "before".into(),
+                },
+                UserContentPart::Image {
+                    image: crate::model::ImageInput {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                        validated_key: None,
+                    },
+                },
+                UserContentPart::Text {
+                    text: "after".into(),
+                },
+            ]),
+        }]);
+
+        assert_eq!(updates.len(), 3);
+        assert_eq!(updates[0]["content"]["text"], "before");
+        assert_eq!(updates[1]["content"]["type"], "image");
+        assert_eq!(updates[1]["content"]["mimeType"], "image/png");
+        assert_eq!(updates[1]["content"]["data"], "iVBORw0KGgo=");
+        assert_eq!(updates[2]["content"]["text"], "after");
+    }
+
+    #[test]
     fn omits_orphans_and_fails_dangling_calls_in_declaration_order() {
         let records = vec![
             Record::Tool {
@@ -235,7 +287,7 @@ mod tests {
     fn manual_compaction_resets_before_emission_and_allows_reused_tool_ids() {
         let records = vec![
             Record::User {
-                text: "discarded".to_string(),
+                text: "discarded".into(),
             },
             Record::Assistant {
                 content: None,
@@ -323,7 +375,7 @@ mod tests {
     fn automatic_compaction_is_invisible_but_closes_interrupted_tools() {
         let records = vec![
             Record::User {
-                text: "question".to_string(),
+                text: "question".into(),
             },
             Record::Assistant {
                 content: None,

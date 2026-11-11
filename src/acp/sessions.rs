@@ -124,6 +124,7 @@ pub(crate) struct PreparedRestore {
     tools: Arc<ToolRegistry>,
     additional_directories: Vec<PathBuf>,
     agent_kind: AgentKind,
+    has_images: bool,
 }
 
 /// A validated load whose replay is complete but whose session is not exposed.
@@ -320,6 +321,7 @@ impl SessionRegistry {
             return Err(LoadError::CwdMismatch);
         }
         let agent_kind = AgentKind::parse(loaded.effective_agent()).unwrap_or_default();
+        let has_images = loaded.has_images();
         let updates = project_replay
             .then(|| replay_updates(&loaded.records).map_err(LoadError::Internal))
             .transpose()?;
@@ -334,6 +336,7 @@ impl SessionRegistry {
                 tools: Arc::new(ToolRegistry::builtin()),
                 additional_directories: Vec::new(),
                 agent_kind,
+                has_images,
             },
             updates,
         ))
@@ -525,6 +528,10 @@ impl PreparedRestore {
         self.agent_kind
     }
 
+    pub(crate) fn has_images(&self) -> bool {
+        self.has_images
+    }
+
     /// Register this restore as pending while its protocol response is admitted.
     pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
         let PreparedRestore {
@@ -534,6 +541,7 @@ impl PreparedRestore {
             tools,
             additional_directories,
             agent_kind,
+            has_images: _,
         } = self;
         let registry = registry.upgrade().ok_or_else(|| {
             LoadError::Internal(anyhow::anyhow!("ACP session registry was released"))
@@ -566,6 +574,10 @@ impl PreparedLoad {
     /// Return the effective agent kind restored from durable session state.
     pub(crate) fn agent_kind(&self) -> AgentKind {
         self.restored.agent_kind()
+    }
+
+    pub(crate) fn has_images(&self) -> bool {
+        self.restored.has_images()
     }
 
     /// Return the fully validated replay projection without exposing the session.

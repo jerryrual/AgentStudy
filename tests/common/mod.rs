@@ -187,6 +187,7 @@ pub fn mock_profile(base_url: String) -> icode::config::ModelProfile {
         responses_stored_continuation: false,
         responses_background: false,
         model: "mock-model".to_string(),
+        vision: false,
         base_url,
         api_key: "test-key".to_string(),
         max_tokens: None,

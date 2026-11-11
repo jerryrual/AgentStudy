@@ -5,5 +5,6 @@ pub mod types;
 
 pub use client::ModelClient;
 pub use types::{
-    AssistantMessage, Completion, Message, ResponsesContinuation, ToolCall, ToolDef, Usage,
+    AssistantMessage, Completion, ImageInput, Message, ResponsesContinuation, ToolCall, ToolDef,
+    Usage, UserContent, UserContentPart,
 };

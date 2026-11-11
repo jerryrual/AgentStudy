@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::schema::{
-    CancelNotification, CloseSessionRequest, DeleteSessionRequest, InitializeRequest,
+    CancelNotification, CloseSessionRequest, ContentBlock, DeleteSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse,
     ResumeSessionRequest, SetSessionConfigOptionRequest, StopReason,
 };
@@ -91,6 +91,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
     runtime: Arc<PromptRuntime>,
     prompt_setup_hook: Option<PromptSetupHook>,
 ) -> impl ConnectTo<Client> {
+    let initialize_control = Arc::clone(&control);
     let new_control = Arc::clone(&control);
     let list_control = Arc::clone(&control);
     let notices = Arc::new(AtomicBool::new(false));
@@ -133,7 +134,7 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(dispatcher);
                 }
-                responder.respond(SessionControl::initialize(&request))
+                responder.respond(initialize_control.initialize(&request))
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -233,6 +234,17 @@ pub(crate) fn callback_bundle_with_setup_hook(
         )
         .on_receive_request(
             async move |request: PromptRequest, responder, connection| {
+                if !prompt_control.image_prompts_enabled()
+                    && request
+                        .prompt
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Image(_)))
+                {
+                    return responder.respond_with_error(
+                        ProtocolError::invalid_params()
+                            .data("ACP image prompts are disabled for the active model profile"),
+                    );
+                }
                 let message = match prompt::user_message(&request.prompt) {
                     Ok(message) => message,
                     Err(error) => {
@@ -399,7 +411,7 @@ mod tests {
         CloseSessionResponse, ContentBlock, DeleteSessionRequest, DeleteSessionResponse,
         FileSystemCapabilities, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
         LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse, NoticeCapabilities,
-        PromptRequest, ResumeSessionRequest, ResumeSessionResponse,
+        PromptCapabilities, PromptRequest, ResumeSessionRequest, ResumeSessionResponse,
         SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
         SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
         SessionResumeCapabilities, SetSessionConfigOptionResponse,
@@ -502,6 +514,7 @@ mod tests {
             Arc::clone(&sessions),
             "model-a",
             "build",
+            true,
         ));
 
         let loaded = store
@@ -509,7 +522,7 @@ mod tests {
             .unwrap();
         loaded
             .append(&Record::User {
-                text: "question".to_string(),
+                text: "question".into(),
             })
             .unwrap();
         loaded
@@ -527,7 +540,7 @@ mod tests {
             .unwrap();
         resumed
             .append(&Record::User {
-                text: "do not replay".to_string(),
+                text: "do not replay".into(),
             })
             .unwrap();
         let resume_id = SessionId::new(resumed.id());
@@ -567,6 +580,7 @@ mod tests {
                         initialized.agent_capabilities,
                         AgentCapabilities::new()
                             .load_session(true)
+                            .prompt_capabilities(PromptCapabilities::new().image(true))
                             .session_capabilities(
                                 SessionCapabilities::new()
                                     .additional_directories(
@@ -764,7 +778,7 @@ mod tests {
         let store = SessionStore::with_root(directory.path().join("sessions"));
         let sessions = Arc::new(SessionRegistry::new(store));
         accepts_component(callback_bundle(
-            Arc::new(SessionControl::new(sessions, "model-a", "build")),
+            Arc::new(SessionControl::new(sessions, "model-a", "build", false)),
             prompt_runtime(),
         ));
     }

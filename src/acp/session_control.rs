@@ -18,11 +18,11 @@ use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
-    NewSessionRequest, NewSessionResponse, ResumeSessionRequest, ResumeSessionResponse,
-    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOption, SessionDeleteCapabilities, SessionId, SessionInfo,
-    SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, ResumeSessionRequest,
+    ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities, SessionCapabilities,
+    SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
 };
 use agent_client_protocol::Error as ProtocolError;
@@ -57,6 +57,7 @@ pub(crate) struct SessionControl {
     sessions: Arc<SessionRegistry>,
     model: String,
     agent: String,
+    image_prompts: bool,
 }
 
 /// A prepared load that owns its lease until replay and response complete.
@@ -86,33 +87,41 @@ impl SessionControl {
         sessions: Arc<SessionRegistry>,
         model: impl Into<String>,
         agent: impl Into<String>,
+        image_prompts: bool,
     ) -> Self {
         Self {
             sessions,
             model: model.into(),
             agent: agent.into(),
+            image_prompts,
         }
     }
 
     /// Build the honest stable-v1 initialization response for the staged service.
-    pub(crate) fn initialize(request: &InitializeRequest) -> InitializeResponse {
+    pub(crate) fn initialize(&self, request: &InitializeRequest) -> InitializeResponse {
         let protocol_version = if request.protocol_version == ProtocolVersion::V1 {
             request.protocol_version
         } else {
             ProtocolVersion::LATEST
         };
-        InitializeResponse::new(protocol_version).agent_capabilities(
-            AgentCapabilities::new()
-                .load_session(true)
-                .session_capabilities(
-                    SessionCapabilities::new()
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
-                        .close(SessionCloseCapabilities::new())
-                        .delete(SessionDeleteCapabilities::new())
-                        .list(SessionListCapabilities::new())
-                        .resume(SessionResumeCapabilities::new()),
-                ),
-        )
+        let mut capabilities = AgentCapabilities::new()
+            .load_session(true)
+            .session_capabilities(
+                SessionCapabilities::new()
+                    .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
+                    .close(SessionCloseCapabilities::new())
+                    .delete(SessionDeleteCapabilities::new())
+                    .list(SessionListCapabilities::new())
+                    .resume(SessionResumeCapabilities::new()),
+            );
+        if self.image_prompts {
+            capabilities = capabilities.prompt_capabilities(PromptCapabilities::new().image(true));
+        }
+        InitializeResponse::new(protocol_version).agent_capabilities(capabilities)
+    }
+
+    pub(crate) fn image_prompts_enabled(&self) -> bool {
+        self.image_prompts
     }
 
     /// Validate all setup fields before creating any durable session state.
@@ -165,6 +174,9 @@ impl SessionControl {
             .sessions
             .prepare_load(&request.session_id, cwd)
             .map_err(|error| map_load_error(error, &request.session_id))?;
+        if !self.image_prompts && prepared.has_images() {
+            return Err(ControlError::invalid(InvalidSessionRequest::ImagesDisabled));
+        }
         prepared.set_additional_directories(additional_directories);
         Ok(LoadTransaction { prepared })
     }
@@ -254,6 +266,13 @@ impl SessionControl {
         .await
         .map_err(ControlError::internal)?
         .map_err(|error| map_load_error(error, session_id))?;
+        let has_images = match &prepared {
+            PreparedTransaction::Load(prepared) => prepared.has_images(),
+            PreparedTransaction::Resume(prepared) => prepared.has_images(),
+        };
+        if !self.image_prompts && has_images {
+            return Err(ControlError::invalid(InvalidSessionRequest::ImagesDisabled));
+        }
         let tools = mcp::start_tool_registry(&specs, Path::new(&cwd))
             .await
             .map_err(ControlError::internal)?;
@@ -518,41 +537,103 @@ fn validated_cwd(cwd: &Path) -> ControlResult<&str> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::io::Cursor;
 
     use agent_client_protocol::v1::schema::{EnvVariable, McpServer, McpServerStdio, SessionId};
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+    use image::{DynamicImage, ImageFormat};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::model::ToolCall;
+    use crate::model::{ImageInput, ToolCall, UserContent, UserContentPart};
     use crate::session::{Record, Session, SessionStore};
 
     fn control() -> (TempDir, SessionStore, SessionControl) {
         let directory = TempDir::new().unwrap();
         let store = SessionStore::with_root(directory.path().join("sessions"));
         let sessions = Arc::new(SessionRegistry::new(store.clone()));
-        let control = SessionControl::new(sessions, "model-a", "build");
+        let control = SessionControl::new(sessions, "model-a", "build", true);
         (directory, store, control)
+    }
+
+    fn image_user_content() -> UserContent {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, ImageFormat::Png)
+            .unwrap();
+        let (image, _) = ImageInput::validated(
+            "image/png".into(),
+            BASE64_STANDARD.encode(bytes.into_inner()),
+            crate::model::types::MAX_IMAGE_BYTES,
+        )
+        .unwrap();
+        UserContent::parts(vec![UserContentPart::Image { image }])
     }
 
     #[test]
     fn initialization_negotiates_stable_v1_without_unimplemented_capabilities() {
         for requested in [ProtocolVersion::V0, ProtocolVersion::V1] {
-            let response = SessionControl::initialize(&InitializeRequest::new(requested));
+            let response = control().2.initialize(&InitializeRequest::new(requested));
             assert_eq!(response.protocol_version, ProtocolVersion::V1);
             assert_eq!(
                 response.agent_capabilities,
                 AgentCapabilities::new()
                     .load_session(true)
+                    .prompt_capabilities(PromptCapabilities::new().image(true))
                     .session_capabilities(
-                    SessionCapabilities::new()
-                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new(),)
-                        .close(SessionCloseCapabilities::new())
-                        .delete(SessionDeleteCapabilities::new())
-                        .list(SessionListCapabilities::new())
-                        .resume(SessionResumeCapabilities::new()),
-                )
+                        SessionCapabilities::new()
+                            .additional_directories(
+                                SessionAdditionalDirectoriesCapabilities::new(),
+                            )
+                            .close(SessionCloseCapabilities::new())
+                            .delete(SessionDeleteCapabilities::new())
+                            .list(SessionListCapabilities::new())
+                            .resume(SessionResumeCapabilities::new()),
+                    )
             );
         }
+
+        let (directory, store, _) = control();
+        let sessions = Arc::new(SessionRegistry::new(store));
+        let text_only = SessionControl::new(sessions, "model-a", "build", false);
+        let response = text_only.initialize(&InitializeRequest::new(ProtocolVersion::V1));
+        assert!(!response.agent_capabilities.prompt_capabilities.image);
+        drop(directory);
+    }
+
+    #[tokio::test]
+    async fn text_only_profile_rejects_image_bearing_load_and_resume() {
+        let (directory, store, _) = control();
+        let session = store
+            .create(directory.path().to_str().unwrap(), "model-a", "build")
+            .unwrap();
+        session
+            .append(&Record::User {
+                text: image_user_content(),
+            })
+            .unwrap();
+        let session_id = SessionId::new(session.id());
+        drop(session);
+        let text_only = SessionControl::new(
+            Arc::new(SessionRegistry::new(store)),
+            "model-a",
+            "build",
+            false,
+        );
+
+        assert!(matches!(
+            text_only.prepare_load(&LoadSessionRequest::new(
+                session_id.clone(),
+                directory.path(),
+            )),
+            Err(ControlError::Invalid(InvalidSessionRequest::ImagesDisabled))
+        ));
+        assert!(matches!(
+            text_only
+                .prepare_resume_with_mcp(&ResumeSessionRequest::new(session_id, directory.path(),))
+                .await,
+            Err(ControlError::Invalid(InvalidSessionRequest::ImagesDisabled))
+        ));
     }
 
     #[tokio::test]
@@ -579,7 +660,7 @@ mod tests {
             .unwrap();
         primary
             .append(&Record::User {
-                text: "Primary title\nmore".to_string(),
+                text: "Primary title\nmore".into(),
             })
             .unwrap();
         let other = store
@@ -1133,7 +1214,7 @@ mod tests {
         let (directory, store, control) = control();
         let records = vec![
             Record::User {
-                text: "question".to_string(),
+                text: "question".into(),
             },
             Record::Assistant {
                 content: Some("checking".to_string()),
@@ -1311,7 +1392,7 @@ mod tests {
             let (directory, store, control) = control();
             let records = [
                 Record::User {
-                    text: "first".to_string(),
+                    text: "first".into(),
                 },
                 Record::Assistant {
                     content: Some("second".to_string()),

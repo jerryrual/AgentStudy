@@ -359,7 +359,7 @@ mod tests {
                 .iter()
                 .rev()
                 .find_map(|message| match message {
-                    Message::User { content } => Some(content.clone()),
+                    Message::User { content } => Some(content.display_text()),
                     _ => None,
                 })
                 .expect("test snapshot label");
