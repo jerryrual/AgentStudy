@@ -633,7 +633,7 @@ pub(crate) async fn execute_with_content(options: RunOptions, content: UserConte
         if options.resume_turn {
             TurnStart::Resume
         } else {
-            TurnStart::User(content.clone())
+            TurnStart::User(content)
         },
     )?;
 

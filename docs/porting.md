@@ -71,7 +71,7 @@
   todo 更新保持顺序执行，以保证审批、交互和会话状态的确定性。
 - Responses API 默认采用无状态完整历史重放；可通过 `responses_stored_continuation` 显式启用
   provider 存储续传。不支持 create 结果不明且没有可靠 id 时的远端取消，也不支持除显式启用的 `web_search` / `file_search` /
-  OpenAI `code_interpreter` 以外的托管工具或 TUI / CLI 图片输入；遇到未支持的可执行输出类型会失败关闭。
+  OpenAI `code_interpreter` 以外的托管工具或 TUI 图片输入；遇到未支持的可执行输出类型会失败关闭。
 - `icode run` 与 iCode 一样绕过审批；`--approval deny` 提供只读保护。
 
 ## 设计取向
