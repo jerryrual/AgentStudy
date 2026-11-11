@@ -657,12 +657,6 @@ impl Settings {
                         profile.name
                     );
                 }
-                if profile.stream {
-                    bail!(
-                        "model profile {:?} enables background Responses with streaming",
-                        profile.name
-                    );
-                }
             }
             if !(MIN_LAST_WORDS_MAX_OUTPUT_TOKENS..=MAX_LAST_WORDS_MAX_OUTPUT_TOKENS)
                 .contains(&profile.last_words_max_output_tokens)
@@ -986,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_background_requires_openai_stored_nonstreaming_responses() {
+    fn responses_background_requires_openai_stored_responses() {
         let profile: ModelProfile = serde_json::from_str(
             r#"{
                 "name": "legacy",
@@ -1022,11 +1016,7 @@ mod tests {
             .to_string()
             .contains("background Responses without stored continuation"));
         settings.models[0].responses_stored_continuation = true;
-        assert!(settings
-            .normalise()
-            .unwrap_err()
-            .to_string()
-            .contains("background Responses with streaming"));
+        settings.normalise().unwrap();
         settings.models[0].stream = false;
         settings.normalise().unwrap();
     }

@@ -184,11 +184,10 @@ impl ModelClient {
         if profile.responses_background
             && (profile.api_style != ApiStyle::Responses
                 || !profile.provider.eq_ignore_ascii_case("openai")
-                || !profile.responses_stored_continuation
-                || profile.stream)
+                || !profile.responses_stored_continuation)
         {
             bail!(
-                "background Responses require an OpenAI Responses profile with stored continuation enabled and streaming disabled"
+                "background Responses require an OpenAI Responses profile with stored continuation enabled"
             );
         }
         if profile.responses_code_interpreter
@@ -729,7 +728,11 @@ impl ModelClient {
         continuation_input_sha256: Option<&str>,
     ) -> std::result::Result<Completion, ClientError> {
         if body.get("background").and_then(Value::as_bool) == Some(true) {
-            let mut completion = self.send_background_once(body, sink).await?;
+            let mut completion = if body.get("stream").and_then(Value::as_bool) == Some(true) {
+                self.send_background_stream_once(body, sink).await?
+            } else {
+                self.send_background_once(body, sink).await?
+            };
             self.finalize_responses_continuation(
                 body,
                 &mut completion,
@@ -1303,6 +1306,345 @@ impl ModelClient {
         };
         body[field] = json!(output);
         Ok(())
+    }
+
+    async fn send_background_stream_once(
+        &self,
+        body: &Value,
+        sink: &dyn EventSink,
+    ) -> Result<Completion, ClientError> {
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            BACKGROUND_DEADLINE,
+            self.http
+                .post(&self.endpoint)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            ClientError::Fatal(anyhow!(
+                "background Responses stream create timed out with an ambiguous remote outcome; it was not retried"
+            ))
+        })?
+        .map_err(|error| {
+            ClientError::Fatal(anyhow!(
+                "background Responses stream create failed with an ambiguous remote outcome and was not retried: {error}"
+            ))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+            let (bytes, truncated) = tokio::time::timeout(
+                remaining,
+                read_limited_error_body(response),
+            )
+            .await
+            .map_err(|_| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses stream create failed with HTTP {}: error body timed out; it was not retried",
+                    status.as_u16()
+                ))
+            })?
+            .map_err(|error| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses stream create failed with HTTP {}: error body read failed: {error}; it was not retried",
+                    status.as_u16()
+                ))
+            })?;
+            let text = String::from_utf8_lossy(&bytes);
+            let detail = if truncated {
+                format!(
+                    "error body exceeded {MAX_ERROR_READ} bytes: {}",
+                    truncate(&text, MAX_ERROR_BODY).trim()
+                )
+            } else {
+                truncate(&text, MAX_ERROR_BODY).trim().to_string()
+            };
+            let message = format!(
+                "background Responses stream create failed with HTTP {} and was not retried: {detail}",
+                status.as_u16()
+            );
+            if !truncated {
+                if let Some(named_limit) = context_overflow_details(status, &text) {
+                    return Err(ClientError::ContextOverflow {
+                        error: anyhow!(message),
+                        named_limit,
+                    });
+                }
+            }
+            return Err(ClientError::Fatal(anyhow!(message)));
+        }
+
+        let mut accumulator = super::responses::ResponsesAccumulator::default();
+        let mut response_id = None;
+        let mut sequence_number = None;
+        let mut cancellation = None;
+        let result: Result<Completion, ClientError> = async {
+            let mut connection = Some(response);
+            loop {
+                let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+                let finished = tokio::time::timeout(
+                    remaining,
+                    self.consume_background_stream_connection(
+                        connection.take().ok_or_else(|| {
+                            ClientError::Fatal(anyhow!(
+                                "background response stream lost its active connection"
+                            ))
+                        })?,
+                        &mut accumulator,
+                        &mut response_id,
+                        &mut sequence_number,
+                        &mut cancellation,
+                        sink,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    if response_id.is_none() {
+                        ClientError::Fatal(anyhow!(
+                            "background Responses stream create timed out with an ambiguous remote outcome; it was not retried"
+                        ))
+                    } else {
+                        ClientError::Fatal(anyhow!(
+                            "background response stream did not finish within {} seconds",
+                            BACKGROUND_DEADLINE.as_secs()
+                        ))
+                    }
+                })??;
+                if finished {
+                    return accumulator.finish().map_err(ClientError::Fatal);
+                }
+                let id = response_id.as_deref().ok_or_else(|| {
+                    ClientError::Fatal(anyhow!(
+                        "background Responses stream ended before returning a response id; create outcome is ambiguous and was not retried"
+                    ))
+                })?;
+                let cursor = sequence_number.ok_or_else(|| {
+                    ClientError::Fatal(anyhow!(
+                        "background response {id} stream ended without a sequence cursor"
+                    ))
+                })?;
+                if started.elapsed() >= BACKGROUND_DEADLINE {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "background response {id} stream did not finish within {} seconds",
+                        BACKGROUND_DEADLINE.as_secs()
+                    )));
+                }
+                let mut url = reqwest::Url::parse(&self.endpoint)
+                    .context("invalid Responses endpoint")
+                    .map_err(ClientError::Fatal)?;
+                url.path_segments_mut()
+                    .map_err(|_| {
+                        ClientError::Fatal(anyhow!(
+                            "Responses endpoint cannot accept a response id"
+                        ))
+                    })?
+                    .push(id);
+                {
+                    let mut query = url.query_pairs_mut();
+                    if self.include_encrypted_reasoning {
+                        query.append_pair("include", "reasoning.encrypted_content");
+                    }
+                    if !self.responses_file_search_vector_store_ids.is_empty() {
+                        query.append_pair("include", "file_search_call.results");
+                    }
+                    query
+                        .append_pair("stream", "true")
+                        .append_pair("starting_after", &cursor.to_string());
+                }
+                connection = Some(loop {
+                    if started.elapsed() >= BACKGROUND_DEADLINE {
+                        return Err(ClientError::Fatal(anyhow!(
+                            "background response {id} stream did not finish within {} seconds",
+                            BACKGROUND_DEADLINE.as_secs()
+                        )));
+                    }
+                    tokio::time::sleep(BACKGROUND_POLL_INTERVAL).await;
+                    let remaining = BACKGROUND_DEADLINE.saturating_sub(started.elapsed());
+                    let reconnect = tokio::time::timeout(
+                        remaining,
+                        self.http
+                            .get(url.clone())
+                            .header("Authorization", format!("Bearer {}", self.api_key))
+                            .send(),
+                    )
+                    .await;
+                    match reconnect {
+                        Ok(Ok(response)) if response.status().is_success() => break response,
+                        Ok(Ok(response)) if is_retryable_status(response.status()) => {
+                            sink.info(&format!(
+                                "background response {id} stream resume failed with HTTP {}; retrying",
+                                response.status().as_u16()
+                            ));
+                        }
+                        Ok(Ok(response)) => {
+                            return Err(ClientError::Fatal(anyhow!(
+                                "background response {id} stream resume failed with HTTP {}",
+                                response.status().as_u16()
+                            )));
+                        }
+                        Ok(Err(error)) => {
+                            sink.info(&format!(
+                                "background response {id} stream resume failed ({error}); retrying"
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(ClientError::Fatal(anyhow!(
+                                "background response {id} stream resume timed out"
+                            )));
+                        }
+                    }
+                });
+            }
+        }
+        .await;
+
+        match result {
+            Ok(completion) => {
+                if let Some(cancellation) = cancellation.as_mut() {
+                    cancellation.disarm();
+                }
+                Ok(completion)
+            }
+            Err(error) => {
+                let Some(cancellation) = cancellation.as_mut() else {
+                    return Err(error);
+                };
+                let original = error.into_error();
+                let cancellation_detail = match cancellation.cancel().await {
+                    Ok(()) => "remote cancellation was accepted".to_string(),
+                    Err(cancel_error) => format!("remote cancellation failed: {cancel_error}"),
+                };
+                Err(ClientError::Fatal(anyhow!(
+                    "{original:#}; {cancellation_detail}"
+                )))
+            }
+        }
+    }
+
+    async fn consume_background_stream_connection(
+        &self,
+        response: reqwest::Response,
+        accumulator: &mut super::responses::ResponsesAccumulator,
+        response_id: &mut Option<String>,
+        sequence_number: &mut Option<u64>,
+        cancellation: &mut Option<BackgroundCancellation>,
+        sink: &dyn EventSink,
+    ) -> Result<bool, ClientError> {
+        let mut stream = response.bytes_stream();
+        let mut parser = SseParser::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(error) if response_id.is_some() && sequence_number.is_some() => {
+                    sink.info(&format!(
+                        "background response stream disconnected ({error}); resuming"
+                    ));
+                    return Ok(false);
+                }
+                Err(error) => {
+                    return Err(ClientError::Fatal(anyhow!(
+                        "background Responses stream create failed with an ambiguous remote outcome and was not retried: {error}"
+                    )));
+                }
+            };
+            for payload in parser
+                .push(&bytes)
+                .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+            {
+                if self.apply_background_stream_payload(
+                    &payload,
+                    accumulator,
+                    response_id,
+                    sequence_number,
+                    cancellation,
+                    sink,
+                )? {
+                    return Ok(true);
+                }
+            }
+        }
+        for payload in parser
+            .finish()
+            .map_err(|error| ClientError::Fatal(anyhow!("{error}")))?
+        {
+            if response_id.is_some()
+                && sequence_number.is_some()
+                && serde_json::from_str::<Value>(payload.trim()).is_err_and(|error| error.is_eof())
+            {
+                return Ok(false);
+            }
+            if self.apply_background_stream_payload(
+                &payload,
+                accumulator,
+                response_id,
+                sequence_number,
+                cancellation,
+                sink,
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_background_stream_payload(
+        &self,
+        payload: &str,
+        accumulator: &mut super::responses::ResponsesAccumulator,
+        response_id: &mut Option<String>,
+        sequence_number: &mut Option<u64>,
+        cancellation: &mut Option<BackgroundCancellation>,
+        sink: &dyn EventSink,
+    ) -> Result<bool, ClientError> {
+        let trimmed = payload.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(false);
+        }
+        let event: Value = serde_json::from_str(trimmed).map_err(|error| {
+            ClientError::Fatal(anyhow!(
+                "invalid background Responses stream event: {error}"
+            ))
+        })?;
+        let next_sequence = event
+            .get("sequence_number")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ClientError::Fatal(anyhow!(
+                    "background Responses stream event is missing sequence_number"
+                ))
+            })?;
+        if sequence_number.is_some_and(|current| next_sequence <= current) {
+            return Err(ClientError::Fatal(anyhow!(
+                "background Responses stream sequence did not advance"
+            )));
+        }
+        if let Some(response) = event
+            .get("response")
+            .filter(|value| value.get("id").is_some())
+        {
+            let id = background_response_id(response).map_err(ClientError::Fatal)?;
+            if response_id.as_deref().is_some_and(|current| current != id) {
+                return Err(ClientError::Fatal(anyhow!(
+                    "background Responses stream changed response id"
+                )));
+            }
+            if response_id.is_none() {
+                *cancellation = Some(
+                    BackgroundCancellation::new(&self.http, &self.endpoint, &self.api_key, &id)
+                        .map_err(ClientError::Fatal)?,
+                );
+                *response_id = Some(id);
+            }
+        }
+        let terminal = accumulator
+            .apply(trimmed, sink)
+            .map_err(ClientError::Fatal)?;
+        *sequence_number = Some(next_sequence);
+        Ok(terminal)
     }
 
     async fn send_background_once(
