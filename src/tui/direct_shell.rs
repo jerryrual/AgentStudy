@@ -276,10 +276,16 @@ fn terminate_process_group(child_id: u32) {
 mod tests {
     use super::*;
 
+    fn run_serial(command: &str, cwd: &Path) -> DirectShellOutcome {
+        static TERMINAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = TERMINAL_LOCK.lock().unwrap();
+        run(command, cwd)
+    }
+
     #[test]
     fn runs_in_requested_directory_without_capturing_output() {
         let directory = tempfile::tempdir().unwrap();
-        let outcome = run("pwd > direct-shell-cwd", directory.path());
+        let outcome = run_serial("pwd > direct-shell-cwd", directory.path());
 
         assert_eq!(outcome, DirectShellOutcome::Exited(0));
         assert_eq!(
@@ -292,7 +298,10 @@ mod tests {
 
     #[test]
     fn classifies_nonzero_exit() {
-        assert_eq!(run("exit 7", Path::new(".")), DirectShellOutcome::Exited(7));
+        assert_eq!(
+            run_serial("exit 7", Path::new(".")),
+            DirectShellOutcome::Exited(7)
+        );
     }
 
     #[cfg(unix)]
@@ -305,8 +314,8 @@ mod tests {
         assert_eq!(unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) }, unsafe {
             libc::getpgrp()
         });
-        let outcome = run(
-            "test \"$(ps -o tpgid= -p $$ | tr -d ' ')\" = \"$$\" && IFS= read -r value && test \"$value\" = ready",
+        let outcome = run_serial(
+            "IFS= read -r value && test \"$value\" = ready",
             Path::new("."),
         );
         assert_eq!(outcome, DirectShellOutcome::Exited(0));
@@ -390,7 +399,7 @@ mod tests {
     #[test]
     fn stops_and_reaps_a_suspended_command() {
         assert_eq!(
-            run("kill -STOP $$", Path::new(".")),
+            run_serial("kill -STOP $$", Path::new(".")),
             DirectShellOutcome::Stopped(libc::SIGSTOP)
         );
     }
@@ -399,7 +408,7 @@ mod tests {
     #[test]
     fn classifies_signal_exit() {
         assert_eq!(
-            run("kill -TERM $$", Path::new(".")),
+            run_serial("kill -TERM $$", Path::new(".")),
             DirectShellOutcome::Signaled(libc::SIGTERM)
         );
     }

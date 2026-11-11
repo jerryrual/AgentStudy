@@ -96,6 +96,8 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
 }
 
 /// Drop keys crossterm parsed beyond the Enter that submitted a direct command.
+/// Bytes arriving after this drain remain terminal input for whichever side owns
+/// the terminal next; a second drain removes anything the child leaves behind.
 fn discard_pending_events() -> Result<()> {
     while event::poll(Duration::ZERO).context("failed to inspect buffered terminal input")? {
         event::read().context("failed to discard buffered terminal input")?;
@@ -117,6 +119,7 @@ fn execute_direct_shell(
                 ratatui::try_init()
                     .context("failed to restore the terminal after shell command")?,
             );
+            discard_pending_events().context("failed to discard residual shell input")?;
             Ok(())
         },
     )?;
