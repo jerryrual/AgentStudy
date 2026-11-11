@@ -43,6 +43,7 @@ pub struct ModelClient {
     api_style: ApiStyle,
     include_encrypted_reasoning: bool,
     responses_web_search: bool,
+    responses_code_interpreter: bool,
     responses_file_search_vector_store_ids: Vec<String>,
     responses_file_search_filters: Option<ResponsesFileSearchFilter>,
     responses_file_search_max_num_results: Option<u8>,
@@ -116,6 +117,12 @@ impl ModelClient {
                 "background Responses require an OpenAI Responses profile with stored continuation enabled and streaming disabled"
             );
         }
+        if profile.responses_code_interpreter
+            && (profile.api_style != ApiStyle::Responses
+                || !profile.provider.eq_ignore_ascii_case("openai"))
+        {
+            bail!("Responses code interpreter requires an OpenAI Responses profile");
+        }
         if let Some(filter) = profile
             .responses_file_search
             .as_ref()
@@ -152,6 +159,7 @@ impl ModelClient {
             include_encrypted_reasoning: profile.api_style == ApiStyle::Responses
                 && profile.provider.eq_ignore_ascii_case("openai"),
             responses_web_search: profile.responses_web_search,
+            responses_code_interpreter: profile.responses_code_interpreter,
             responses_file_search_vector_store_ids: profile
                 .responses_file_search
                 .as_ref()
@@ -747,6 +755,7 @@ impl ModelClient {
             hasher.update([0]);
         }
         hasher.update([u8::from(self.responses_web_search)]);
+        hasher.update([u8::from(self.responses_code_interpreter)]);
         hasher.update((self.responses_file_search_vector_store_ids.len() as u64).to_be_bytes());
         hasher.update([self
             .responses_file_search_max_num_results
@@ -926,6 +935,7 @@ impl ModelClient {
                 super::responses::RequestFeatures {
                     include_encrypted_reasoning: self.include_encrypted_reasoning,
                     web_search: self.responses_web_search,
+                    code_interpreter: self.responses_code_interpreter,
                     file_search_vector_store_ids: self
                         .responses_file_search_vector_store_ids
                         .clone(),
@@ -1006,6 +1016,18 @@ impl ModelClient {
         if allow_hosted_tools && self.api_style == ApiStyle::Responses && self.responses_web_search
         {
             semantic_tools.push(json!({"type": "web_search"}));
+        }
+        if allow_hosted_tools
+            && self.api_style == ApiStyle::Responses
+            && self.responses_code_interpreter
+        {
+            semantic_tools.push(json!({
+                "type": "code_interpreter",
+                "container": {
+                    "type": "auto",
+                    "network_policy": {"type": "disabled"}
+                }
+            }));
         }
         if allow_hosted_tools
             && self.api_style == ApiStyle::Responses

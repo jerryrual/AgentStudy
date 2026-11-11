@@ -95,6 +95,9 @@ provider 搜索既有 vector store；`max_num_results` 可省略，若设置须�
 `gte` / `lt` / `lte` / `in` / `nin` 比较节点，以及递归 `and` / `or` 组合；key 不能为空，数值必须
 有限，过深或过大的过滤树会在请求前拒绝。文件搜索结果、原生
 `file_search_call` 与文件引用注解会进入本地会话并原样回放，但当前 TUI 仅显示回答文本，不单独渲染引用。
+OpenAI Responses profile 还可显式设置 `"responses_code_interpreter": true`，让 provider 在无挂载文件、
+禁用出站网络的自动 Python 容器中执行代码。该选项默认关闭，容器计算可能单独计费并受 provider 数据保留
+策略约束；原生 `code_interpreter_call`、代码与日志会原样持久化，图片 URL 只保留、不下载或渲染且可能过期。
 这些托管调用都不经过本地工具审批/执行；切换配置会使存储续传建立新 scope。Phase 4 Last Words
 side-call 始终不暴露托管工具。还可显式设置
 `"responses_stored_continuation": true`：普通 Responses 结果会由 provider 远端存储，Rust 会把不透明
