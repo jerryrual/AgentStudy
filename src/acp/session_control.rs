@@ -10,16 +10,18 @@ use std::sync::Arc;
 use super::error::{ControlError, ControlResult, InvalidSessionRequest};
 use super::mcp;
 use super::sessions::{
-    BeginPromptError, CloseError, LoadError, PreparedLoad, PromptGuard, SessionRegistry,
+    BeginPromptError, CloseError, LoadError, PreparedLoad, PreparedRestore, PromptGuard,
+    SessionRegistry,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
     DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
-    SessionInfo, SessionListCapabilities, SessionNotification,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
+    NewSessionRequest, NewSessionResponse, ResumeSessionRequest, ResumeSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionDeleteCapabilities, SessionId, SessionInfo, SessionListCapabilities,
+    SessionNotification, SessionResumeCapabilities,
 };
 use agent_client_protocol::Error as ProtocolError;
 
@@ -35,6 +37,22 @@ pub(crate) struct SessionControl {
 /// A prepared load that owns its lease until replay and response complete.
 pub(crate) struct LoadTransaction {
     prepared: PreparedLoad,
+}
+
+/// A prepared resume that owns its lease until the response is admitted.
+pub(crate) struct ResumeTransaction {
+    prepared: PreparedRestore,
+}
+
+#[derive(Clone, Copy)]
+enum RestoreMode {
+    Load,
+    Resume,
+}
+
+enum PreparedTransaction {
+    Load(PreparedLoad),
+    Resume(PreparedRestore),
 }
 
 impl SessionControl {
@@ -66,7 +84,8 @@ impl SessionControl {
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
                         .close(SessionCloseCapabilities::new())
                         .delete(SessionDeleteCapabilities::new())
-                        .list(SessionListCapabilities::new()),
+                        .list(SessionListCapabilities::new())
+                        .resume(SessionResumeCapabilities::new()),
                 ),
         )
     }
@@ -129,37 +148,100 @@ impl SessionControl {
         &self,
         request: &LoadSessionRequest,
     ) -> ControlResult<LoadTransaction> {
-        let additional_directories =
-            validated_additional_directories(&request.additional_directories)?;
-        let specs = mcp::stdio_specs(&request.mcp_servers)
+        match self
+            .prepare_restore_with_mcp(
+                &request.session_id,
+                &request.cwd,
+                &request.additional_directories,
+                &request.mcp_servers,
+                RestoreMode::Load,
+            )
+            .await?
+        {
+            PreparedTransaction::Load(prepared) => Ok(LoadTransaction { prepared }),
+            PreparedTransaction::Resume(_) => unreachable!("load requested a resume restore"),
+        }
+    }
+
+    /// Validate and restore a session without replaying historical notifications.
+    pub(crate) async fn prepare_resume_with_mcp(
+        &self,
+        request: &ResumeSessionRequest,
+    ) -> ControlResult<ResumeTransaction> {
+        match self
+            .prepare_restore_with_mcp(
+                &request.session_id,
+                &request.cwd,
+                &request.additional_directories,
+                &request.mcp_servers,
+                RestoreMode::Resume,
+            )
+            .await?
+        {
+            PreparedTransaction::Resume(prepared) => Ok(ResumeTransaction { prepared }),
+            PreparedTransaction::Load(_) => unreachable!("resume requested a load restore"),
+        }
+    }
+
+    async fn prepare_restore_with_mcp(
+        &self,
+        session_id: &SessionId,
+        requested_cwd: &Path,
+        requested_directories: &[PathBuf],
+        mcp_servers: &[McpServer],
+        mode: RestoreMode,
+    ) -> ControlResult<PreparedTransaction> {
+        let additional_directories = validated_additional_directories(requested_directories)?;
+        let specs = mcp::stdio_specs(mcp_servers)
             .map_err(|_| ControlError::invalid(InvalidSessionRequest::InvalidMcpServers))?;
-        let requested_cwd = request.cwd.clone();
+        let requested_cwd = requested_cwd.to_path_buf();
         let cwd = tokio::task::spawn_blocking(move || {
             validated_cwd(&requested_cwd).map(|cwd| cwd.to_string())
         })
         .await
         .map_err(ControlError::internal)??;
-        if self.sessions.is_registered(&request.session_id) {
+        if self.sessions.is_registered(session_id) {
             return Err(ControlError::invalid(
                 InvalidSessionRequest::AlreadyRegistered,
             ));
         }
         let registry = Arc::downgrade(&self.sessions);
         let store = self.sessions.store();
-        let session_id = request.session_id.clone();
+        let detached_session_id = session_id.clone();
         let expected_cwd = cwd.clone();
-        let mut prepared = tokio::task::spawn_blocking(move || {
-            SessionRegistry::prepare_load_detached(registry, store, session_id, expected_cwd)
+        let mut prepared = tokio::task::spawn_blocking(move || match mode {
+            RestoreMode::Load => SessionRegistry::prepare_load_detached(
+                registry,
+                store,
+                detached_session_id,
+                expected_cwd,
+            )
+            .map(PreparedTransaction::Load),
+            RestoreMode::Resume => SessionRegistry::prepare_resume_detached(
+                registry,
+                store,
+                detached_session_id,
+                expected_cwd,
+            )
+            .map(PreparedTransaction::Resume),
         })
         .await
         .map_err(ControlError::internal)?
-        .map_err(|error| map_load_error(error, &request.session_id))?;
-        prepared.set_additional_directories(additional_directories);
-        let tools = mcp::start_tool_registry(&specs, std::path::Path::new(&cwd))
+        .map_err(|error| map_load_error(error, session_id))?;
+        let tools = mcp::start_tool_registry(&specs, Path::new(&cwd))
             .await
             .map_err(ControlError::internal)?;
-        prepared.set_tools(tools);
-        Ok(LoadTransaction { prepared })
+        match &mut prepared {
+            PreparedTransaction::Load(prepared) => {
+                prepared.set_additional_directories(additional_directories);
+                prepared.set_tools(tools);
+            }
+            PreparedTransaction::Resume(prepared) => {
+                prepared.set_additional_directories(additional_directories);
+                prepared.set_tools(tools);
+            }
+        }
+        Ok(prepared)
     }
 
     /// Acquire the prompt slot or classify its client-visible admission failure.
@@ -281,6 +363,23 @@ impl LoadTransaction {
     }
 }
 
+impl ResumeTransaction {
+    /// Admit the response before making the resumed session prompt-visible.
+    pub(crate) fn complete_with(
+        self,
+        respond: impl FnOnce(ResumeSessionResponse) -> Result<(), ProtocolError>,
+    ) -> ControlResult<()> {
+        let session_id = self.prepared.session_id();
+        let pending = self
+            .prepared
+            .activate()
+            .map_err(|error| map_load_error(error, &session_id))?;
+        respond(ResumeSessionResponse::new()).map_err(ControlError::Protocol)?;
+        pending.commit();
+        Ok(())
+    }
+}
+
 fn map_delete_error(error: RunLeaseError, session_id: SessionId) -> ControlError {
     match error {
         RunLeaseError::InvalidSessionId(_) => {
@@ -381,7 +480,8 @@ mod tests {
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new(),)
                         .close(SessionCloseCapabilities::new())
                         .delete(SessionDeleteCapabilities::new())
-                        .list(SessionListCapabilities::new()),
+                        .list(SessionListCapabilities::new())
+                        .resume(SessionResumeCapabilities::new()),
                 )
             );
         }
@@ -706,6 +806,38 @@ mod tests {
         assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_rebuilds_tools_from_client_stdio_declarations() {
+        let (directory, store, control) = control();
+        let (_session, session_id) = persisted_session(&store, directory.path(), &[]);
+        let script = concat!(
+            "read initialize; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,",
+            "\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+            "\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}'; ",
+            "read initialized; read list; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,",
+            "\"result\":{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{}}]}}'; ",
+            "read until_closed"
+        );
+        let request =
+            ResumeSessionRequest::new(session_id.clone(), directory.path()).mcp_servers(vec![
+                McpServer::Stdio(
+                    McpServerStdio::new("fixture", "/bin/sh")
+                        .args(vec!["-c".into(), script.into()]),
+                ),
+            ]);
+
+        control
+            .prepare_resume_with_mcp(&request)
+            .await
+            .unwrap()
+            .complete_with(|_| Ok::<_, ProtocolError>(()))
+            .unwrap();
+        let guard = control.begin_prompt(&session_id).unwrap();
+        assert!(guard.tools().get("read_file").is_some());
+        assert!(guard.tools().get("mcp_s0_t0_echo").is_some());
+    }
+
     #[tokio::test]
     async fn load_rejects_invalid_mcp_before_acquiring_the_session_lease() {
         let (directory, store, control) = control();
@@ -794,6 +926,62 @@ mod tests {
             .unwrap();
         let guard = control.begin_prompt(&created.session_id).unwrap();
         assert!(guard.additional_directories().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_skips_replay_admits_response_before_ready_and_rolls_back_failure() {
+        let (directory, store, control) = control();
+        let duplicate = Record::Assistant {
+            content: None,
+            reasoning: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "same".to_string(),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCall {
+                    id: "same".to_string(),
+                    name: "grep".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ],
+            responses_items: vec![],
+            responses_continuation: None,
+        };
+        let (session, session_id) =
+            persisted_session(&store, directory.path(), std::slice::from_ref(&duplicate));
+        let request = ResumeSessionRequest::new(session_id.clone(), directory.path());
+        let transaction = control.prepare_resume_with_mcp(&request).await.unwrap();
+        transaction
+            .complete_with(|response| {
+                assert_eq!(response, ResumeSessionResponse::new());
+                assert!(matches!(
+                    control.begin_prompt(&session_id),
+                    Err(ControlError::Invalid(InvalidSessionRequest::PromptLoading))
+                ));
+                Ok(())
+            })
+            .unwrap();
+        drop(control.begin_prompt(&session_id).unwrap());
+        control.sessions.close(&session_id).await.unwrap();
+
+        assert!(matches!(
+            control
+                .prepare_load_with_mcp(&LoadSessionRequest::new(
+                    session_id.clone(),
+                    directory.path()
+                ))
+                .await,
+            Err(ControlError::Internal(_))
+        ));
+        let failed = control.prepare_resume_with_mcp(&request).await.unwrap();
+        assert!(matches!(
+            failed.complete_with(|_| Err(ProtocolError::internal_error())),
+            Err(ControlError::Protocol(_))
+        ));
+        assert!(!control.sessions.is_registered(&session_id));
+        store.try_acquire_run_lease(session.id()).unwrap();
     }
 
     #[test]

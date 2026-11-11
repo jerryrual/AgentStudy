@@ -104,14 +104,19 @@ pub(crate) struct PreparedCreate {
     committed: bool,
 }
 
-/// A validated load whose replay is complete but whose session is not exposed.
-pub(crate) struct PreparedLoad {
+/// A restored session that is validated and leased but not yet exposed.
+pub(crate) struct PreparedRestore {
     registry: Weak<SessionRegistry>,
     session: Session,
     run_lease: SessionRunLease,
-    updates: Vec<SessionUpdate>,
     tools: Arc<ToolRegistry>,
     additional_directories: Vec<PathBuf>,
+}
+
+/// A validated load whose replay is complete but whose session is not exposed.
+pub(crate) struct PreparedLoad {
+    restored: PreparedRestore,
+    updates: Vec<SessionUpdate>,
 }
 
 /// A load registered as pending while its response is admitted.
@@ -228,13 +233,43 @@ impl SessionRegistry {
         )
     }
 
-    /// Perform blocking load I/O while retaining only a weak registry reference.
+    /// Perform blocking load I/O and project history while retaining a weak registry.
     pub(crate) fn prepare_load_detached(
         registry: Weak<Self>,
         store: SessionStore,
         session_id: SessionId,
         expected_cwd: String,
     ) -> std::result::Result<PreparedLoad, LoadError> {
+        let (restored, updates) =
+            Self::prepare_restore_detached(registry, store, session_id, expected_cwd, true)?;
+        Ok(PreparedLoad {
+            restored,
+            updates: updates.expect("load restore requested replay"),
+        })
+    }
+
+    /// Perform blocking resume I/O without projecting historical notifications.
+    pub(crate) fn prepare_resume_detached(
+        registry: Weak<Self>,
+        store: SessionStore,
+        session_id: SessionId,
+        expected_cwd: String,
+    ) -> std::result::Result<PreparedRestore, LoadError> {
+        Self::prepare_restore_detached(registry, store, session_id, expected_cwd, false).map(
+            |(restored, updates)| {
+                debug_assert!(updates.is_none());
+                restored
+            },
+        )
+    }
+
+    fn prepare_restore_detached(
+        registry: Weak<Self>,
+        store: SessionStore,
+        session_id: SessionId,
+        expected_cwd: String,
+        project_replay: bool,
+    ) -> std::result::Result<(PreparedRestore, Option<Vec<SessionUpdate>>), LoadError> {
         let id = session_id.to_string();
         let run_lease = store
             .try_acquire_run_lease(&id)
@@ -257,24 +292,28 @@ impl SessionRegistry {
         })?;
         if loaded.meta.id != id {
             return Err(LoadError::Internal(anyhow::anyhow!(
-                "ACP load session id does not match persisted metadata"
+                "ACP restore session id does not match persisted metadata"
             )));
         }
         if loaded.meta.cwd != expected_cwd {
             return Err(LoadError::CwdMismatch);
         }
-        let updates = replay_updates(&loaded.records).map_err(LoadError::Internal)?;
+        let updates = project_replay
+            .then(|| replay_updates(&loaded.records).map_err(LoadError::Internal))
+            .transpose()?;
         let session = store
             .reopen_loaded(&id, loaded)
             .map_err(LoadError::Internal)?;
-        Ok(PreparedLoad {
-            registry,
-            session,
-            run_lease,
+        Ok((
+            PreparedRestore {
+                registry,
+                session,
+                run_lease,
+                tools: Arc::new(ToolRegistry::builtin()),
+                additional_directories: Vec::new(),
+            },
             updates,
-            tools: Arc::new(ToolRegistry::builtin()),
-            additional_directories: Vec::new(),
-        })
+        ))
     }
 
     fn register(
@@ -398,34 +437,28 @@ impl Drop for PreparedCreate {
     }
 }
 
-impl PreparedLoad {
+impl PreparedRestore {
     /// Return the stable ACP session ID that will be registered on activation.
     pub(crate) fn session_id(&self) -> SessionId {
         SessionId::new(self.session.id())
     }
 
-    /// Return the fully validated replay projection without exposing the session.
-    pub(crate) fn updates(&self) -> &[SessionUpdate] {
-        &self.updates
-    }
-
-    /// Replace built-ins with the registry reconstructed for this load.
+    /// Replace built-ins with the registry reconstructed for this restore.
     pub(crate) fn set_tools(&mut self, tools: Arc<ToolRegistry>) {
         self.tools = tools;
     }
 
-    /// Replace the ordered additional workspace roots for this load.
+    /// Replace the ordered additional workspace roots for this restore.
     pub(crate) fn set_additional_directories(&mut self, directories: Vec<PathBuf>) {
         self.additional_directories = directories;
     }
 
-    /// Register this load as pending while its protocol response is admitted.
+    /// Register this restore as pending while its protocol response is admitted.
     pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
-        let PreparedLoad {
+        let PreparedRestore {
             registry,
             session,
             run_lease,
-            updates: _,
             tools,
             additional_directories,
         } = self;
@@ -441,6 +474,33 @@ impl PreparedLoad {
             registered,
             committed: false,
         })
+    }
+}
+
+impl PreparedLoad {
+    /// Return the stable ACP session ID that will be registered on activation.
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.restored.session_id()
+    }
+
+    /// Return the fully validated replay projection without exposing the session.
+    pub(crate) fn updates(&self) -> &[SessionUpdate] {
+        &self.updates
+    }
+
+    /// Replace built-ins with the registry reconstructed for this load.
+    pub(crate) fn set_tools(&mut self, tools: Arc<ToolRegistry>) {
+        self.restored.set_tools(tools);
+    }
+
+    /// Replace the ordered additional workspace roots for this load.
+    pub(crate) fn set_additional_directories(&mut self, directories: Vec<PathBuf>) {
+        self.restored.set_additional_directories(directories);
+    }
+
+    /// Register this load as pending while its protocol response is admitted.
+    pub(crate) fn activate(self) -> std::result::Result<PendingLoad, LoadError> {
+        self.restored.activate()
     }
 }
 
