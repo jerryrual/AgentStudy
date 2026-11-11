@@ -15,9 +15,10 @@ use super::sessions::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     AgentCapabilities, CancelNotification, CloseSessionRequest, CloseSessionResponse,
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, SessionAdditionalDirectoriesCapabilities,
-    SessionCapabilities, SessionCloseCapabilities, SessionNotification,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+    SessionId, SessionInfo, SessionListCapabilities, SessionNotification,
 };
 use agent_client_protocol::Error as ProtocolError;
 
@@ -60,7 +61,8 @@ impl SessionControl {
                 .session_capabilities(
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new())
-                        .close(SessionCloseCapabilities::new()),
+                        .close(SessionCloseCapabilities::new())
+                        .list(SessionListCapabilities::new()),
                 ),
         )
     }
@@ -174,6 +176,38 @@ impl SessionControl {
                     ControlError::invalid(InvalidSessionRequest::PromptActive)
                 }
             })
+    }
+
+    /// List durable sessions with an optional exact working-directory filter.
+    pub(crate) async fn list_sessions(
+        &self,
+        request: &ListSessionsRequest,
+    ) -> ControlResult<ListSessionsResponse> {
+        if request.cursor.is_some() {
+            return Err(ControlError::invalid(InvalidSessionRequest::ListCursor));
+        }
+        if request.cwd.as_deref().is_some_and(|cwd| !cwd.is_absolute()) {
+            return Err(ControlError::invalid(InvalidSessionRequest::CwdNotAbsolute));
+        }
+        let cwd = request.cwd.clone();
+        let store = self.sessions.store();
+        let summaries = tokio::task::spawn_blocking(move || store.list())
+            .await
+            .map_err(ControlError::internal)?
+            .map_err(ControlError::internal)?;
+        let sessions = summaries
+            .into_iter()
+            .filter(|summary| {
+                let summary_cwd = Path::new(&summary.cwd);
+                summary_cwd.is_absolute()
+                    && cwd.as_deref().is_none_or(|filter| summary_cwd == filter)
+            })
+            .map(|summary| {
+                SessionInfo::new(SessionId::new(summary.id), PathBuf::from(summary.cwd))
+                    .title(summary.preview)
+            })
+            .collect();
+        Ok(ListSessionsResponse::new(sessions))
     }
 
     /// Cancel active work, drain it, and release one registered session.
@@ -307,7 +341,8 @@ mod tests {
                     .session_capabilities(
                     SessionCapabilities::new()
                         .additional_directories(SessionAdditionalDirectoriesCapabilities::new(),)
-                        .close(SessionCloseCapabilities::new()),
+                        .close(SessionCloseCapabilities::new())
+                        .list(SessionListCapabilities::new()),
                 )
             );
         }
@@ -325,6 +360,65 @@ mod tests {
         assert_eq!(loaded.meta.cwd, directory.path().to_str().unwrap());
         assert_eq!(loaded.meta.model, "model-a");
         assert_eq!(loaded.meta.agent, "build");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_projects_durable_summaries_and_validates_filters() {
+        let (directory, store, control) = control();
+        let primary_cwd = directory.path().join("primary");
+        let other_cwd = directory.path().join("other");
+        let primary = store
+            .create(primary_cwd.to_str().unwrap(), "model-a", "build")
+            .unwrap();
+        primary
+            .append(&Record::User {
+                text: "Primary title\nmore".to_string(),
+            })
+            .unwrap();
+        let other = store
+            .create(other_cwd.to_str().unwrap(), "model-b", "plan")
+            .unwrap();
+
+        let listed = control
+            .list_sessions(&ListSessionsRequest::new())
+            .await
+            .unwrap();
+        assert_eq!(listed.sessions.len(), 2);
+        assert_eq!(listed.next_cursor, None);
+        let projected = listed
+            .sessions
+            .iter()
+            .find(|session| session.session_id.to_string() == primary.id())
+            .unwrap();
+        assert_eq!(projected.cwd, primary_cwd);
+        assert_eq!(projected.title.as_deref(), Some("Primary title"));
+        assert!(projected.additional_directories.is_empty());
+        assert_eq!(projected.updated_at, None);
+
+        let filtered = control
+            .list_sessions(&ListSessionsRequest::new().cwd(other_cwd.clone()))
+            .await
+            .unwrap();
+        assert_eq!(filtered.sessions.len(), 1);
+        assert_eq!(filtered.sessions[0].session_id.to_string(), other.id());
+        assert_eq!(filtered.sessions[0].cwd, other_cwd);
+
+        let relative = control
+            .list_sessions(&ListSessionsRequest::new().cwd("relative"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            relative,
+            ControlError::Invalid(InvalidSessionRequest::CwdNotAbsolute)
+        ));
+        let cursor = control
+            .list_sessions(&ListSessionsRequest::new().cursor("unexpected"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cursor,
+            ControlError::Invalid(InvalidSessionRequest::ListCursor)
+        ));
     }
 
     #[tokio::test]
