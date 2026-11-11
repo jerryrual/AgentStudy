@@ -137,6 +137,42 @@ impl Tool for ReadFile {
     }
 }
 
+pub(crate) fn format_client_read(
+    display: &str,
+    offset: usize,
+    limit: usize,
+    text: &str,
+) -> Result<String> {
+    if text.len() > MAX_READ_BYTES as usize {
+        bail!(
+            "client returned more than {} bytes for {display}",
+            MAX_READ_BYTES
+        );
+    }
+    let lines: Vec<&str> = text.lines().take(limit).collect();
+    if lines.is_empty() {
+        return Ok(format!(
+            "{display} returned no text from client at line {offset}"
+        ));
+    }
+    let end = offset.saturating_add(lines.len() - 1);
+    let width = end.to_string().len();
+    let mut body = String::new();
+    for (index, line) in lines.into_iter().enumerate() {
+        let number = offset.saturating_add(index);
+        if line.len() > MAX_LINE_BYTES {
+            let mut end = MAX_LINE_BYTES;
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.push_str(&format!("{number:>width$}\t{}…\n", &line[..end]));
+        } else {
+            body.push_str(&format!("{number:>width$}\t{line}\n"));
+        }
+    }
+    Ok(format!("{display} (client lines {offset}-{end})\n{body}"))
+}
+
 pub struct WriteFile;
 
 #[async_trait]

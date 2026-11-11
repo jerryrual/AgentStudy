@@ -24,6 +24,7 @@ use crate::run::{
 };
 
 use super::approval::AcpApprover;
+use super::client_fs::AcpReadFile;
 use super::dispatcher;
 use super::error::ControlError;
 use super::prompt;
@@ -67,6 +68,10 @@ fn supports_notices(request: &InitializeRequest) -> bool {
         .is_some_and(|session| session.notices.is_some())
 }
 
+fn supports_client_text_reads(request: &InitializeRequest) -> bool {
+    request.client_capabilities.fs.read_text_file
+}
+
 pub(crate) type PromptSetupHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Build the unexposed stable-v1 callbacks over the shared session control boundary.
@@ -87,6 +92,9 @@ pub(crate) fn callback_bundle_with_setup_hook(
     let notices = Arc::new(AtomicBool::new(false));
     let initialize_notices = Arc::clone(&notices);
     let prompt_notices = notices;
+    let client_text_reads = Arc::new(AtomicBool::new(false));
+    let initialize_text_reads = Arc::clone(&client_text_reads);
+    let prompt_text_reads = client_text_reads;
     let load_control = Arc::clone(&control);
     let resume_control = Arc::clone(&control);
     let config_control = Arc::clone(&control);
@@ -102,6 +110,8 @@ pub(crate) fn callback_bundle_with_setup_hook(
         .on_receive_request(
             async move |request: InitializeRequest, responder, _connection| {
                 initialize_notices.store(supports_notices(&request), Ordering::Release);
+                initialize_text_reads
+                    .store(supports_client_text_reads(&request), Ordering::Release);
                 responder.respond(SessionControl::initialize(&request))
             },
             agent_client_protocol::on_receive_request!(),
@@ -229,6 +239,12 @@ pub(crate) fn callback_bundle_with_setup_hook(
                 let phase_four_budget = runtime.phase_four_side_call_token_budget();
                 let context_window = runtime.context_window();
                 let supports_notices = prompt_notices.load(Ordering::Acquire);
+                let text_file_reader = prompt_text_reads.load(Ordering::Acquire).then(|| {
+                    Arc::new(AcpReadFile::new(
+                        request.session_id.clone(),
+                        connection.clone(),
+                    ))
+                });
                 let request_cancellation = responder.cancellation();
                 let approver = Arc::new(AcpApprover::new(
                     request.session_id.clone(),
@@ -244,13 +260,16 @@ pub(crate) fn callback_bundle_with_setup_hook(
                         if let Some(hook) = setup_hook {
                             hook();
                         }
-                        let agent = runtime.agent_for_kind_with_directories(
+                        let mut agent = runtime.agent_for_kind_with_directories(
                             agent_kind,
                             &cwd,
                             additional_directories,
                             tools,
                             approver,
                         );
+                        if let Some(reader) = text_file_reader {
+                            agent = agent.with_tool_override(reader);
+                        }
                         let prepared = prepare_session_turn(&session, TurnStart::User(content))?;
                         Ok::<_, anyhow::Error>((agent, session, prepared))
                     })
@@ -341,12 +360,12 @@ mod tests {
     use agent_client_protocol::v1::schema::{
         AgentCapabilities, ClientCapabilities, ClientSessionCapabilities, CloseSessionRequest,
         CloseSessionResponse, ContentBlock, DeleteSessionRequest, DeleteSessionResponse,
-        InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionResponse,
-        McpServer, McpServerStdio, NewSessionResponse, NoticeCapabilities, PromptRequest,
-        ResumeSessionRequest, ResumeSessionResponse, SessionAdditionalDirectoriesCapabilities,
-        SessionCapabilities, SessionCloseCapabilities, SessionDeleteCapabilities, SessionId,
-        SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
-        SetSessionConfigOptionResponse,
+        FileSystemCapabilities, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+        LoadSessionResponse, McpServer, McpServerStdio, NewSessionResponse, NoticeCapabilities,
+        PromptRequest, ResumeSessionRequest, ResumeSessionResponse,
+        SessionAdditionalDirectoriesCapabilities, SessionCapabilities, SessionCloseCapabilities,
+        SessionDeleteCapabilities, SessionId, SessionListCapabilities, SessionNotification,
+        SessionResumeCapabilities, SetSessionConfigOptionResponse,
     };
     use agent_client_protocol::ErrorCode;
     use tempfile::TempDir;
@@ -381,6 +400,17 @@ mod tests {
 
         assert!(!supports_notices(&without));
         assert!(supports_notices(&with));
+    }
+
+    #[test]
+    fn client_text_reads_require_explicit_fs_capability() {
+        let without = InitializeRequest::new(ProtocolVersion::V1);
+        let with = InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+            ClientCapabilities::new().fs(FileSystemCapabilities::new().read_text_file(true)),
+        );
+
+        assert!(!supports_client_text_reads(&without));
+        assert!(supports_client_text_reads(&with));
     }
 
     #[tokio::test(flavor = "current_thread")]

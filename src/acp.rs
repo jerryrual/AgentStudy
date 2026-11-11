@@ -12,6 +12,7 @@ use crate::session::SessionStore;
 
 pub(crate) mod approval;
 pub(crate) mod callbacks;
+mod client_fs;
 pub(crate) mod dispatcher;
 pub(crate) mod error;
 pub(crate) mod event_mapping;

@@ -4,6 +4,7 @@
 pub mod events;
 pub mod injection;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ pub use events::{EventSink, NullSink};
 
 use crate::interaction::{ApprovalDecision, Approver, Asker};
 use crate::model::{Message, ModelClient, ToolDef, Usage};
-use crate::tools::{truncate_output, TodoItem, ToolContext, ToolRegistry};
+use crate::tools::{truncate_output, TodoItem, Tool, ToolContext, ToolRegistry};
 
 /// Which built-in agent to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,6 +117,7 @@ pub struct Agent {
     options: AgentOptions,
     project_memory: crate::memory::ProjectMemory,
     additional_directories: Vec<PathBuf>,
+    tool_overrides: HashMap<String, Arc<dyn Tool>>,
     todos: Arc<Mutex<Vec<TodoItem>>>,
 }
 
@@ -136,12 +138,23 @@ impl Agent {
             options,
             project_memory,
             additional_directories: Vec::new(),
+            tool_overrides: HashMap::new(),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub(crate) fn with_additional_directories(mut self, directories: Vec<PathBuf>) -> Self {
         self.additional_directories = directories;
+        self
+    }
+
+    pub(crate) fn with_tool_override(mut self, tool: Arc<dyn Tool>) -> Self {
+        let name = tool.model_name();
+        assert!(
+            self.tools.get(name).is_some(),
+            "tool override {name:?} has no registered specification"
+        );
+        self.tool_overrides.insert(name.to_string(), tool);
         self
     }
 
@@ -392,15 +405,20 @@ impl Agent {
         Ok(())
     }
 
+    fn tool(&self, name: &str) -> Option<&dyn Tool> {
+        self.tool_overrides
+            .get(name)
+            .map(Arc::as_ref)
+            .or_else(|| self.tools.get(name))
+    }
+
     fn is_parallel_safe(&self, call: &crate::model::ToolCall) -> bool {
-        self.tools
-            .get(&call.name)
+        self.tool(&call.name)
             .is_some_and(|tool| tool.parallel_safe() && !tool.mutates())
     }
 
     fn tool_summary(&self, call: &crate::model::ToolCall) -> String {
-        self.tools
-            .get(&call.name)
+        self.tool(&call.name)
             .map(|tool| tool.summarize(&call.arguments))
             .unwrap_or_else(|| call.name.clone())
     }
@@ -434,7 +452,7 @@ impl Agent {
             }
         };
 
-        let Some(tool) = self.tools.get(&call.name) else {
+        let Some(tool) = self.tool(&call.name) else {
             let message = format!(
                 "Error: unknown tool {:?}; available tools: {}",
                 call.name,
@@ -815,6 +833,35 @@ mod tests {
         }
     }
 
+    struct OutputProbe(&'static str);
+
+    #[async_trait]
+    impl Tool for OutputProbe {
+        fn name(&self) -> &'static str {
+            "read_file"
+        }
+
+        fn description(&self) -> &'static str {
+            "test read override"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+
+        fn summarize(&self, raw: &str) -> String {
+            raw.to_string()
+        }
+
+        async fn run(&self, _arguments: &Value, _context: &ToolContext) -> Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
     struct IdentityApprover {
         calls: StdMutex<Vec<ToolCall>>,
     }
@@ -852,6 +899,25 @@ mod tests {
             asker: Arc::new(NoAsker),
             todos: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_tool_override_replaces_execution_only() {
+        let agent = test_agent(Box::new(OutputProbe("local")))
+            .with_tool_override(Arc::new(OutputProbe("client")));
+        assert_eq!(agent.tool_defs()[0].name, "read_file");
+        let call = ToolCall {
+            id: "read-1".to_string(),
+            name: "read_file".to_string(),
+            arguments: "{}".to_string(),
+        };
+
+        let (ok, _, output, model_output) = agent
+            .execute_tool_inner(&call, &test_context(), "read")
+            .await;
+        assert!(ok);
+        assert_eq!(output, "client");
+        assert_eq!(model_output, "client");
     }
 
     #[tokio::test]
