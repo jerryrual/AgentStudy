@@ -227,6 +227,18 @@ impl ResponsesFileSearchFilter {
                 if filter.key.trim().is_empty() {
                     bail!("Responses file search metadata filter has an empty key");
                 }
+                let list_value = matches!(&filter.value, ResponsesFileSearchFilterValue::List(_));
+                let membership_operator = matches!(
+                    filter.operator,
+                    ResponsesFileSearchComparisonOperator::In
+                        | ResponsesFileSearchComparisonOperator::Nin
+                );
+                if list_value != membership_operator {
+                    bail!(
+                        "Responses file search metadata filter key {:?} must use a list only with in/nin",
+                        filter.key
+                    );
+                }
                 match &filter.value {
                     ResponsesFileSearchFilterValue::Number(number) if !number.is_finite() => {
                         bail!("Responses file search metadata filter number must be finite");
@@ -1163,6 +1175,40 @@ mod tests {
             })
         );
 
+        let decoded: ResponsesFileSearchFilter = serde_json::from_value(serde_json::json!({
+            "type": "and",
+            "filters": [{
+                "type": "or",
+                "filters": [{"type":"gte","key":"year","value":2025}]
+            }]
+        }))
+        .unwrap();
+        let ResponsesFileSearchFilter::Compound(root) = decoded else {
+            panic!("expected compound root");
+        };
+        let ResponsesFileSearchFilter::Compound(group) = &root.filters[0] else {
+            panic!("expected nested compound group");
+        };
+        let ResponsesFileSearchFilter::Comparison(comparison) = &group.filters[0] else {
+            panic!("expected nested comparison");
+        };
+        assert!(matches!(
+            comparison.value,
+            ResponsesFileSearchFilterValue::Number(number) if number == 2025.0
+        ));
+        assert!(
+            serde_json::from_value::<ResponsesFileSearchFilter>(serde_json::json!({
+                "type":"eq","key":"team","value":"core","extra":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ResponsesFileSearchFilter>(serde_json::json!({
+                "type":"contains","key":"team","value":"core"
+            }))
+            .is_err()
+        );
+
         let invalid_number =
             ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
                 key: "score".into(),
@@ -1174,6 +1220,27 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("number must be finite"));
+
+        for invalid in [
+            ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                key: "team".into(),
+                operator: ResponsesFileSearchComparisonOperator::In,
+                value: ResponsesFileSearchFilterValue::String("core".into()),
+            }),
+            ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
+                key: "team".into(),
+                operator: ResponsesFileSearchComparisonOperator::Eq,
+                value: ResponsesFileSearchFilterValue::List(vec![
+                    ResponsesFileSearchFilterScalar::String("core".into()),
+                ]),
+            }),
+        ] {
+            assert!(invalid
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must use a list only with in/nin"));
+        }
 
         let mut too_deep =
             ResponsesFileSearchFilter::Comparison(ResponsesFileSearchComparisonFilter {
