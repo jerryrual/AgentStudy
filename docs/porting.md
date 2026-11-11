@@ -43,7 +43,7 @@
 1. MCP 服务器与 Skills。
 2. Hooks 与子智能体；依赖统一的工具协议和上下文隔离。
 3. `web_fetch` 等联网工具；依赖独立搜索/抓取提供方。
-4. 真正的交互式 Shell 终端；当前 `!` 命令只回显输出，不接管全屏程序。
+4. 真正的交互式 Shell 终端。TUI `!command` 现会暂停绘制并退出 raw mode/alternate screen，以当前 cwd 启动继承 stdin/stdout/stderr 的 `bash -c`；Unix 上子命令使用独立前台进程组，支持全屏程序与交互输入，Ctrl-C 只发送给子进程，退出码、信号或启动/等待错误写回工具卡后恢复 icode 的前台终端和 TUI。该直通路径不进入模型、审批、会话 transcript 或 recovery；模型 `bash` 工具仍保持有界捕获和超时语义。
 
 ### 3. 可观测性 / 恢复
 

@@ -111,10 +111,6 @@ pub(crate) enum UiEvent {
         result: std::result::Result<Compaction, String>,
         duration: Duration,
     },
-    ShellFinished {
-        ok: bool,
-        duration: Duration,
-    },
 }
 
 /// Construction options, separated so tests can build an app without a
@@ -136,6 +132,15 @@ pub struct AppOptions {
 struct PendingInjection {
     id: String,
     raw: String,
+}
+
+/// One direct shell command waiting for the event loop to own the terminal.
+#[derive(Debug, Clone)]
+pub(crate) struct DirectShellRequest {
+    pub id: u64,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub started: Instant,
 }
 
 pub struct App {
@@ -179,6 +184,8 @@ pub struct App {
     next_injection_id: u64,
     persistence_gate: Option<Arc<AtomicBool>>,
     recovery_writer: Option<RecoveryCheckpointWriter>,
+    pending_direct_shell: Option<DirectShellRequest>,
+    active_direct_shell: Option<u64>,
     pub approver: Arc<dyn Approver>,
     pub asker: Arc<dyn Asker>,
     pub tools: Arc<ToolRegistry>,
@@ -265,6 +272,8 @@ impl App {
             next_injection_id: 0,
             persistence_gate: None,
             recovery_writer: None,
+            pending_direct_shell: None,
+            active_direct_shell: None,
             approver,
             asker,
             tools: Arc::new(ToolRegistry::builtin()),
@@ -621,17 +630,6 @@ impl App {
                         }
                     }
                     Err(error) => self.view.push(ViewItem::Error(error)),
-                }
-            }
-            UiEvent::ShellFinished { ok, duration } => {
-                self.running = false;
-                self.turn_started = None;
-                self.elapsed = duration;
-                if !ok {
-                    self.view.push(ViewItem::Info(
-                        "Shell command failed; its output is not part of the conversation."
-                            .to_string(),
-                    ));
                 }
             }
         }
@@ -1184,6 +1182,28 @@ impl App {
         if !self.running {
             return;
         }
+        if self.active_direct_shell.take().is_some() {
+            self.pending_direct_shell = None;
+            self.running = false;
+            self.turn_started = None;
+            for item in &mut self.view {
+                if let ViewItem::Tool {
+                    name,
+                    status,
+                    ok,
+                    output,
+                    ..
+                } = item
+                {
+                    if name == "bash" && *status == ToolStatus::Running {
+                        *status = ToolStatus::Done;
+                        *ok = Some(false);
+                        *output = "Cancelled.".to_string();
+                    }
+                }
+            }
+            return;
+        }
         if self.pending_ask.is_some() {
             if let Some(pending) = self.pending_injection.as_ref() {
                 self.input = pending.raw.clone();
@@ -1238,6 +1258,8 @@ impl App {
         if let Some(reply) = self.pending_ask.take() {
             let _ = reply.send(String::new());
         }
+        self.active_direct_shell = None;
+        self.pending_direct_shell = None;
         self.running = false;
         self.turn_id = self.turn_id.wrapping_add(1);
         self.turn_started = None;
@@ -1345,8 +1367,9 @@ impl App {
         }
         self.running = true;
         self.turn_id = self.turn_id.wrapping_add(1);
-        let turn_id = self.turn_id;
-        self.turn_started = Some(Instant::now());
+        let id = self.turn_id;
+        let started = Instant::now();
+        self.turn_started = Some(started);
         self.view.push(ViewItem::Tool {
             name: "bash".to_string(),
             summary: command.clone(),
@@ -1355,49 +1378,57 @@ impl App {
             duration: None,
             output: String::new(),
         });
-        let tx = self.events_tx.clone();
-        let cwd = self.cwd.clone();
-        let handle = self.runtime.clone();
-        let task = handle.spawn(async move {
-            let started = Instant::now();
-            let result =
-                crate::tools::shell::run_command(&command, &cwd, Duration::from_secs(120)).await;
-            let ok = result.is_ok();
-            match result {
-                Ok(output) => {
-                    let _ = tx.send(UiEvent::Turn {
-                        id: turn_id,
-                        event: Box::new(UiEvent::ToolFinished {
-                            name: "bash".to_string(),
-                            ok: true,
-                            duration: started.elapsed(),
-                            summary: command.clone(),
-                            output,
-                        }),
-                    });
-                }
-                Err(error) => {
-                    let _ = tx.send(UiEvent::Turn {
-                        id: turn_id,
-                        event: Box::new(UiEvent::ToolFinished {
-                            name: "bash".to_string(),
-                            ok: false,
-                            duration: started.elapsed(),
-                            summary: command.clone(),
-                            output: format!("{error:#}"),
-                        }),
-                    });
-                }
-            }
-            let _ = tx.send(UiEvent::Turn {
-                id: turn_id,
-                event: Box::new(UiEvent::ShellFinished {
-                    ok,
-                    duration: started.elapsed(),
-                }),
-            });
+        self.active_direct_shell = Some(id);
+        self.pending_direct_shell = Some(DirectShellRequest {
+            id,
+            command,
+            cwd: self.cwd.clone(),
+            started,
         });
-        self.cancel_handle = Some(task);
+    }
+
+    /// Hand the one pending direct command to the terminal event loop.
+    pub(crate) fn take_direct_shell(&mut self) -> Option<DirectShellRequest> {
+        self.pending_direct_shell.take()
+    }
+
+    /// Complete the matching direct command without touching conversation state.
+    pub(crate) fn complete_direct_shell(
+        &mut self,
+        id: u64,
+        command: &str,
+        duration: Duration,
+        outcome: super::direct_shell::DirectShellOutcome,
+    ) -> bool {
+        if self.active_direct_shell != Some(id) {
+            return false;
+        }
+        self.active_direct_shell = None;
+        self.pending_direct_shell = None;
+        self.running = false;
+        self.turn_started = None;
+        self.elapsed = duration;
+        let ok = outcome.succeeded();
+        let output = outcome.summary();
+        if let Some(ViewItem::Tool {
+            status,
+            ok: tool_ok,
+            duration: tool_duration,
+            output: tool_output,
+            ..
+        }) = self.view.iter_mut().rev().find(|item| {
+            matches!(
+                item,
+                ViewItem::Tool { name, summary, status: ToolStatus::Running, .. }
+                    if name == "bash" && summary == command
+            )
+        }) {
+            *status = ToolStatus::Done;
+            *tool_ok = Some(ok);
+            *tool_duration = Some(duration);
+            *tool_output = output;
+        }
+        true
     }
 
     fn expand_mentions(&self, input: &str) -> String {
@@ -2381,6 +2412,75 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), screen);
         assert!(!app.running);
         assert_eq!(app.input, locked);
+    }
+
+    #[test]
+    fn direct_shell_request_and_completion_are_identity_scoped() {
+        let mut app = injection_input_test_app();
+        app.input = "!printf hello".to_string();
+        app.submit();
+
+        let request = app.take_direct_shell().unwrap();
+        assert_eq!(request.command, "printf hello");
+        assert_eq!(request.cwd, app.cwd);
+        assert!(app.take_direct_shell().is_none());
+        assert!(app.running);
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Tool {
+                name,
+                summary,
+                status: ToolStatus::Running,
+                ..
+            }) if name == "bash" && summary == "printf hello"
+        ));
+
+        assert!(!app.complete_direct_shell(
+            request.id.wrapping_add(1),
+            &request.command,
+            Duration::from_secs(1),
+            super::super::direct_shell::DirectShellOutcome::Exited(0),
+        ));
+        assert!(app.running);
+        assert!(app.complete_direct_shell(
+            request.id,
+            &request.command,
+            Duration::from_secs(2),
+            super::super::direct_shell::DirectShellOutcome::Exited(7),
+        ));
+        assert!(!app.running);
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Tool {
+                status: ToolStatus::Done,
+                ok: Some(false),
+                duration: Some(duration),
+                output,
+                ..
+            }) if *duration == Duration::from_secs(2) && output.contains("code 7")
+        ));
+    }
+
+    #[test]
+    fn cancelling_pending_direct_shell_does_not_touch_session_recovery() {
+        let mut app = injection_input_test_app();
+        app.input = "!sleep 1".to_string();
+        app.submit();
+
+        app.cancel();
+
+        assert!(!app.running);
+        assert!(app.take_direct_shell().is_none());
+        assert!(!app.requires_session_reload);
+        assert!(matches!(
+            app.view.last(),
+            Some(ViewItem::Tool {
+                status: ToolStatus::Done,
+                ok: Some(false),
+                output,
+                ..
+            }) if output == "Cancelled."
+        ));
     }
 
     #[test]

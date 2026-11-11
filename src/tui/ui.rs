@@ -758,13 +758,9 @@ mod tests {
             summary: "new command".to_string(),
             output: "old result".to_string(),
         });
-        app.push_stale_event(UiEvent::ShellFinished {
-            ok: true,
-            duration: std::time::Duration::from_millis(1),
-        });
         app.pump();
 
-        assert!(app.running, "stale ShellFinished must not end the new turn");
+        assert!(app.running, "stale tool events must not end the new turn");
         assert!(
             !app.view.iter().any(
                 |item| matches!(item, ViewItem::Tool { output, .. } if output == "old result")

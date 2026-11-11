@@ -1,6 +1,7 @@
 //! The terminal user interface.
 
 pub mod app;
+mod direct_shell;
 pub mod ui;
 
 pub use app::App;
@@ -74,6 +75,16 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
                 }
             }
         }
+        if let Some(request) = app.take_direct_shell() {
+            let outcome = execute_direct_shell(terminal, &request)?;
+            app.complete_direct_shell(
+                request.id,
+                &request.command,
+                request.started.elapsed(),
+                outcome,
+            );
+            continue;
+        }
         app.pump();
         app.tick();
         if app.quit {
@@ -81,4 +92,95 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<
         }
     }
     Ok(())
+}
+
+fn execute_direct_shell(
+    terminal: &mut ratatui::DefaultTerminal,
+    request: &app::DirectShellRequest,
+) -> Result<direct_shell::DirectShellOutcome> {
+    let mut replacement = None;
+    let outcome = with_terminal_suspended(
+        || {
+            ratatui::restore();
+            Ok(())
+        },
+        || direct_shell::run(&request.command, &request.cwd),
+        || {
+            replacement = Some(
+                ratatui::try_init()
+                    .context("failed to restore the terminal after shell command")?,
+            );
+            Ok(())
+        },
+    )?;
+    *terminal = replacement.expect("terminal resume succeeded without replacement");
+    Ok(outcome)
+}
+
+fn with_terminal_suspended<T>(
+    leave: impl FnOnce() -> Result<()>,
+    run: impl FnOnce() -> T,
+    enter: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    leave()?;
+    let result = run();
+    enter()?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[test]
+    fn suspended_terminal_reenters_after_every_runner_outcome() {
+        for outcome in [
+            direct_shell::DirectShellOutcome::Exited(0),
+            direct_shell::DirectShellOutcome::Exited(9),
+            direct_shell::DirectShellOutcome::Signaled(2),
+            direct_shell::DirectShellOutcome::Error("spawn failed".to_string()),
+        ] {
+            let order = RefCell::new(Vec::new());
+            let actual = with_terminal_suspended(
+                || {
+                    order.borrow_mut().push("leave");
+                    Ok(())
+                },
+                || {
+                    order.borrow_mut().push("run");
+                    outcome.clone()
+                },
+                || {
+                    order.borrow_mut().push("enter");
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(actual, outcome);
+            assert_eq!(&*order.borrow(), &["leave", "run", "enter"]);
+        }
+    }
+
+    #[test]
+    fn resume_failure_is_reported_after_runner_finishes() {
+        let order = RefCell::new(Vec::new());
+        let error = with_terminal_suspended(
+            || {
+                order.borrow_mut().push("leave");
+                Ok(())
+            },
+            || order.borrow_mut().push("run"),
+            || {
+                order.borrow_mut().push("enter");
+                anyhow::bail!("cannot enter")
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot enter"));
+        assert_eq!(&*order.borrow(), &["leave", "run", "enter"]);
+    }
 }
